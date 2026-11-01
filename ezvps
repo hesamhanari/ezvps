@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# ezvps - bash TUI/CLI VPS manager for Debian 13 (run as root).
+#
+# PR 1 scope: skeleton + L2TP module. Every other module prints a clean
+# "not implemented yet" message and returns without failing.
+#
+# This script deliberately uses bash builtins only (plus the external
+# `ezl2tp` command when the user picks L2TP), so it has no dependencies.
+
+set -uo pipefail
+
+EZVPS_VERSION="0.0.1-dev"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_BOLD=$'\033[1m'
+    C_YELLOW=$'\033[33m'
+    C_RED=$'\033[31m'
+    C_RESET=$'\033[0m'
+else
+    C_BOLD="" C_YELLOW="" C_RED="" C_RESET=""
+fi
+
+info() { printf '%s\n' "$*"; }
+warn() { printf '%s%s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+err() { printf '%s%s%s\n' "$C_RED" "$*" "$C_RESET" >&2; }
+
+clear_screen() {
+    [[ -t 1 && -n "${TERM:-}" ]] && printf '\033[H\033[2J'
+    return 0
+}
+
+# Wait for Enter so the user can read a message before the menu redraws.
+# Returns non-zero on EOF (stdin closed); callers ignore that on purpose.
+pause() {
+    [[ "${EZVPS_NO_PAUSE:-0}" == "1" ]] && return 0
+    local _
+    read -r -p "Press Enter to return to the menu... " _
+}
+
+# ---------------------------------------------------------------------------
+# Module registry: key | menu label
+# The menu number is the position in this list. Labels are clean: no
+# description text after the item names.
+# ---------------------------------------------------------------------------
+
+MODULE_KEYS=(l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall backup update uninstall)
+MODULE_LABELS=("L2TP" "3x-ui" "Backpack" "ctunnel" "Nginx" "Certificates" "Lazyports" "SSH and Users" "Firewall" "Backup" "Check For Updates" "Uninstall")
+
+module_label() {
+    local i
+    for i in "${!MODULE_KEYS[@]}"; do
+        if [[ "${MODULE_KEYS[$i]}" == "$1" ]]; then
+            printf '%s' "${MODULE_LABELS[$i]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Modules
+# ---------------------------------------------------------------------------
+
+# Shared stub for modules that are planned but not built yet. Never fails.
+module_not_implemented() {
+    local label
+    label="$(module_label "$1")" || label="$1"
+    info ""
+    info "${label} is not implemented yet."
+    info "It is planned for a later ezvps release."
+    return 0
+}
+
+print_ezl2tp_install_help() {
+    info '
+ezl2tp is not installed on this server.
+
+ezvps does not install it for you: the easyl2tp repository is private, so
+it cannot be downloaded anonymously. Install it from a git clone that uses
+your own authentication, then run its installer:
+
+  Option A - GitHub CLI (interactive login, no token on the command line):
+    gh auth login
+    gh repo clone <owner>/easyl2tp
+    cd easyl2tp
+
+  Option B - SSH key or deploy key that has read access to the repo:
+    git clone git@github.com:<owner>/easyl2tp.git
+    cd easyl2tp
+
+  Option C - HTTPS with a personal access token (git prompts for it; paste
+  the token at the password prompt, never put it in the command line):
+    git clone https://github.com/<owner>/easyl2tp.git
+    cd easyl2tp
+
+Then follow the install steps in the README of that repository. When the
+ezl2tp command exists, choose L2TP in ezvps again.
+'
+}
+
+module_l2tp() {
+    local rc
+    if command -v ezl2tp >/dev/null 2>&1; then
+        info ""
+        info "Launching ezl2tp..."
+        ezl2tp
+        rc=$?
+        info ""
+        if ((rc != 0)); then
+            warn "ezl2tp exited with status ${rc}."
+        fi
+        info "Returned to ezvps."
+    else
+        print_ezl2tp_install_help
+    fi
+    return 0
+}
+
+# Dispatch a module by key. Always returns 0 so a module can never take the
+# menu down; real failures are reported by the module itself.
+run_module() {
+    case "$1" in
+        l2tp) module_l2tp ;;
+        3x-ui | backpack | ctunnel | nginx | certs | lazyports | ssh | firewall | backup | update | uninstall)
+            module_not_implemented "$1"
+            ;;
+        *)
+            err "Unknown module: $1"
+            return 2
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Menu
+# ---------------------------------------------------------------------------
+
+print_menu() {
+    local i
+    info "${C_BOLD}ezvps ${EZVPS_VERSION}${C_RESET}"
+    info ""
+    for i in "${!MODULE_LABELS[@]}"; do
+        printf '%2d) %s\n' "$((i + 1))" "${MODULE_LABELS[$i]}"
+    done
+    printf '%2d) %s\n' 0 "Exit"
+    info ""
+}
+
+main_menu() {
+    local choice
+    while true; do
+        clear_screen
+        print_menu
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0 # EOF on stdin: leave cleanly
+        fi
+        choice="${choice//[[:space:]]/}"
+        if [[ "$choice" == "0" ]]; then
+            return 0
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#MODULE_KEYS[@]})); then
+            run_module "${MODULE_KEYS[$((10#$choice - 1))]}"
+            pause || true
+        else
+            warn "Invalid choice: ${choice:-<empty>}"
+            pause || true
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+usage() {
+    info "ezvps ${EZVPS_VERSION} - VPS manager for Debian 13
+
+Usage:
+  ezvps                 open the interactive menu
+  ezvps <module>        run one module directly
+  ezvps --version       print the version
+  ezvps --help          show this help
+
+Modules:
+  l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
+  backup update uninstall
+
+Only l2tp is implemented in this release; the others report that they are
+not implemented yet."
+}
+
+require_root() {
+    if ((EUID != 0)) && [[ "${EZVPS_ALLOW_NONROOT:-0}" != "1" ]]; then
+        err "ezvps must be run as root."
+        return 1
+    fi
+    return 0
+}
+
+main() {
+    case "${1:-}" in
+        -h | --help | help)
+            usage
+            return 0
+            ;;
+        -V | --version | version)
+            info "ezvps ${EZVPS_VERSION}"
+            return 0
+            ;;
+        "" | menu)
+            require_root || return 1
+            main_menu
+            return $?
+            ;;
+        *)
+            local key="$1" known=0 k
+            for k in "${MODULE_KEYS[@]}"; do
+                [[ "$k" == "$key" ]] && known=1
+            done
+            if ((known == 0)); then
+                err "Unknown command: $key"
+                usage >&2
+                return 2
+            fi
+            require_root || return 1
+            run_module "$key"
+            return $?
+            ;;
+    esac
+}
+
+main "$@"
