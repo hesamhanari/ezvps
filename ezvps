@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ezvps - bash TUI/CLI VPS manager for Debian 13 (run as root).
 #
-# PR 1 scope: skeleton + L2TP module. Every other module prints a clean
-# "not implemented yet" message and returns without failing.
+# Implemented modules: L2TP (PR 1) and 3x-ui (PR 2). Every other module
+# prints a clean "not implemented yet" message and returns without failing.
 #
-# This script deliberately uses bash builtins only (plus the external
-# `ezl2tp` command when the user picks L2TP), so it has no dependencies.
+# Menu, L2TP and the rest of the script use bash builtins only. The 3x-ui
+# module also needs coreutils, systemctl and curl; each is checked with
+# `command -v` before use and the module degrades with a clear message.
 
 set -uo pipefail
 
@@ -38,7 +39,7 @@ clear_screen() {
 pause() {
     [[ "${EZVPS_NO_PAUSE:-0}" == "1" ]] && return 0
     local _
-    read -r -p "Press Enter to return to the menu... " _
+    read -r -p "${1:-Press Enter to return to the menu... }" _
 }
 
 # ---------------------------------------------------------------------------
@@ -120,12 +121,806 @@ module_l2tp() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# 3x-ui module
+#
+# Upstream: https://github.com/MHSanaei/3x-ui (public). ezvps downloads the
+# project's own install.sh at a pinned release tag into a temp file, shows
+# the URL and its SHA-256, verifies the hash, asks, and only then runs it.
+# Nothing is ever piped from the network into a shell.
+#
+# To bump the pin: change XUI_PINNED_TAG and XUI_INSTALLER_SHA256 together
+# (sha256 of the install.sh served at that tag) and update SPEC.md 6.2.
+# ---------------------------------------------------------------------------
+
+XUI_UPSTREAM="MHSanaei/3x-ui"
+XUI_PINNED_TAG="v3.11.0"
+XUI_INSTALLER_URL="https://raw.githubusercontent.com/${XUI_UPSTREAM}/${XUI_PINNED_TAG}/install.sh"
+XUI_INSTALLER_SHA256="9684bae4f769b2127fcceceb4f200045657381311867529e6ba76c6b58e2825d"
+
+# Owner-specified defaults for "Install 3x-ui" (SPEC 6.2). Known to the
+# world, so every use is paired with a change-password warning.
+XUI_DEF_PORT="3389"
+XUI_DEF_USER="admin"
+XUI_DEF_PASS="Admin123"
+XUI_DEF_PATH="xuipanel"
+
+XUI_SERVICE_NAME="x-ui"
+XUI_DIR="${EZVPS_XUI_DIR:-/usr/local/x-ui}"
+XUI_BIN="${XUI_DIR}/x-ui"
+XUI_DB_DIR="${EZVPS_XUI_DB_DIR:-/etc/x-ui}"
+XUI_STATE_FILE="${EZVPS_STATE_DIR:-/var/lib/ezvps}/3x-ui.state"
+XUI_BACKUP_BASE="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
+
+# Filled by xui_read_settings / xui_probe / xui_fetch_installer.
+XUI_CUR_PORT="" XUI_CUR_PATH="" XUI_CUR_TLS=""
+XUI_PROBE_CODE="" XUI_PROBE_URL=""
+XUI_TMP_DIR=""
+
+xui_have() { command -v "$1" >/dev/null 2>&1; }
+
+xui_require() {
+    local c missing=()
+    for c in "$@"; do
+        xui_have "$c" || missing+=("$c")
+    done
+    if ((${#missing[@]} > 0)); then
+        err "3x-ui: required command(s) not found: ${missing[*]}"
+        return 1
+    fi
+    return 0
+}
+
+# xui_ask <question>: yes only on an explicit y/yes. EOF counts as no.
+xui_ask() {
+    local reply
+    read -r -p "$1 [y/N] " reply || {
+        info ""
+        return 1
+    }
+    [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+}
+
+# Sleep without an external command.
+xui_sleep() { read -r -t "$1" <> <(:) || true; }
+
+xui_cleanup_tmp() {
+    [[ -n "$XUI_TMP_DIR" && -d "$XUI_TMP_DIR" ]] && rm -rf "$XUI_TMP_DIR"
+    XUI_TMP_DIR=""
+    return 0
+}
+
+# --- state (non-secret facts about how the panel was installed) -------------
+
+xui_state_get() { # xui_state_get <key>
+    local k v
+    [[ -r "$XUI_STATE_FILE" ]] || return 0
+    while IFS='=' read -r k v; do
+        if [[ "$k" == "$1" ]]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    done <"$XUI_STATE_FILE"
+    return 0
+}
+
+# xui_state_write <mode> <username> <password_is_default 0|1>
+# Never stores a password; only whether the known default is still in use.
+xui_state_write() {
+    local dir tmp
+    dir="${XUI_STATE_FILE%/*}"
+    mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
+    tmp="${XUI_STATE_FILE}.tmp.$$"
+    {
+        printf 'mode=%s\n' "$1"
+        printf 'username=%s\n' "$2"
+        printf 'password_default=%s\n' "$3"
+    } >"$tmp" 2>/dev/null
+    if ! chmod 600 "$tmp" 2>/dev/null || ! mv -f "$tmp" "$XUI_STATE_FILE" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        warn "Could not write ${XUI_STATE_FILE}; 'Panel info' will have less detail."
+    fi
+    return 0
+}
+
+# --- detection ---------------------------------------------------------------
+
+xui_is_installed() {
+    [[ -x "$XUI_BIN" || -f "${XUI_DB_DIR}/x-ui.db" ]] && return 0
+    if xui_have systemctl; then
+        [[ "$(systemctl list-unit-files --no-legend "${XUI_SERVICE_NAME}.service" 2>/dev/null)" == *"${XUI_SERVICE_NAME}.service"* ]]
+        return $?
+    fi
+    return 1
+}
+
+xui_describe_existing() {
+    [[ -x "$XUI_BIN" ]] && info "  binary:   ${XUI_BIN}"
+    [[ -f "${XUI_DB_DIR}/x-ui.db" ]] && info "  database: ${XUI_DB_DIR}/x-ui.db"
+    if xui_have systemctl; then
+        info "  service:  ${XUI_SERVICE_NAME} ($(xui_service_state))"
+    fi
+    return 0
+}
+
+xui_service_state() {
+    xui_have systemctl || {
+        printf 'unknown'
+        return 0
+    }
+    if systemctl is-active --quiet "$XUI_SERVICE_NAME" 2>/dev/null; then
+        printf 'running'
+    else
+        printf 'not running'
+    fi
+}
+
+# Reads port / base path / TLS from the panel's own `setting -show` output.
+xui_read_settings() {
+    XUI_CUR_PORT="" XUI_CUR_PATH="" XUI_CUR_TLS=""
+    [[ -x "$XUI_BIN" ]] || return 1
+    local out line
+    out="$("$XUI_BIN" setting -show=true 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            port:*) XUI_CUR_PORT="${line#port:}" ;;
+            webBasePath:*) XUI_CUR_PATH="${line#webBasePath:}" ;;
+            "Panel is secure with SSL") XUI_CUR_TLS="yes" ;;
+            "Warning: Panel is not secure with SSL") XUI_CUR_TLS="no" ;;
+        esac
+    done <<<"$out"
+    XUI_CUR_PORT="${XUI_CUR_PORT//[[:space:]]/}"
+    XUI_CUR_PATH="${XUI_CUR_PATH//[[:space:]]/}"
+    XUI_CUR_PATH="${XUI_CUR_PATH#/}"
+    XUI_CUR_PATH="${XUI_CUR_PATH%/}"
+    [[ "$XUI_CUR_PORT" =~ ^[0-9]+$ ]]
+}
+
+xui_scheme() { [[ "$XUI_CUR_TLS" == "yes" ]] && printf 'https' || printf 'http'; }
+
+# xui_port_in_use <port>: `ss` when present, else a bash /dev/tcp connect.
+xui_port_in_use() {
+    local out
+    if xui_have ss; then
+        out="$(ss -H -ltn "( sport = :$1 )" 2>/dev/null)"
+        [[ -n "$out" ]]
+        return $?
+    fi
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# xui_probe <port> <path>: does the panel answer HTTP(S) on 127.0.0.1?
+# Sets XUI_PROBE_CODE / XUI_PROBE_URL. Returns 2 when curl is missing.
+xui_probe() {
+    local url code
+    XUI_PROBE_CODE="" XUI_PROBE_URL=""
+    xui_have curl || return 2
+    url="$(xui_scheme)://127.0.0.1:${1}/${2:+${2}/}"
+    XUI_PROBE_URL="$url"
+    # -k: a panel certificate is issued for a domain, never for 127.0.0.1; this
+    # is only a local reachability check, no credentials are sent.
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)" || code=""
+    XUI_PROBE_CODE="${code:-000}"
+    [[ "$XUI_PROBE_CODE" =~ ^[23][0-9][0-9]$ ]]
+}
+
+xui_wait_ready() { # xui_wait_ready <port> <path>
+    local waited=0 max="${EZVPS_XUI_WAIT_SECONDS:-30}"
+    while true; do
+        xui_probe "$1" "$2"
+        case $? in
+            0) return 0 ;;
+            2) return 2 ;;
+        esac
+        ((waited >= max)) && return 1
+        xui_sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# xui_verify_response <port> <path>: prints the result of the probe.
+xui_verify_response() {
+    local rc
+    xui_wait_ready "$1" "$2"
+    rc=$?
+    case $rc in
+        0) info "Verified: the panel answers on ${XUI_PROBE_URL} (HTTP ${XUI_PROBE_CODE})." ;;
+        2) warn "Cannot verify: curl is not installed." ;;
+        *)
+            if [[ "$XUI_PROBE_CODE" == "404" ]]; then
+                err "The panel answers on port ${1} but not on path /${2:+${2}/} (HTTP 404)."
+            else
+                err "The panel did not answer on ${XUI_PROBE_URL} (HTTP ${XUI_PROBE_CODE})."
+            fi
+            err "Check: systemctl status ${XUI_SERVICE_NAME}   and   journalctl -u ${XUI_SERVICE_NAME} -n 50"
+            ;;
+    esac
+    return "$rc"
+}
+
+# --- preflight ---------------------------------------------------------------
+
+xui_check_os() {
+    [[ "${EZVPS_SKIP_OS_CHECK:-0}" == "1" ]] && return 0
+    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line id="" ver=""
+    if [[ -r "$f" ]]; then
+        while IFS= read -r line; do
+            case "$line" in
+                ID=*) id="${line#ID=}" ;;
+                VERSION_ID=*) ver="${line#VERSION_ID=}" ;;
+            esac
+        done <"$f"
+    fi
+    id="${id//\"/}"
+    ver="${ver//\"/}"
+    if [[ "$id" != "debian" || "$ver" != "13" ]]; then
+        err "3x-ui install needs Debian 13; found '${id:-unknown} ${ver:-unknown}'. Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
+xui_preflight() {
+    require_root || return 1
+    xui_check_os || return 1
+    xui_require cp mkdir mv rm mktemp date chmod systemctl sha256sum || return 1
+    return 0
+}
+
+# curl is needed to download the installer. Offer to install it (Debian 13
+# minimal images do not ship it); never install without a yes.
+xui_ensure_curl() {
+    xui_have curl && return 0
+    info "curl is not installed; it is needed to download the 3x-ui installer."
+    if ! xui_have apt-get; then
+        err "apt-get not found; install curl manually and try again."
+        return 1
+    fi
+    xui_ask "Install curl with apt-get now?" || {
+        info "Cancelled. Nothing was changed."
+        return 1
+    }
+    apt-get update -q && apt-get install -y -q curl
+    if ! xui_have curl; then
+        err "curl is still not available; cannot continue."
+        return 1
+    fi
+    return 0
+}
+
+# --- backup ------------------------------------------------------------------
+
+# xui_backup [--binary]: copy the panel database/config (and optionally the
+# panel binary) to /var/backups/ezvps/x-ui.<timestamp>.<pid>/ (mode 700).
+# A failed copy aborts the caller before anything is changed.
+xui_backup() {
+    local dest copied=0 want_bin=0
+    [[ "${1:-}" == "--binary" && -f "$XUI_BIN" ]] && want_bin=1
+        dest="${XUI_BACKUP_BASE}/x-ui.$(date +%Y%m%d-%H%M%S).$$"
+    if [[ ! -d "$XUI_DB_DIR" && ! -f "${XUI_DIR}/bin/config.json" ]] && ((want_bin == 0)); then
+        info "Nothing to back up yet."
+        return 0
+    fi
+    if ! { mkdir -p "$XUI_BACKUP_BASE" && chmod 700 "$XUI_BACKUP_BASE" && mkdir -m 700 "$dest"; }; then
+        err "Cannot create backup directory ${dest}; aborting before any change."
+        return 1
+    fi
+    if [[ -d "$XUI_DB_DIR" ]]; then
+        cp -a "$XUI_DB_DIR" "${dest}/db" || {
+            err "Backup of ${XUI_DB_DIR} failed; aborting before any change."
+            return 1
+        }
+        copied=1
+    fi
+    if [[ -f "${XUI_DIR}/bin/config.json" ]]; then
+        cp -a "${XUI_DIR}/bin/config.json" "${dest}/config.json" || {
+            err "Backup of config.json failed; aborting before any change."
+            return 1
+        }
+        copied=1
+    fi
+    if ((want_bin == 1)); then
+        cp -a "$XUI_BIN" "${dest}/x-ui" || {
+            err "Backup of ${XUI_BIN} failed; aborting before any change."
+            return 1
+        }
+        copied=1
+    fi
+    if ((copied == 0)); then
+        rmdir "$dest" 2>/dev/null
+        info "Nothing to back up yet."
+        return 0
+    fi
+    info "Backed up the existing 3x-ui config to ${dest}"
+    return 0
+}
+
+# --- installer download ------------------------------------------------------
+
+xui_show_download_plan() {
+    info ""
+    info "ezvps will download the official 3x-ui installer and run it:"
+    info "  project:  https://github.com/${XUI_UPSTREAM}"
+    info "  version:  ${XUI_PINNED_TAG} (pinned release tag)"
+    info "  from:     ${XUI_INSTALLER_URL}"
+    info "  sha256:   ${XUI_INSTALLER_SHA256} (expected)"
+    info "The file is saved to a temporary directory and checked against that"
+    info "hash first; it is never piped into a shell. The installer then fetches"
+    info "the ${XUI_PINNED_TAG} release archive from GitHub and checks its published sha256."
+    info ""
+}
+
+# Downloads the pinned installer to $XUI_TMP_DIR/install.sh and verifies it.
+xui_fetch_installer() {
+    local actual
+    XUI_TMP_DIR="$(mktemp -d)" || {
+        err "Cannot create a temporary directory."
+        return 1
+    }
+    if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 --max-time 120 \
+        -o "${XUI_TMP_DIR}/install.sh" "$XUI_INSTALLER_URL"; then
+        err "Download failed: ${XUI_INSTALLER_URL}"
+        xui_cleanup_tmp
+        return 1
+    fi
+    actual="$(sha256sum "${XUI_TMP_DIR}/install.sh")" || {
+        err "sha256sum failed."
+        xui_cleanup_tmp
+        return 1
+    }
+    actual="${actual%% *}"
+    if [[ "$actual" != "$XUI_INSTALLER_SHA256" ]]; then
+        err "SHA-256 mismatch for the downloaded installer; refusing to run it."
+        err "  expected: ${XUI_INSTALLER_SHA256}"
+        err "  got:      ${actual}"
+        xui_cleanup_tmp
+        return 1
+    fi
+    info "Downloaded installer matches the pinned sha256."
+    return 0
+}
+
+# --- default mode helpers ----------------------------------------------------
+
+# Applies the owner-specified defaults with the panel's own CLI, then makes
+# sure no certificate is configured. Output of the CLI is shown (it never
+# echoes the password).
+xui_apply_defaults() {
+    local out rc
+    info "Applying panel settings (port ${XUI_DEF_PORT}, user ${XUI_DEF_USER}, path /${XUI_DEF_PATH}/, no certificate)..."
+    out="$("$XUI_BIN" setting -username "$XUI_DEF_USER" -password "$XUI_DEF_PASS" \
+        -port "$XUI_DEF_PORT" -webBasePath "$XUI_DEF_PATH" 2>&1)"
+    rc=$?
+    out="${out//"$XUI_DEF_PASS"/***}"
+    [[ -n "$out" ]] && info "$out"
+    # The panel CLI reports failures on stdout and still exits 0, so check its
+    # success messages (stable: the upstream version is pinned).
+    if ((rc != 0)) || [[ "$out" != *"Port set successfully"* || "$out" != *"Username and password updated successfully"* ]]; then
+        err "The panel settings command did not report success (exit ${rc})."
+        return 1
+    fi
+    out="$("$XUI_BIN" cert -reset 2>&1)"
+    rc=$?
+    [[ -n "$out" ]] && info "$out"
+    if ((rc != 0)); then
+        err "Clearing the certificate settings failed (exit ${rc})."
+        return 1
+    fi
+    if ! xui_read_settings; then
+        err "Cannot read the panel settings back to check them."
+        return 1
+    fi
+    if [[ "$XUI_CUR_PORT" != "$XUI_DEF_PORT" || "$XUI_CUR_PATH" != "$XUI_DEF_PATH" || "$XUI_CUR_TLS" == "yes" ]]; then
+        err "The panel does not report the expected settings (port='${XUI_CUR_PORT}', path='${XUI_CUR_PATH}', tls='${XUI_CUR_TLS}')."
+        return 1
+    fi
+    return 0
+}
+
+xui_restart_service() {
+    if ! systemctl restart "$XUI_SERVICE_NAME"; then
+        err "systemctl restart ${XUI_SERVICE_NAME} failed."
+        return 1
+    fi
+    return 0
+}
+
+xui_print_default_warning() {
+    warn ""
+    warn "=================================================================="
+    warn " WARNING: CHANGE THE PANEL PASSWORD NOW"
+    warn ""
+    warn " The login ${XUI_DEF_USER} / ${XUI_DEF_PASS} is a well-known default. Anyone who finds"
+    warn " port ${XUI_DEF_PORT} can log in. The panel also runs without TLS (plain HTTP),"
+    warn " so the password travels unencrypted."
+    warn ""
+    warn " Fix it now:  ezvps -> 3x-ui -> Change password"
+    warn "=================================================================="
+    warn ""
+}
+
+xui_print_result_summary() {
+    info ""
+    info "3x-ui panel (default install)"
+    info "  URL:       http://<server-ip>:${XUI_DEF_PORT}/${XUI_DEF_PATH}/"
+    info "  Username:  ${XUI_DEF_USER}"
+    info "  Password:  ${XUI_DEF_PASS}   <- known default, change it"
+    info "  TLS:       none (plain HTTP)"
+    xui_print_server_addresses
+}
+
+xui_print_server_addresses() {
+    local addrs
+    if xui_have hostname; then
+        addrs="$(hostname -I 2>/dev/null)"
+        addrs="${addrs%"${addrs##*[![:space:]]}"}"
+        [[ -n "$addrs" ]] && info "  This server's addresses: ${addrs}"
+    fi
+    return 0
+}
+
+# --- actions -----------------------------------------------------------------
+
+xui_install_default() {
+    xui_preflight || return 0
+    local existing=0 cur_matches=0 port_busy=0 rc
+
+    if xui_is_installed; then
+        existing=1
+        info ""
+        info "An existing 3x-ui panel was found:"
+        xui_describe_existing
+        if xui_read_settings; then
+            info "  port:     ${XUI_CUR_PORT}"
+            info "  path:     /${XUI_CUR_PATH}/"
+            if [[ "$XUI_CUR_PORT" == "$XUI_DEF_PORT" && "$XUI_CUR_PATH" == "$XUI_DEF_PATH" &&
+                "$XUI_CUR_TLS" != "yes" && "$(xui_state_get password_default)" == "1" ]]; then
+                cur_matches=1
+            fi
+        else
+            warn "  (could not read its current settings)"
+        fi
+    fi
+
+    if ((cur_matches == 1)); then
+        info ""
+        info "The panel already has the ezvps default settings; nothing to change."
+        if [[ "$(xui_service_state)" != "running" ]]; then
+            info "The service is not running; starting it."
+            systemctl start "$XUI_SERVICE_NAME" || warn "systemctl start ${XUI_SERVICE_NAME} failed."
+        fi
+        xui_verify_response "$XUI_DEF_PORT" "$XUI_DEF_PATH"
+        xui_print_result_summary
+        xui_print_default_warning
+        return 0
+    fi
+
+    # Port 3389 must be free, unless the existing panel is itself using it.
+    if xui_port_in_use "$XUI_DEF_PORT"; then
+        port_busy=1
+        if ((existing == 1)) && [[ "$XUI_CUR_PORT" == "$XUI_DEF_PORT" ]]; then
+            port_busy=0
+        fi
+    fi
+    if ((port_busy == 1)); then
+        err "Port ${XUI_DEF_PORT} is already in use by something else. Free it and try again. Nothing was changed."
+        return 0
+    fi
+
+    if ((existing == 1)); then
+        info ""
+        info "Default settings would REPLACE this panel's settings with:"
+        info "  port ${XUI_DEF_PORT}, username ${XUI_DEF_USER}, password ${XUI_DEF_PASS}, path /${XUI_DEF_PATH}/, no certificate."
+        info "The existing config is backed up first. The panel software itself is not reinstalled."
+        xui_backup || return 0
+        xui_ask "Overwrite the existing panel settings with the defaults?" || {
+            info "Cancelled. Settings left as they were."
+            return 0
+        }
+        if [[ ! -x "$XUI_BIN" ]]; then
+            err "${XUI_BIN} not found; cannot change settings. Use the self installer to repair the install."
+            return 0
+        fi
+    else
+        xui_ensure_curl || return 0
+        info ""
+        info "Default install will set up 3x-ui with:"
+        info "  port ${XUI_DEF_PORT}, username ${XUI_DEF_USER}, password ${XUI_DEF_PASS}, path /${XUI_DEF_PATH}/, no certificate (plain HTTP)."
+        info "The installer prints temporary generated credentials; ezvps replaces them right after."
+        xui_show_download_plan
+        xui_ask "Download and run the installer now?" || {
+            info "Cancelled. Nothing was changed."
+            return 0
+        }
+        xui_fetch_installer || return 0
+        info "Running the official installer non-interactively (no certificate)..."
+        trap ':' INT
+        XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_PANEL_PORT="$XUI_DEF_PORT" \
+            bash "${XUI_TMP_DIR}/install.sh" "$XUI_PINNED_TAG" </dev/null
+        rc=$?
+        trap - INT
+        xui_cleanup_tmp
+        if ((rc != 0)); then
+            err "The 3x-ui installer exited with status ${rc}. Default settings were not applied."
+            return 0
+        fi
+        if [[ ! -x "$XUI_BIN" ]]; then
+            err "The installer finished but ${XUI_BIN} does not exist; cannot apply settings."
+            return 0
+        fi
+    fi
+
+    if ! xui_apply_defaults; then
+        err "Default settings were NOT applied cleanly. Check the panel with: ezvps -> 3x-ui -> Status"
+        return 0
+    fi
+    xui_state_write default "$XUI_DEF_USER" 1
+    xui_restart_service || return 0
+    xui_verify_response "$XUI_DEF_PORT" "$XUI_DEF_PATH"
+    xui_print_result_summary
+    xui_print_default_warning
+    return 0
+}
+
+xui_install_self() {
+    xui_preflight || return 0
+    xui_ensure_curl || return 0
+    local rc
+    if xui_is_installed; then
+        info ""
+        info "An existing 3x-ui panel was found:"
+        xui_describe_existing
+        info "The official installer will upgrade/reconfigure it and may change its settings."
+        xui_backup --binary || return 0
+    fi
+    info ""
+    info "Self installer mode: the official installer asks its own questions"
+    info "(port, credentials, certificate...). ezvps does not pass any defaults."
+    xui_show_download_plan
+    xui_ask "Download and launch the installer now?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    xui_fetch_installer || return 0
+    info "Launching the 3x-ui installer..."
+    info ""
+    trap ':' INT
+    bash "${XUI_TMP_DIR}/install.sh" "$XUI_PINNED_TAG"
+    rc=$?
+    trap - INT
+    xui_cleanup_tmp
+    info ""
+    if ((rc != 0)); then
+        warn "The 3x-ui installer exited with status ${rc}."
+    fi
+    info "Returned to ezvps."
+    if xui_is_installed; then
+        # The credentials were chosen inside the installer; ezvps never saw them.
+        xui_state_write self "" 0
+        xui_status
+    fi
+    return 0
+}
+
+xui_status() {
+    if ! xui_is_installed; then
+        info "3x-ui is not installed."
+        return 0
+    fi
+    local state enabled="unknown" resp
+    state="$(xui_service_state)"
+    if xui_have systemctl; then
+        enabled="$(systemctl is-enabled "$XUI_SERVICE_NAME" 2>/dev/null)" || true
+        enabled="${enabled:-unknown}"
+    fi
+    info ""
+    info "3x-ui status"
+    info "  Service:   ${XUI_SERVICE_NAME} - ${state} (boot: ${enabled})"
+    if xui_read_settings; then
+        info "  Port:      ${XUI_CUR_PORT}"
+        info "  Path:      /${XUI_CUR_PATH:+${XUI_CUR_PATH}/}"
+        info "  TLS:       $([[ "$XUI_CUR_TLS" == "yes" ]] && printf 'yes' || printf 'no (plain HTTP)')"
+        xui_probe "$XUI_CUR_PORT" "$XUI_CUR_PATH"
+        case $? in
+            0) resp="yes (HTTP ${XUI_PROBE_CODE} at ${XUI_PROBE_URL})" ;;
+            2) resp="unknown (curl is not installed)" ;;
+            *) resp="NO (HTTP ${XUI_PROBE_CODE} at ${XUI_PROBE_URL})" ;;
+        esac
+        info "  Responds:  ${resp}"
+    else
+        info "  Port:      unknown (could not read the panel settings)"
+        info "  Path:      unknown"
+        info "  Responds:  unknown"
+    fi
+    if [[ "$(xui_state_get password_default)" == "1" ]]; then
+        warn "  The panel still uses the known default password. Change it: 3x-ui -> Change password"
+    fi
+    return 0
+}
+
+xui_restart() {
+    if ! xui_is_installed; then
+        info "3x-ui is not installed."
+        return 0
+    fi
+    xui_require systemctl || return 0
+    info "Restarting the ${XUI_SERVICE_NAME} service (only the panel service)..."
+    xui_restart_service || return 0
+    if xui_read_settings; then
+        xui_verify_response "$XUI_CUR_PORT" "$XUI_CUR_PATH"
+    else
+        info "Service restarted. Could not read the panel settings to check that it responds."
+    fi
+    return 0
+}
+
+# Best-effort lookup of the panel username: ezvps state, then the sqlite DB.
+xui_lookup_username() {
+    local u
+    u="$(xui_state_get username)"
+    if [[ -z "$u" ]] && xui_have sqlite3 && [[ -f "${XUI_DB_DIR}/x-ui.db" ]]; then
+        u="$(sqlite3 -readonly "${XUI_DB_DIR}/x-ui.db" 'SELECT username FROM users ORDER BY id LIMIT 1;' 2>/dev/null)" || u=""
+    fi
+    printf '%s' "${u//[[:cntrl:]]/}"
+}
+
+xui_info() {
+    if ! xui_is_installed; then
+        info "3x-ui is not installed."
+        return 0
+    fi
+    local mode user pwdef host_url
+    mode="$(xui_state_get mode)"
+    user="$(xui_lookup_username)"
+    pwdef="$(xui_state_get password_default)"
+    info ""
+    info "3x-ui panel info"
+    if xui_read_settings; then
+        host_url="$(xui_scheme)://<server-ip>:${XUI_CUR_PORT}/${XUI_CUR_PATH:+${XUI_CUR_PATH}/}"
+        info "  URL:       ${host_url}"
+        info "  Port:      ${XUI_CUR_PORT}"
+        info "  Path:      /${XUI_CUR_PATH:+${XUI_CUR_PATH}/}"
+        info "  TLS:       $([[ "$XUI_CUR_TLS" == "yes" ]] && printf 'yes' || printf 'no (plain HTTP)')"
+    else
+        info "  URL/Port/Path: unknown (could not read the panel settings)"
+    fi
+    xui_print_server_addresses
+    info "  Username:  ${user:-unknown (not available to ezvps; use the one set during install)}"
+    case "$mode" in
+        default)
+            if [[ "$pwdef" == "1" ]]; then
+                info "  Password:  ${XUI_DEF_PASS}   <- still the known default"
+                xui_print_default_warning
+            else
+                info "  Password:  the one you set with 'Change password'; ezvps does not store it."
+            fi
+            ;;
+        self)
+            info "  Password:  the one you set during the 3x-ui self installer;"
+            info "             it is not stored by ezvps."
+            ;;
+        *)
+            info "  Password:  not managed by ezvps (set outside it); ezvps does not store passwords."
+            ;;
+    esac
+    return 0
+}
+
+xui_change_password() {
+    if ! xui_is_installed; then
+        info "3x-ui is not installed."
+        return 0
+    fi
+    xui_require cp mkdir mv rm date chmod systemctl || return 0
+    if [[ ! -x "$XUI_BIN" ]]; then
+        err "${XUI_BIN} not found; cannot change the password."
+        return 0
+    fi
+    local user pw1 pw2 out rc
+    user="$(xui_lookup_username)"
+    if [[ -z "$user" ]]; then
+        warn "The panel CLI sets the username and password together, and ezvps does not know the current username."
+        warn "Enter the CURRENT username exactly; a typo would rename the panel login."
+        read -r -p "Current panel username: " user || {
+            info ""
+            return 0
+        }
+        user="${user//[[:cntrl:]]/}"
+        if [[ -z "$user" ]]; then
+            info "Cancelled. Nothing was changed."
+            return 0
+        fi
+    fi
+    info "Changing the password for panel user '${user}'."
+    read -r -s -p "New password: " pw1 || {
+        info ""
+        return 0
+    }
+    info ""
+    read -r -s -p "Repeat new password: " pw2 || {
+        info ""
+        return 0
+    }
+    info ""
+    if [[ "$pw1" != "$pw2" ]]; then
+        err "Passwords do not match. Nothing was changed."
+        return 0
+    fi
+    if ((${#pw1} < 8)); then
+        err "Use at least 8 characters. Nothing was changed."
+        return 0
+    fi
+    if [[ "$pw1" == "$XUI_DEF_PASS" ]]; then
+        err "That is the well-known default password; choose a different one. Nothing was changed."
+        return 0
+    fi
+    xui_backup || return 0
+    # The panel CLI only accepts the password as an argument, so it is visible
+    # in the process list for the instant this command runs. Its output is
+    # captured and shown only on failure, with the password masked.
+    out="$("$XUI_BIN" setting -username "$user" -password "$pw1" 2>&1)"
+    rc=$?
+    if ((rc != 0)) || [[ "$out" != *"Username and password updated successfully"* ]]; then
+        out="${out//"$pw1"/***}"
+        err "The panel settings command did not report success (exit ${rc}); the password was not changed."
+        [[ -n "$out" ]] && err "$out"
+        pw1="" pw2=""
+        return 0
+    fi
+    pw1="" pw2="" out=""
+    xui_state_write "$(xui_state_get mode)" "$user" 0
+    info "Password updated. Restarting the panel..."
+    xui_restart_service || return 0
+    if xui_read_settings; then
+        xui_verify_response "$XUI_CUR_PORT" "$XUI_CUR_PATH"
+    fi
+    info "Done. ezvps does not store or log the password; keep it in your password manager."
+    return 0
+}
+
+# --- submenu -----------------------------------------------------------------
+
+XUI_MENU_LABELS=("Install 3x-ui" "Install with 3x-ui self installer" "Status" "Restart" "Panel info" "Change password")
+
+module_3x_ui() {
+    local choice i
+    while true; do
+        info ""
+        info "${C_BOLD}3x-ui${C_RESET}"
+        info ""
+        for i in "${!XUI_MENU_LABELS[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${XUI_MENU_LABELS[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) xui_install_default || true ;;
+            2) xui_install_self || true ;;
+            3) xui_status || true ;;
+            4) xui_restart || true ;;
+            5) xui_info || true ;;
+            6) xui_change_password || true ;;
+            *)
+                warn "Invalid choice: ${choice:-<empty>}"
+                ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
     case "$1" in
         l2tp) module_l2tp ;;
-        3x-ui | backpack | ctunnel | nginx | certs | lazyports | ssh | firewall | backup | update | uninstall)
+        3x-ui) module_3x_ui ;;
+        backpack | ctunnel | nginx | certs | lazyports | ssh | firewall | backup | update | uninstall)
             module_not_implemented "$1"
             ;;
         *)
@@ -189,8 +984,8 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp is implemented in this release; the others report that they are
-not implemented yet."
+Only l2tp and 3x-ui are implemented in this release; the others report that
+they are not implemented yet."
 }
 
 require_root() {
