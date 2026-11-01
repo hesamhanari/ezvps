@@ -37,7 +37,7 @@ managing a Debian 13 VPS as root. `install.sh` installs it to
 ## Layout
 
 ```
-ezvps                    the panel script (bash, builtins-only so far)
+ezvps                    the panel script (bash; menu + L2TP are builtins-only)
 install.sh               installer
 tests/lint.sh            bash -n + shellcheck + hygiene scan
 tests/smoke-test.sh      automated smoke test (fake data, stubs, temp dirs)
@@ -51,13 +51,19 @@ SPEC.md  README.md  AGENTS.md
   errors explicitly so the menu survives).
 * Must pass `shellcheck` clean. Quote everything; use `[[ ]]`; `local`
   variables; functions named `module_<key>` for modules.
-* `ezvps` currently uses bash builtins only. Adding an external command is
-  a decision: check it exists (`command -v`) and degrade with a clear
+* Menu and L2TP use bash builtins only. Module code may use coreutils and
+  the few external commands its SPEC section lists (3x-ui: `systemctl`,
+  `sha256sum`, `curl`, optionally `ss`/`sqlite3`/`hostname`). Adding another
+  one is a decision: check it exists (`command -v`) and degrade with a clear
   message; do not assume it.
+* Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`
+  (lint enforces it). Download to a temp file, show URL and hash, verify,
+  ask, then run. Never pipe or process-substitute a download into a shell.
+  Pin a tag/version plus a SHA-256; never `master`/`main`.
 * Output goes through `info` / `warn` / `err`. Colour only on a TTY and
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
-  (`EZVPS_ALLOW_NONROOT`, `EZVPS_BIN_DIR`, ...). Do not add switches that
+  section 7a (`EZVPS_ALLOW_NONROOT`, `EZVPS_XUI_DIR`, ...). Do not add switches that
   weaken real behaviour.
 
 ## Adding a module
@@ -66,8 +72,9 @@ SPEC.md  README.md  AGENTS.md
    `module_not_implemented` entry).
 2. Follow the module contract in `SPEC.md` section 5.
 3. Extend `tests/smoke-test.sh` with stubs/fakes: no network, no real
-   system changes, fake data only. Remove the module from the
-   not-yet-implemented loop.
+   system changes, fake data only (the 3x-ui section is the template: a fake
+   panel CLI, stub `systemctl`/`curl`/`ss`, per-scenario temp dirs). Remove
+   the module from the not-yet-implemented loop.
 4. Add a section to `tests/fresh-vps-test.md` and update the status table in
    `SPEC.md`.
 5. One module per PR.

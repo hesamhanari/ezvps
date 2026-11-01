@@ -53,9 +53,32 @@ for f in "${files[@]}"; do
     fi
 done
 
-# 3. L2TP rule: ezvps must not download anything or embed the ezl2tp installer.
-if grep -nE 'curl|wget' ezvps | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
-    bad "ezvps must not use curl/wget in this release"
+# 3. Download rules.
+#    - ezvps may call curl only from the 3x-ui download/probe functions
+#      (xui_fetch_installer, xui_probe); never from L2TP or anywhere else.
+#    - Nothing is ever piped or process-substituted from the network into a shell.
+#    - install.sh downloads nothing.
+bad_curl="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
+    !/^[[:space:]]*#/ && /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/ {
+        if (fn != "xui_fetch_installer()" && fn != "xui_probe()") print NR": "$0 }' ezvps)"
+if [[ -n "$bad_curl" ]]; then
+    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe:"
+    printf '%s\n' "$bad_curl" >&2
+fi
+for f in ezvps install.sh; do
+    if grep -vE '^[[:space:]]*#' "$f" | grep -qE '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|da)?sh|(ba)?sh[[:space:]]+<\(|(source|\.)[[:space:]]+<\('; then
+        bad "$f: pipes a download into a shell"
+    fi
+done
+if grep -vE '^[[:space:]]*#' install.sh | grep -qE 'curl|wget'; then
+    bad "install.sh must not download anything"
+fi
+# 3x-ui installer must be fetched from a pinned tag, never a moving branch.
+if grep -nE 'raw\.githubusercontent\.com/[^"]*/(master|main|HEAD)/' ezvps | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+    bad "ezvps: installer URL must use a pinned tag, not master/main"
+fi
+if ! grep -qE '^XUI_INSTALLER_SHA256="[0-9a-f]{64}"' ezvps || ! grep -qE '^XUI_PINNED_TAG="v[0-9]+\.[0-9]+\.[0-9]+"' ezvps; then
+    bad "ezvps: XUI_PINNED_TAG / XUI_INSTALLER_SHA256 pin missing or malformed"
 fi
 
 if ((fail == 0)); then

@@ -3,9 +3,11 @@
 A bash TUI/CLI VPS manager for **Debian 13**, run as **root**. One script, no
 extra dependencies.
 
-> **Status: v0.0.1 in development.** Only **L2TP** works so far. The other
-> menu items print "not implemented yet" and return to the menu. They arrive
-> in later releases, one module per PR. See [SPEC.md](SPEC.md).
+> **Status: v0.0.1 in development.** **L2TP** and **3x-ui** work so far. The
+> other menu items (Backpack, ctunnel, Nginx, Certificates, Lazyports, SSH and
+> Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
+> they print "not implemented yet" and return to the menu. They arrive in
+> later releases, one module per PR. See [SPEC.md](SPEC.md).
 
 ## Install
 
@@ -56,6 +58,41 @@ Menu:
   returns to the menu. ezvps never downloads that repo anonymously and does
   not bundle the ezl2tp installer.
 
+### 3x-ui
+
+`ezvps` -> `2` opens a submenu:
+
+```
+ 1) Install 3x-ui
+ 2) Install with 3x-ui self installer
+ 3) Status
+ 4) Restart
+ 5) Panel info
+ 6) Change password
+ 0) Back
+```
+
+* **Install 3x-ui** downloads the official [3x-ui](https://github.com/MHSanaei/3x-ui)
+  installer at a **pinned release tag** (`v3.11.0`), shows the URL and its
+  SHA-256, verifies the hash and asks before running it (nothing is piped into
+  a shell). It then sets port `3389`, user `admin`, password `Admin123`, path
+  `xuipanel` and no certificate with the panel's own settings command, and
+  checks that the panel answers on that port and path. If a panel already
+  exists, its config is backed up first and you are asked before its settings
+  are overwritten.
+* **Install with 3x-ui self installer** launches the same pinned official
+  installer interactively; it asks its own questions and ezvps forces nothing.
+* **Status**, **Restart** (only the `x-ui` service), **Panel info** and
+  **Change password** (through the panel's own settings command, then a panel
+  restart; the new password is never printed, logged or stored).
+
+> **Change the password right after a default install.** `admin` / `Admin123`
+> is a well-known default and the default panel runs on plain HTTP (no TLS).
+> ezvps prints this warning after every default install: use
+> `3x-ui -> Change password` immediately.
+
+The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
+
 ## Principles
 
 Check before installing. Back up before overwriting. Idempotent re-runs. No
@@ -66,7 +103,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, not-yet-implemented paths, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui against a fake panel CLI, pending modules, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway Debian 13
