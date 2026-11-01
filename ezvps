@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ezvps - bash TUI/CLI VPS manager for Debian 13 (run as root).
 #
-# Implemented modules: L2TP (PR 1) and 3x-ui (PR 2). Every other module
+# Implemented modules: L2TP (PR 1), 3x-ui (PR 2) and Nginx (PR 3). Every other module
 # prints a clean "not implemented yet" message and returns without failing.
 #
 # Menu, L2TP and the rest of the script use bash builtins only. The 3x-ui
-# module also needs coreutils, systemctl and curl; each is checked with
+# module also needs coreutils, systemctl and curl, and the Nginx module needs
+# coreutils, systemctl, apt-get and nginx itself; each is checked with
 # `command -v` before use and the module degrades with a clear message.
 
 set -uo pipefail
@@ -157,22 +158,22 @@ XUI_CUR_PORT="" XUI_CUR_PATH="" XUI_CUR_TLS=""
 XUI_PROBE_CODE="" XUI_PROBE_URL=""
 XUI_TMP_DIR=""
 
-xui_have() { command -v "$1" >/dev/null 2>&1; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-xui_require() {
+require_cmds() {
     local c missing=()
     for c in "$@"; do
-        xui_have "$c" || missing+=("$c")
+        have_cmd "$c" || missing+=("$c")
     done
     if ((${#missing[@]} > 0)); then
-        err "3x-ui: required command(s) not found: ${missing[*]}"
+        err "Required command(s) not found: ${missing[*]}"
         return 1
     fi
     return 0
 }
 
-# xui_ask <question>: yes only on an explicit y/yes. EOF counts as no.
-xui_ask() {
+# ask_yes_no <question>: yes only on an explicit y/yes. EOF counts as no.
+ask_yes_no() {
     local reply
     read -r -p "$1 [y/N] " reply || {
         info ""
@@ -182,7 +183,7 @@ xui_ask() {
 }
 
 # Sleep without an external command.
-xui_sleep() { read -r -t "$1" <> <(:) || true; }
+sleep_s() { read -r -t "$1" <> <(:) || true; }
 
 xui_cleanup_tmp() {
     [[ -n "$XUI_TMP_DIR" && -d "$XUI_TMP_DIR" ]] && rm -rf "$XUI_TMP_DIR"
@@ -227,7 +228,7 @@ xui_state_write() {
 
 xui_is_installed() {
     [[ -x "$XUI_BIN" || -f "${XUI_DB_DIR}/x-ui.db" ]] && return 0
-    if xui_have systemctl; then
+    if have_cmd systemctl; then
         [[ "$(systemctl list-unit-files --no-legend "${XUI_SERVICE_NAME}.service" 2>/dev/null)" == *"${XUI_SERVICE_NAME}.service"* ]]
         return $?
     fi
@@ -237,14 +238,14 @@ xui_is_installed() {
 xui_describe_existing() {
     [[ -x "$XUI_BIN" ]] && info "  binary:   ${XUI_BIN}"
     [[ -f "${XUI_DB_DIR}/x-ui.db" ]] && info "  database: ${XUI_DB_DIR}/x-ui.db"
-    if xui_have systemctl; then
+    if have_cmd systemctl; then
         info "  service:  ${XUI_SERVICE_NAME} ($(xui_service_state))"
     fi
     return 0
 }
 
 xui_service_state() {
-    xui_have systemctl || {
+    have_cmd systemctl || {
         printf 'unknown'
         return 0
     }
@@ -278,10 +279,10 @@ xui_read_settings() {
 
 xui_scheme() { [[ "$XUI_CUR_TLS" == "yes" ]] && printf 'https' || printf 'http'; }
 
-# xui_port_in_use <port>: `ss` when present, else a bash /dev/tcp connect.
-xui_port_in_use() {
+# port_in_use <port>: `ss` when present, else a bash /dev/tcp connect.
+port_in_use() {
     local out
-    if xui_have ss; then
+    if have_cmd ss; then
         out="$(ss -H -ltn "( sport = :$1 )" 2>/dev/null)"
         [[ -n "$out" ]]
         return $?
@@ -294,7 +295,7 @@ xui_port_in_use() {
 xui_probe() {
     local url code
     XUI_PROBE_CODE="" XUI_PROBE_URL=""
-    xui_have curl || return 2
+    have_cmd curl || return 2
     url="$(xui_scheme)://127.0.0.1:${1}/${2:+${2}/}"
     XUI_PROBE_URL="$url"
     # -k: a panel certificate is issued for a domain, never for 127.0.0.1; this
@@ -313,7 +314,7 @@ xui_wait_ready() { # xui_wait_ready <port> <path>
             2) return 2 ;;
         esac
         ((waited >= max)) && return 1
-        xui_sleep 1
+        sleep_s 1
         waited=$((waited + 1))
     done
 }
@@ -340,7 +341,7 @@ xui_verify_response() {
 
 # --- preflight ---------------------------------------------------------------
 
-xui_check_os() {
+require_debian13() {
     [[ "${EZVPS_SKIP_OS_CHECK:-0}" == "1" ]] && return 0
     local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line id="" ver=""
     if [[ -r "$f" ]]; then
@@ -354,7 +355,7 @@ xui_check_os() {
     id="${id//\"/}"
     ver="${ver//\"/}"
     if [[ "$id" != "debian" || "$ver" != "13" ]]; then
-        err "3x-ui install needs Debian 13; found '${id:-unknown} ${ver:-unknown}'. Nothing was changed."
+        err "${1:-This action} needs Debian 13; found '${id:-unknown} ${ver:-unknown}'. Nothing was changed."
         return 1
     fi
     return 0
@@ -362,26 +363,26 @@ xui_check_os() {
 
 xui_preflight() {
     require_root || return 1
-    xui_check_os || return 1
-    xui_require cp mkdir mv rm mktemp date chmod systemctl sha256sum || return 1
+    require_debian13 "3x-ui install" || return 1
+    require_cmds cp mkdir mv rm mktemp date chmod systemctl sha256sum || return 1
     return 0
 }
 
 # curl is needed to download the installer. Offer to install it (Debian 13
 # minimal images do not ship it); never install without a yes.
 xui_ensure_curl() {
-    xui_have curl && return 0
+    have_cmd curl && return 0
     info "curl is not installed; it is needed to download the 3x-ui installer."
-    if ! xui_have apt-get; then
+    if ! have_cmd apt-get; then
         err "apt-get not found; install curl manually and try again."
         return 1
     fi
-    xui_ask "Install curl with apt-get now?" || {
+    ask_yes_no "Install curl with apt-get now?" || {
         info "Cancelled. Nothing was changed."
         return 1
     }
     apt-get update -q && apt-get install -y -q curl
-    if ! xui_have curl; then
+    if ! have_cmd curl; then
         err "curl is still not available; cannot continue."
         return 1
     fi
@@ -551,7 +552,7 @@ xui_print_result_summary() {
 
 xui_print_server_addresses() {
     local addrs
-    if xui_have hostname; then
+    if have_cmd hostname; then
         addrs="$(hostname -I 2>/dev/null)"
         addrs="${addrs%"${addrs##*[![:space:]]}"}"
         [[ -n "$addrs" ]] && info "  This server's addresses: ${addrs}"
@@ -596,7 +597,7 @@ xui_install_default() {
     fi
 
     # Port 3389 must be free, unless the existing panel is itself using it.
-    if xui_port_in_use "$XUI_DEF_PORT"; then
+    if port_in_use "$XUI_DEF_PORT"; then
         port_busy=1
         if ((existing == 1)) && [[ "$XUI_CUR_PORT" == "$XUI_DEF_PORT" ]]; then
             port_busy=0
@@ -613,7 +614,7 @@ xui_install_default() {
         info "  port ${XUI_DEF_PORT}, username ${XUI_DEF_USER}, password ${XUI_DEF_PASS}, path /${XUI_DEF_PATH}/, no certificate."
         info "The existing config is backed up first. The panel software itself is not reinstalled."
         xui_backup || return 0
-        xui_ask "Overwrite the existing panel settings with the defaults?" || {
+        ask_yes_no "Overwrite the existing panel settings with the defaults?" || {
             info "Cancelled. Settings left as they were."
             return 0
         }
@@ -628,7 +629,7 @@ xui_install_default() {
         info "  port ${XUI_DEF_PORT}, username ${XUI_DEF_USER}, password ${XUI_DEF_PASS}, path /${XUI_DEF_PATH}/, no certificate (plain HTTP)."
         info "The installer prints temporary generated credentials; ezvps replaces them right after."
         xui_show_download_plan
-        xui_ask "Download and run the installer now?" || {
+        ask_yes_no "Download and run the installer now?" || {
             info "Cancelled. Nothing was changed."
             return 0
         }
@@ -677,7 +678,7 @@ xui_install_self() {
     info "Self installer mode: the official installer asks its own questions"
     info "(port, credentials, certificate...). ezvps does not pass any defaults."
     xui_show_download_plan
-    xui_ask "Download and launch the installer now?" || {
+    ask_yes_no "Download and launch the installer now?" || {
         info "Cancelled. Nothing was changed."
         return 0
     }
@@ -709,7 +710,7 @@ xui_status() {
     fi
     local state enabled="unknown" resp
     state="$(xui_service_state)"
-    if xui_have systemctl; then
+    if have_cmd systemctl; then
         enabled="$(systemctl is-enabled "$XUI_SERVICE_NAME" 2>/dev/null)" || true
         enabled="${enabled:-unknown}"
     fi
@@ -743,7 +744,7 @@ xui_restart() {
         info "3x-ui is not installed."
         return 0
     fi
-    xui_require systemctl || return 0
+    require_cmds systemctl || return 0
     info "Restarting the ${XUI_SERVICE_NAME} service (only the panel service)..."
     xui_restart_service || return 0
     if xui_read_settings; then
@@ -758,7 +759,7 @@ xui_restart() {
 xui_lookup_username() {
     local u
     u="$(xui_state_get username)"
-    if [[ -z "$u" ]] && xui_have sqlite3 && [[ -f "${XUI_DB_DIR}/x-ui.db" ]]; then
+    if [[ -z "$u" ]] && have_cmd sqlite3 && [[ -f "${XUI_DB_DIR}/x-ui.db" ]]; then
         u="$(sqlite3 -readonly "${XUI_DB_DIR}/x-ui.db" 'SELECT username FROM users ORDER BY id LIMIT 1;' 2>/dev/null)" || u=""
     fi
     printf '%s' "${u//[[:cntrl:]]/}"
@@ -811,7 +812,7 @@ xui_change_password() {
         info "3x-ui is not installed."
         return 0
     fi
-    xui_require cp mkdir mv rm date chmod systemctl || return 0
+    require_cmds cp mkdir mv rm date chmod systemctl || return 0
     if [[ ! -x "$XUI_BIN" ]]; then
         err "${XUI_BIN} not found; cannot change the password."
         return 0
@@ -914,13 +915,711 @@ module_3x_ui() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Nginx module (PR 3)
+#
+# Installs nginx from apt and manages HTTP reverse-proxy sites in the Debian
+# layout (sites-available + symlink in sites-enabled). HTTP ONLY: certificates
+# and HTTPS belong to the separate Certificates module (later PR); nothing
+# here issues, stores or references a certificate.
+#
+# Rule used everywhere: `nginx -t` must pass before nginx is reloaded or
+# restarted. A change whose test fails is rolled back and nginx is left alone.
+# ---------------------------------------------------------------------------
+
+NGX_SERVICE_NAME="nginx"
+NGX_DIR="${EZVPS_NGINX_DIR:-/etc/nginx}"
+NGX_AVAIL="${NGX_DIR}/sites-available"
+NGX_ENABLED="${NGX_DIR}/sites-enabled"
+NGX_HTTP_PORT="${EZVPS_NGINX_HTTP_PORT:-80}"
+NGX_BACKUP_BASE="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
+
+# Filled by ngx_config_test / ngx_probe / ngx_read_site / ngx_parse_upstream / backup_file.
+NGX_TEST_OUT=""
+NGX_PROBE_CODE=""
+NGX_SITE_DOMAIN="" NGX_SITE_UPSTREAM="" NGX_SITE_MANAGED=0
+NGX_UP=""
+BACKUP_FILE_PATH=""
+NGX_SERVER_NAME_RE='^[[:space:]]*server_name[[:space:]]+([^;]+);'
+
+# Installed = the nginx command exists, or dpkg says the package is installed.
+ngx_installed() {
+    have_cmd nginx && return 0
+    if have_cmd dpkg-query; then
+        # shellcheck disable=SC2016 # ${db:...} is a dpkg-query format, not a shell expansion
+        [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' nginx 2>/dev/null)" == ii* ]] && return 0
+    fi
+    return 1
+}
+
+ngx_need_nginx() {
+    if ! ngx_installed; then
+        info "Nginx is not installed. Choose 'Install Nginx' first."
+        return 1
+    fi
+    if ! have_cmd nginx; then
+        err "The nginx package is installed but the 'nginx' command is not in PATH (is /usr/sbin in PATH?)."
+        return 1
+    fi
+    return 0
+}
+
+ngx_version() {
+    local v
+    have_cmd nginx || return 0
+    v="$(nginx -v 2>&1)"
+    v="${v#*nginx version: }"
+    printf '%s' "${v//[[:cntrl:]]/}"
+}
+
+ngx_service_state() {
+    have_cmd systemctl || {
+        printf 'unknown'
+        return 0
+    }
+    if systemctl is-active --quiet "$NGX_SERVICE_NAME" 2>/dev/null; then
+        printf 'running'
+    else
+        printf 'not running'
+    fi
+}
+
+# nginx -t. Output kept in NGX_TEST_OUT; return 0 only when the config is valid.
+ngx_config_test() {
+    NGX_TEST_OUT="$(nginx -t 2>&1)"
+    return $?
+}
+
+ngx_print_test_output() {
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && err "  ${line}"
+    done <<<"$NGX_TEST_OUT"
+    return 0
+}
+
+# Does nginx answer an HTTP request on 127.0.0.1:<port>? Pure bash (/dev/tcp),
+# so it also works on a fresh image without curl. Sets NGX_PROBE_CODE.
+ngx_probe() {
+    local line
+    NGX_PROBE_CODE=""
+    line="$(
+        (
+            resp=""
+            exec 3<>"/dev/tcp/127.0.0.1/${NGX_HTTP_PORT}" || exit 1
+            printf 'HEAD / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
+            read -r -t 5 resp <&3 || true
+            printf '%s' "$resp"
+        ) 2>/dev/null
+    )"
+    if [[ "$line" =~ ^HTTP/[0-9.]+[[:space:]]+([1-5][0-9][0-9]) ]]; then
+        NGX_PROBE_CODE="${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+ngx_wait_ready() {
+    local waited=0 max="${EZVPS_NGINX_WAIT_SECONDS:-15}"
+    while true; do
+        ngx_probe && return 0
+        ((waited >= max)) && return 1
+        sleep_s 1
+        waited=$((waited + 1))
+    done
+}
+
+ngx_verify_response() {
+    if ngx_wait_ready; then
+        info "Verified: nginx answers on 127.0.0.1:${NGX_HTTP_PORT} (HTTP ${NGX_PROBE_CODE})."
+        return 0
+    fi
+    err "nginx did not answer on 127.0.0.1:${NGX_HTTP_PORT}."
+    err "Check: systemctl status ${NGX_SERVICE_NAME}   and   journalctl -u ${NGX_SERVICE_NAME} -n 50"
+    return 1
+}
+
+# Reload only when the service is running (a reload of a stopped unit fails).
+# Callers must have a passing config test first.
+ngx_reload() {
+    if [[ "$(ngx_service_state)" != "running" ]]; then
+        info "nginx is not running, so nothing was reloaded. The config is valid; use Restart to start it."
+        return 0
+    fi
+    if systemctl reload "$NGX_SERVICE_NAME"; then
+        info "nginx reloaded."
+    else
+        err "systemctl reload ${NGX_SERVICE_NAME} failed. Check: journalctl -u ${NGX_SERVICE_NAME} -n 50"
+    fi
+    return 0
+}
+
+# --- generic backup of one file ----------------------------------------------
+
+# backup_file <src> <label>: copy to /var/backups/ezvps/<label>.<timestamp>.<pid>
+# (dir mode 700). Sets BACKUP_FILE_PATH. Non-zero (and a message) on failure.
+backup_file() {
+    local dest
+    BACKUP_FILE_PATH=""
+    dest="${NGX_BACKUP_BASE}/${2}.$(date +%Y%m%d-%H%M%S).$$"
+    if ! { mkdir -p "$NGX_BACKUP_BASE" && chmod 700 "$NGX_BACKUP_BASE" && cp -a "$1" "$dest"; }; then
+        err "Backup of ${1} to ${dest} failed; aborting before any change."
+        return 1
+    fi
+    BACKUP_FILE_PATH="$dest"
+    info "Backed up ${1} to ${dest}"
+    return 0
+}
+
+# --- install -----------------------------------------------------------------
+
+# Names who listens on a port (best effort; needs ss).
+port_listener_info() {
+    local out
+    if have_cmd ss; then
+        out="$(ss -H -ltnp "( sport = :$1 )" 2>/dev/null)"
+        [[ -n "$out" ]] && {
+            printf '%s' "$out"
+            return 0
+        }
+    fi
+    printf '(could not tell which program; run: ss -ltnp)'
+}
+
+ngx_install() {
+    require_root || return 0
+    require_debian13 "Nginx install" || return 0
+
+    if ngx_installed; then
+        info ""
+        info "Nginx is already installed ($(ngx_version || true)). Not reinstalling; current status:"
+        ngx_status
+        return 0
+    fi
+
+    require_cmds apt-get systemctl || return 0
+    if port_in_use "$NGX_HTTP_PORT"; then
+        warn ""
+        warn "Port ${NGX_HTTP_PORT} is already in use by another service:"
+        warn "  $(port_listener_info "$NGX_HTTP_PORT")"
+        warn "nginx cannot start until that port is free."
+        ask_yes_no "Install nginx anyway?" || {
+            info "Cancelled. Nothing was changed."
+            return 0
+        }
+    fi
+
+    info ""
+    info "ezvps will install the 'nginx' package from the Debian apt repositories,"
+    info "then enable it at boot and start it. The firewall is not changed."
+    ask_yes_no "Install nginx now?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx
+    if ! have_cmd nginx; then
+        err "nginx is still not available after the apt install; see the apt output above."
+        return 0
+    fi
+    if ! systemctl enable --now "$NGX_SERVICE_NAME"; then
+        err "systemctl enable --now ${NGX_SERVICE_NAME} failed."
+    fi
+    info ""
+    if ngx_config_test; then
+        info "Config test passes."
+    else
+        err "The nginx config test failed:"
+        ngx_print_test_output
+    fi
+    ngx_verify_response
+    info ""
+    info "Nginx is installed ($(ngx_version)). Add reverse-proxy sites with 'Add site'."
+    info "This module serves plain HTTP only. For HTTPS use the Certificates module"
+    info "once it exists (not available yet)."
+    return 0
+}
+
+# --- status / restart ----------------------------------------------------------
+
+ngx_status() {
+    if ! ngx_need_nginx; then
+        return 0
+    fi
+    local state enabled="unknown" resp
+    state="$(ngx_service_state)"
+    if have_cmd systemctl; then
+        enabled="$(systemctl is-enabled "$NGX_SERVICE_NAME" 2>/dev/null)" || true
+        enabled="${enabled:-unknown}"
+    fi
+    info ""
+    info "Nginx status"
+    info "  Installed:    yes ($(ngx_version))"
+    info "  Service:      ${NGX_SERVICE_NAME} - ${state} (boot: ${enabled})"
+    if ngx_config_test; then
+        info "  Config test:  passes"
+    else
+        err "  Config test:  FAILS (ezvps will not reload or restart nginx until it passes)"
+        ngx_print_test_output
+    fi
+    if ngx_probe; then
+        resp="yes (HTTP ${NGX_PROBE_CODE} on 127.0.0.1:${NGX_HTTP_PORT})"
+    else
+        resp="NO (nothing answered on 127.0.0.1:${NGX_HTTP_PORT})"
+    fi
+    info "  Responds:     ${resp}"
+    return 0
+}
+
+ngx_restart() {
+    ngx_need_nginx || return 0
+    require_cmds systemctl || return 0
+    info "Testing the nginx config first..."
+    if ! ngx_config_test; then
+        err "The config test FAILED. nginx was NOT restarted or reloaded."
+        ngx_print_test_output
+        err "Fix the config (see: nginx -t), then try again."
+        return 0
+    fi
+    info "Config test passes. Restarting ${NGX_SERVICE_NAME}..."
+    if ! systemctl restart "$NGX_SERVICE_NAME"; then
+        err "systemctl restart ${NGX_SERVICE_NAME} failed. Check: journalctl -u ${NGX_SERVICE_NAME} -n 50"
+        return 0
+    fi
+    ngx_verify_response
+    return 0
+}
+
+# --- site helpers --------------------------------------------------------------
+
+# Lowercase hostname with at least two labels, e.g. example.com.
+ngx_valid_domain() {
+    local d="$1"
+    ((${#d} <= 253)) || return 1
+    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$ ]]
+}
+
+ngx_valid_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local IFS=.
+    for o in $ip; do
+        ((10#$o <= 255)) || return 1
+    done
+    return 0
+}
+
+# ngx_parse_upstream <text>: accepts host:port, optionally with http://. Sets
+# NGX_UP. Host may be an IPv4 address, a hostname or a [IPv6] address.
+ngx_parse_upstream() {
+    local u="$1" host port
+    NGX_UP=""
+    u="${u#"${u%%[![:space:]]*}"}"
+    u="${u%"${u##*[![:space:]]}"}"
+    if [[ "$u" == https://* ]]; then
+        err "Only plain http upstreams are supported here (use host:port of a plain-HTTP backend)."
+        return 1
+    fi
+    u="${u#http://}"
+    u="${u%/}"
+    if [[ "$u" =~ ^(\[[0-9a-fA-F:.]+\]):([0-9]{1,5})$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$u" =~ ^([^:/]+):([0-9]{1,5})$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        if [[ "$host" =~ ^[0-9.]+$ ]]; then
+            ngx_valid_ipv4 "$host" || {
+                err "Not a valid IPv4 address: ${host}"
+                return 1
+            }
+        elif [[ ! "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+            err "Not a valid upstream host: ${host}"
+            return 1
+        fi
+    else
+        err "Upstream must look like host:port (for example 127.0.0.1:3000)."
+        return 1
+    fi
+    if ((10#$port < 1 || 10#$port > 65535)); then
+        err "Port must be between 1 and 65535."
+        return 1
+    fi
+    NGX_UP="${host}:$((10#$port))"
+    return 0
+}
+
+# ngx_read_site <file>: sets NGX_SITE_DOMAIN / NGX_SITE_UPSTREAM / NGX_SITE_MANAGED
+# (1 = created by ezvps). For other files the first server_name is reported.
+ngx_read_site() {
+    local line first_name=""
+    NGX_SITE_DOMAIN="" NGX_SITE_UPSTREAM="" NGX_SITE_MANAGED=0
+    [[ -r "$1" ]] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            "# Managed by ezvps"*) NGX_SITE_MANAGED=1 ;;
+            "# ezvps:domain="*) NGX_SITE_DOMAIN="${line#\# ezvps:domain=}" ;;
+            "# ezvps:upstream="*) NGX_SITE_UPSTREAM="${line#\# ezvps:upstream=}" ;;
+            *)
+                if [[ -z "$first_name" && "$line" =~ $NGX_SERVER_NAME_RE ]]; then
+                    read -r first_name _ <<<"${BASH_REMATCH[1]}"
+                fi
+                ;;
+        esac
+    done <"$1"
+    if ((NGX_SITE_MANAGED == 0)); then
+        NGX_SITE_DOMAIN="$first_name"
+        NGX_SITE_UPSTREAM=""
+    fi
+    NGX_SITE_DOMAIN="${NGX_SITE_DOMAIN//[[:cntrl:]]/}"
+    NGX_SITE_UPSTREAM="${NGX_SITE_UPSTREAM//[[:cntrl:]]/}"
+    return 0
+}
+
+# The IPv6 listener is only written when the kernel has IPv6; on a host booted
+# without it, `listen [::]:80` makes `nginx -t` fail with "Address family not
+# supported by protocol".
+ngx_ipv6_available() { [[ -e "${EZVPS_IF_INET6_FILE:-/proc/net/if_inet6}" ]]; }
+
+# shellcheck disable=SC2016 # nginx variables ($host ...) must stay literal
+ngx_render_site() { # ngx_render_site <domain> <upstream>
+    printf '%s\n' \
+        "# Managed by ezvps (Nginx module). HTTP reverse proxy; edit via ezvps or keep the markers." \
+        "# ezvps:domain=${1}" \
+        "# ezvps:upstream=${2}" \
+        "server {" \
+        "    listen 80;"
+    ngx_ipv6_available && printf '%s\n' "    listen [::]:80;"
+    printf '%s\n' \
+        "    server_name ${1};" \
+        "" \
+        "    location / {" \
+        "        proxy_pass http://${2};" \
+        "        proxy_http_version 1.1;" \
+        '        proxy_set_header Host $host;' \
+        '        proxy_set_header X-Real-IP $remote_addr;' \
+        '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
+        '        proxy_set_header X-Forwarded-Proto $scheme;' \
+        '        proxy_set_header Upgrade $http_upgrade;' \
+        '        proxy_set_header Connection "upgrade";' \
+        "    }" \
+        "}"
+    return 0
+}
+
+# Another enabled file (not named <domain>) that already serves <domain>.
+ngx_find_conflict() {
+    local f line tok
+    for f in "$NGX_ENABLED"/*; do
+        [[ -e "$f" && "${f##*/}" != "$1" ]] || continue
+        while IFS= read -r line; do
+            if [[ "$line" =~ $NGX_SERVER_NAME_RE ]]; then
+                for tok in ${BASH_REMATCH[1]}; do
+                    if [[ "$tok" == "$1" ]]; then
+                        printf '%s' "${f##*/}"
+                        return 0
+                    fi
+                done
+            fi
+        done <"$f"
+    done
+    return 1
+}
+
+ngx_ask_domain() { # sets REPLY_DOMAIN
+    local d
+    REPLY_DOMAIN=""
+    read -r -p "Domain (for example example.com): " d || {
+        info ""
+        return 1
+    }
+    d="${d#"${d%%[![:space:]]*}"}"
+    d="${d%"${d##*[![:space:]]}"}"
+    d="${d,,}"
+    if [[ -z "$d" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 1
+    fi
+    if ! ngx_valid_domain "$d"; then
+        err "'${d}' is not a valid domain name (use something like example.com). Nothing was changed."
+        return 1
+    fi
+    REPLY_DOMAIN="$d"
+    return 0
+}
+
+ngx_layout_ok() {
+    if [[ ! -d "$NGX_AVAIL" || ! -d "$NGX_ENABLED" ]]; then
+        err "Expected the Debian layout (${NGX_AVAIL} and ${NGX_ENABLED}) but it is missing."
+        return 1
+    fi
+    return 0
+}
+
+# ngx_rollback_site <domain> <avail_backup|""> <enabled_kind none|link|file> <link_target> <enabled_backup|"">
+ngx_rollback_site() {
+    local a="${NGX_AVAIL}/${1}" e="${NGX_ENABLED}/${1}" ok=0
+    rm -f "$a" "$e" || ok=1
+    [[ -n "$2" ]] && { cp -a "$2" "$a" || ok=1; }
+    case "$3" in
+        link) ln -s "$4" "$e" || ok=1 ;;
+        file) cp -a "$5" "$e" || ok=1 ;;
+    esac
+    if ((ok != 0)); then
+        err "ROLLBACK PROBLEM: could not fully restore ${1}. Backups: ${2:-none} ${5:-}"
+        return 1
+    fi
+    info "Rolled back: the previous state of ${1} was restored."
+    return 0
+}
+
+# --- list ------------------------------------------------------------------------
+
+ngx_list_sites() {
+    ngx_installed || {
+        info "Nginx is not installed. Choose 'Install Nginx' first."
+        return 0
+    }
+    ngx_layout_ok || return 0
+    local f name shown=0 disabled=()
+    info ""
+    info "Enabled sites (${NGX_ENABLED}):"
+    for f in "$NGX_ENABLED"/*; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        name="${f##*/}"
+        if ((shown == 0)); then
+            printf '  %-28s %-28s %-24s %s\n' "NAME" "DOMAIN" "UPSTREAM" "CREATED BY"
+            shown=1
+        fi
+        if [[ ! -e "$f" ]]; then
+            printf '  %-28s %-28s %-24s %s\n' "${name//[[:cntrl:]]/}" "-" "-" "(broken symlink)"
+            continue
+        fi
+        ngx_read_site "$f" || true
+        if ((NGX_SITE_MANAGED == 1)); then
+            printf '  %-28s %-28s %-24s %s\n' "${name//[[:cntrl:]]/}" "${NGX_SITE_DOMAIN:--}" "${NGX_SITE_UPSTREAM:--}" "ezvps"
+        else
+            printf '  %-28s %-28s %-24s %s\n' "${name//[[:cntrl:]]/}" "${NGX_SITE_DOMAIN:--}" "-" "not ezvps"
+        fi
+    done
+    ((shown == 0)) && info "  (none)"
+    for f in "$NGX_AVAIL"/*; do
+        [[ -e "$f" ]] || continue
+        name="${f##*/}"
+        [[ -e "${NGX_ENABLED}/${name}" ]] || disabled+=("${name//[[:cntrl:]]/}")
+    done
+    if ((${#disabled[@]} > 0)); then
+        info ""
+        info "Available but not enabled: ${disabled[*]}"
+    fi
+    return 0
+}
+
+# --- add ---------------------------------------------------------------------------
+
+ngx_add_site() {
+    ngx_need_nginx || return 0
+    require_cmds cp mkdir mv rm date chmod ln readlink systemctl || return 0
+    ngx_layout_ok || return 0
+    local domain upstream_raw a e conflict tmp
+    ngx_ask_domain || return 0
+    domain="$REPLY_DOMAIN"
+    read -r -p "Upstream address with port (for example 127.0.0.1:3000): " upstream_raw || {
+        info ""
+        return 0
+    }
+    ngx_parse_upstream "$upstream_raw" || {
+        info "Nothing was changed."
+        return 0
+    }
+    local up="$NGX_UP"
+    a="${NGX_AVAIL}/${domain}"
+    e="${NGX_ENABLED}/${domain}"
+
+    if conflict="$(ngx_find_conflict "$domain")"; then
+        err "${domain} is already served by another enabled site file: ${conflict}."
+        err "Remove or edit that site first so the domain is not defined twice. Nothing was changed."
+        return 0
+    fi
+
+    local old_avail_bk="" old_kind=none old_target="" old_enabled_bk=""
+    if [[ -e "$a" || -L "$a" || -e "$e" || -L "$e" ]]; then
+        if [[ -f "$a" ]]; then
+            ngx_read_site "$a" || true
+        else
+            NGX_SITE_MANAGED=0 NGX_SITE_UPSTREAM=""
+        fi
+        if ((NGX_SITE_MANAGED == 1)) && [[ "$NGX_SITE_DOMAIN" == "$domain" && "$NGX_SITE_UPSTREAM" == "$up" ]] &&
+            [[ -L "$e" && "$(readlink "$e")" == "$a" ]]; then
+            info ""
+            info "${domain} already exists with the same upstream (${up}) and is enabled. Nothing to do."
+            return 0
+        fi
+        info ""
+        info "A site for ${domain} already exists:"
+        if [[ -f "$a" ]]; then
+            if ((NGX_SITE_MANAGED == 1)); then
+                info "  ${a}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
+            else
+                info "  ${a}  (NOT created by ezvps)"
+            fi
+        fi
+        if [[ -e "$e" || -L "$e" ]]; then
+            info "  ${e}"
+        else
+            info "  (not enabled)"
+        fi
+        ask_yes_no "Overwrite it with a reverse proxy to ${up}? The old file is backed up first." || {
+            info "Cancelled. Nothing was changed."
+            return 0
+        }
+        if [[ -e "$a" || -L "$a" ]]; then
+            backup_file "$a" "nginx-site-${domain}" || return 0
+            old_avail_bk="$BACKUP_FILE_PATH"
+        fi
+        if [[ -L "$e" ]]; then
+            old_kind='link'
+            old_target="$(readlink "$e")"
+        elif [[ -f "$e" ]]; then
+            backup_file "$e" "nginx-site-${domain}.enabled" || return 0
+            old_enabled_bk="$BACKUP_FILE_PATH"
+            old_kind='file'
+        fi
+    fi
+
+    tmp="${NGX_AVAIL}/.${domain}.ezvps-tmp.$$"
+    if ! { ngx_render_site "$domain" "$up" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$a"; }; then
+        rm -f "$tmp"
+        err "Could not write ${a}. Nothing was changed."
+        return 0
+    fi
+    if ! { rm -f "$e" && ln -s "$a" "$e"; }; then
+        err "Could not enable the site (${e})."
+        ngx_rollback_site "$domain" "$old_avail_bk" "$old_kind" "$old_target" "$old_enabled_bk"
+        return 0
+    fi
+
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED after adding ${domain}; nginx was NOT reloaded."
+        ngx_print_test_output
+        ngx_rollback_site "$domain" "$old_avail_bk" "$old_kind" "$old_target" "$old_enabled_bk"
+        return 0
+    fi
+    info "Site ${domain} -> ${up} written to ${a} and enabled. Config test passes."
+    ngx_reload
+    if [[ "$up" == 127.0.0.1:* || "$up" == localhost:* ]] && ! port_in_use "${up##*:}"; then
+        warn "Nothing is listening on ${up} right now; visitors get a 502 until the backend is up."
+    fi
+    info ""
+    info "Point the DNS record of ${domain} at this server and make sure port 80 is open."
+    info "This site is HTTP only. If it needs HTTPS, use the Certificates module once it"
+    info "exists (not available yet); this module does not touch certificates."
+    return 0
+}
+
+# --- remove --------------------------------------------------------------------------
+
+ngx_remove_site() {
+    ngx_need_nginx || return 0
+    require_cmds cp mkdir rm date chmod ln readlink systemctl || return 0
+    ngx_layout_ok || return 0
+    local domain a e avail_bk="" kind=none target="" enabled_bk=""
+    ngx_ask_domain || return 0
+    domain="$REPLY_DOMAIN"
+    a="${NGX_AVAIL}/${domain}"
+    e="${NGX_ENABLED}/${domain}"
+    if [[ ! -e "$a" && ! -L "$a" && ! -e "$e" && ! -L "$e" ]]; then
+        info "No site named ${domain} in sites-available or sites-enabled. Nothing was changed."
+        return 0
+    fi
+    info ""
+    info "Site ${domain}:"
+    if [[ -f "$a" ]]; then
+        ngx_read_site "$a" || true
+        if ((NGX_SITE_MANAGED == 1)); then
+            info "  ${a}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
+        else
+            warn "  ${a}  (NOT created by ezvps - it was written by hand or another tool)"
+        fi
+    fi
+    if [[ -e "$e" || -L "$e" ]]; then
+        info "  ${e}  (enabled)"
+    fi
+    ask_yes_no "Disable and remove ${domain}? A backup of the file is kept." || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    if [[ -e "$a" || -L "$a" ]]; then
+        backup_file "$a" "nginx-site-${domain}" || return 0
+        avail_bk="$BACKUP_FILE_PATH"
+    fi
+    if [[ -L "$e" ]]; then
+        kind='link'
+        target="$(readlink "$e")"
+    elif [[ -f "$e" ]]; then
+        backup_file "$e" "nginx-site-${domain}.enabled" || return 0
+        enabled_bk="$BACKUP_FILE_PATH"
+        kind='file'
+    fi
+    if ! rm -f "$e" "$a"; then
+        err "Could not remove the site files."
+        ngx_rollback_site "$domain" "$avail_bk" "$kind" "$target" "$enabled_bk"
+        return 0
+    fi
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED after removing ${domain}; nginx was NOT reloaded."
+        ngx_print_test_output
+        ngx_rollback_site "$domain" "$avail_bk" "$kind" "$target" "$enabled_bk"
+        return 0
+    fi
+    info "Site ${domain} disabled and removed. Config test passes."
+    ngx_reload
+    return 0
+}
+
+# --- submenu -------------------------------------------------------------------------
+
+NGX_MENU_LABELS=("Install Nginx" "Status" "Restart" "List sites" "Add site" "Remove site")
+
+module_nginx() {
+    local choice i
+    while true; do
+        info ""
+        info "${C_BOLD}Nginx${C_RESET}"
+        info ""
+        for i in "${!NGX_MENU_LABELS[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${NGX_MENU_LABELS[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) ngx_install || true ;;
+            2) ngx_status || true ;;
+            3) ngx_restart || true ;;
+            4) ngx_list_sites || true ;;
+            5) ngx_add_site || true ;;
+            6) ngx_remove_site || true ;;
+            *)
+                warn "Invalid choice: ${choice:-<empty>}"
+                ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
     case "$1" in
         l2tp) module_l2tp ;;
         3x-ui) module_3x_ui ;;
-        backpack | ctunnel | nginx | certs | lazyports | ssh | firewall | backup | update | uninstall)
+        nginx) module_nginx ;;
+        backpack | ctunnel | certs | lazyports | ssh | firewall | backup | update | uninstall)
             module_not_implemented "$1"
             ;;
         *)
@@ -984,8 +1683,8 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp and 3x-ui are implemented in this release; the others report that
-they are not implemented yet."
+Only l2tp, 3x-ui and nginx are implemented in this release; the others report
+that they are not implemented yet."
 }
 
 require_root() {
