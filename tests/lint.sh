@@ -84,9 +84,26 @@ fi
 # Nginx must come from the nginx.org STABLE repository: the repo URL has no
 # "mainline", the key URL is https, the pin is priority 900, and the key
 # fingerprints are pinned (40 hex digits each).
-if ! grep -qE '^NGX_ORG_REPO_URL="https://nginx\.org/packages/debian"$' ezvps ||
-    grep -vE '^[[:space:]]*#' ezvps | grep -q 'nginx\.org/packages/mainline"'; then
-    bad "ezvps: the nginx.org repo URL must be https://nginx.org/packages/debian (stable), never mainline"
+if ! grep -qE '^NGX_ORG_REPO_DEBIAN="https://nginx\.org/packages/debian"$' ezvps ||
+    ! grep -qE '^NGX_ORG_REPO_UBUNTU="https://nginx\.org/packages/ubuntu"$' ezvps ||
+    grep -vE '^[[:space:]]*#' ezvps | grep -q 'https://nginx\.org/packages/mainline'; then
+    bad "ezvps: the nginx.org repo URLs must be https://nginx.org/packages/debian and .../ubuntu (stable), never mainline"
+fi
+# Every nginx.org repository URL in the script must be one of those two constants.
+if grep -vE '^[[:space:]]*#' ezvps | grep -oE 'https://nginx\.org/packages/[a-z/]*' | sort -u |
+    grep -vxE 'https://nginx\.org/packages/(debian|ubuntu)'; then
+    bad "ezvps: unexpected nginx.org repository URL (only packages/debian and packages/ubuntu are allowed)"
+fi
+# One shared OS check: the Debian-only function must not come back, and the
+# supported list must stay Debian 13 + Ubuntu 24.04 LTS.
+if grep -q 'require_debian13' ezvps; then
+    bad "ezvps: require_debian13 is gone; use require_supported_os (Debian 13 and Ubuntu 24.04 LTS)"
+fi
+if ! grep -qF '"debian 13") printf '"'"'trixie'"'"' ;;' ezvps || ! grep -qF '"ubuntu 24.04") printf '"'"'noble'"'"' ;;' ezvps; then
+    bad "ezvps: os_expected_codename must list exactly Debian 13 (trixie) and Ubuntu 24.04 (noble)"
+fi
+if [[ "$(grep -cE '^        "(debian|ubuntu) [0-9.]+"\) printf ' ezvps)" -ne 2 ]]; then
+    bad "ezvps: only Debian 13 and Ubuntu 24.04 may be listed as supported systems"
 fi
 if ! grep -qE '^NGX_ORG_KEY_URL="https://nginx\.org/keys/nginx_signing\.key"$' ezvps; then
     bad "ezvps: NGX_ORG_KEY_URL missing or changed"

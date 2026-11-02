@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ezvps - bash TUI/CLI VPS manager for Debian 13 (run as root).
+# ezvps - bash TUI/CLI VPS manager for Debian 13 and Ubuntu 24.04 LTS (run as root).
 #
 # Implemented modules: L2TP (PR 1), 3x-ui (PR 2) and Nginx (PR 3). Every other module
 # prints a clean "not implemented yet" message and returns without failing.
@@ -106,6 +106,16 @@ ezl2tp command exists, choose L2TP in ezvps again.
 
 module_l2tp() {
     local rc
+    # ezl2tp supports Debian 13 only for now (SPEC 6.1). Any unsupported system is
+    # rejected; on Ubuntu 24.04 ezvps itself works, but this module explains and
+    # returns without launching or installing anything.
+    require_supported_os "L2TP" || return 0
+    if [[ "$OS_ID" == "ubuntu" ]]; then
+        info ""
+        warn "L2TP via ezl2tp is Debian 13 only for now (found ${OS_PRETTY})."
+        info "ezvps does not launch or install ezl2tp on Ubuntu. Nothing was changed."
+        return 0
+    fi
     if command -v ezl2tp >/dev/null 2>&1; then
         info ""
         info "Launching ezl2tp..."
@@ -341,21 +351,60 @@ xui_verify_response() {
 
 # --- preflight ---------------------------------------------------------------
 
-require_debian13() {
-    [[ "${EZVPS_SKIP_OS_CHECK:-0}" == "1" ]] && return 0
-    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line id="" ver=""
+# --- operating system (shared by every module) -------------------------------
+#
+# Supported: Debian 13 (trixie) and Ubuntu 24.04 LTS (noble). Nothing else.
+# detect_os reads os-release (never sources it) and sets:
+#   OS_ID        distro id: debian, ubuntu, ... ("" when unreadable)
+#   OS_VERSION   VERSION_ID, for example 13 or 24.04
+#   OS_CODENAME  VERSION_CODENAME, for example trixie or noble
+#   OS_PRETTY    human text for messages, for example "Ubuntu 24.04"
+OS_ID="" OS_VERSION="" OS_CODENAME="" OS_PRETTY=""
+OS_SUPPORTED_TEXT="Debian 13 or Ubuntu 24.04 LTS"
+
+detect_os() {
+    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line v
+    OS_ID="" OS_VERSION="" OS_CODENAME="" OS_PRETTY=""
     if [[ -r "$f" ]]; then
         while IFS= read -r line; do
+            v="${line#*=}"
+            v="${v//\"/}"
+            v="${v//\'/}"
             case "$line" in
-                ID=*) id="${line#ID=}" ;;
-                VERSION_ID=*) ver="${line#VERSION_ID=}" ;;
+                ID=*) OS_ID="$v" ;;
+                VERSION_ID=*) OS_VERSION="$v" ;;
+                VERSION_CODENAME=*) OS_CODENAME="$v" ;;
             esac
         done <"$f"
     fi
-    id="${id//\"/}"
-    ver="${ver//\"/}"
-    if [[ "$id" != "debian" || "$ver" != "13" ]]; then
-        err "${1:-This action} needs Debian 13; found '${id:-unknown} ${ver:-unknown}'. Nothing was changed."
+    OS_ID="${OS_ID,,}"
+    OS_PRETTY="${OS_ID:-unknown}"
+    OS_PRETTY="${OS_PRETTY^} ${OS_VERSION:-unknown}"
+    return 0
+}
+
+# The codename a supported release must have (empty for anything else).
+os_expected_codename() { # os_expected_codename <id> <version>
+    case "$1 $2" in
+        "debian 13") printf 'trixie' ;;
+        "ubuntu 24.04") printf 'noble' ;;
+    esac
+    return 0
+}
+
+os_is_supported() { # os_is_supported <id> <version>
+    [[ -n "$(os_expected_codename "$1" "$2")" ]]
+}
+
+# require_supported_os <action>: detects the OS and accepts only Debian 13 and
+# Ubuntu 24.04 LTS. Anything else (Ubuntu 22.04, Debian 12, other distros, an
+# unreadable os-release) is refused before any change. EZVPS_SKIP_OS_CHECK=1 is
+# for tests only; detection still runs so modules can branch on the distro.
+require_supported_os() {
+    detect_os
+    [[ "${EZVPS_SKIP_OS_CHECK:-0}" == "1" ]] && return 0
+    if ! os_is_supported "$OS_ID" "$OS_VERSION"; then
+        err "${1:-This action} needs ${OS_SUPPORTED_TEXT}; found '${OS_ID:-unknown} ${OS_VERSION:-unknown}'. Nothing was changed."
         return 1
     fi
     return 0
@@ -363,13 +412,13 @@ require_debian13() {
 
 xui_preflight() {
     require_root || return 1
-    require_debian13 "3x-ui install" || return 1
+    require_supported_os "3x-ui install" || return 1
     require_cmds cp mkdir mv rm mktemp date chmod systemctl sha256sum || return 1
     return 0
 }
 
-# curl is needed to download the installer. Offer to install it (Debian 13
-# minimal images do not ship it); never install without a yes.
+# curl is needed to download the installer. Offer to install it (minimal
+# Debian/Ubuntu images do not always ship it); never install without a yes.
 xui_ensure_curl() {
     have_cmd curl && return 0
     info "curl is not installed; it is needed to download the 3x-ui installer."
@@ -1079,11 +1128,17 @@ backup_file() {
 
 # --- nginx.org stable source ----------------------------------------------------------------
 # nginx is installed ONLY from the official nginx.org stable repository (never
-# Debian's package, never the mainline branch). The repository, its signing key
-# and an apt pin (origin nginx.org, priority 900) are set up first, so apt can
-# not fall back to Debian's newer-looking or higher-ranked package later.
+# the distribution's package, never the mainline branch). The repository, its
+# signing key and an apt pin (origin nginx.org, priority 900) are set up first,
+# so apt can not fall back to the distribution's newer-looking or higher-ranked
+# package later.
+#
+# Debian and Ubuntu use the same layout and package names on nginx.org; only the
+# repository path differs. ngx_select_repo picks NGX_ORG_REPO_URL from the
+# detected distro, and the codename (trixie / noble) comes from os-release.
 
-NGX_ORG_REPO_URL="https://nginx.org/packages/debian"
+NGX_ORG_REPO_DEBIAN="https://nginx.org/packages/debian"
+NGX_ORG_REPO_UBUNTU="https://nginx.org/packages/ubuntu"
 NGX_ORG_KEY_URL="https://nginx.org/keys/nginx_signing.key"
 # Primary-key fingerprints published in nginx_signing.key. Every key in the
 # downloaded file must be one of these; if nginx.org rotates its keys the
@@ -1100,23 +1155,34 @@ NGX_APT_LIST="${NGX_APT_DIR}/sources.list.d/nginx.list"
 NGX_APT_PREF="${NGX_APT_DIR}/preferences.d/99nginx"
 
 # Filled by the helpers below.
-NGX_CODENAME="" NGX_SRC="" NGX_PKGVER="" NGX_CAND=""
+NGX_ORG_REPO_URL="" NGX_CODENAME="" NGX_SRC="" NGX_PKGVER="" NGX_CAND=""
 NGX_VER_MAJOR=0 NGX_VER_MINOR=0 NGX_VER_CLASS=""
 NGX_KEY_FPS=() NGX_KEY_TMP="" NGX_PURGE_PKGS=()
 NGX_REPO_UNDO_PATH=() NGX_REPO_UNDO_BK=()
 NGX_RESTORED=() NGX_NOT_RESTORED=()
 
-ngx_codename() {
-    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line
-    NGX_CODENAME=""
-    if [[ -r "$f" ]]; then
-        while IFS= read -r line; do
-            [[ "$line" == VERSION_CODENAME=* ]] && NGX_CODENAME="${line#VERSION_CODENAME=}"
-        done <"$f"
-    fi
-    NGX_CODENAME="${NGX_CODENAME//\"/}"
+# ngx_select_repo: from the detected OS (detect_os), choose the nginx.org
+# repository path and codename -> NGX_ORG_REPO_URL / NGX_CODENAME.
+#   Debian 13    https://nginx.org/packages/debian  trixie
+#   Ubuntu 24.04 https://nginx.org/packages/ubuntu  noble
+ngx_select_repo() {
+    local want
+    NGX_ORG_REPO_URL="" NGX_CODENAME="${OS_CODENAME}"
+    case "$OS_ID" in
+        debian) NGX_ORG_REPO_URL="$NGX_ORG_REPO_DEBIAN" ;;
+        ubuntu) NGX_ORG_REPO_URL="$NGX_ORG_REPO_UBUNTU" ;;
+        *)
+            err "nginx.org packages are only set up for Debian and Ubuntu; found '${OS_ID:-unknown}'. Nothing was changed."
+            return 1
+            ;;
+    esac
     if [[ ! "$NGX_CODENAME" =~ ^[a-z]+$ ]]; then
-        err "Could not read the Debian codename (VERSION_CODENAME) from ${f}; the nginx.org repository needs it. Nothing was changed."
+        err "Could not read the ${OS_ID^} codename (VERSION_CODENAME) from ${EZVPS_OS_RELEASE:-/etc/os-release}; the nginx.org repository needs it. Nothing was changed."
+        return 1
+    fi
+    want="$(os_expected_codename "$OS_ID" "$OS_VERSION")"
+    if [[ -n "$want" && "$NGX_CODENAME" != "$want" ]]; then
+        err "os-release says ${OS_PRETTY} but the codename '${NGX_CODENAME}' (expected '${want}'); refusing to guess the nginx.org repository. Nothing was changed."
         return 1
     fi
     return 0
@@ -1158,7 +1224,7 @@ ngx_pkg_version() {
 #   none       nothing installed
 #   org-ok     nginx.org package, stable 1.30 or newer
 #   org-bad    nginx.org package that is mainline or older than 1.30
-#   other      an apt package that is not from nginx.org (for example Debian's)
+#   other      an apt package that is not from nginx.org (for example the distribution's own)
 #   unmanaged  an nginx command but no apt package (built by hand)
 ngx_classify() {
     NGX_SRC="none"
@@ -1389,7 +1455,7 @@ ngx_verify_version() {
     fi
     v="$(ngx_version)"
     if ngx_pkg_version && [[ "$NGX_PKGVER" != *"~${NGX_CODENAME}" ]]; then
-        err "VERSION CHECK FAILED: the installed nginx is still a Debian package version (${NGX_PKGVER}), not nginx.org stable."
+        err "VERSION CHECK FAILED: the installed nginx is still the ${OS_ID^} package version (${NGX_PKGVER}), not nginx.org stable."
         return 1
     fi
     if ! ngx_ver_parse "$v"; then
@@ -1506,11 +1572,11 @@ ngx_install_plan() { # ngx_install_plan <replace 0|1> <tools to install...>
     shift
     info ""
     info "ezvps will install nginx ONLY from the official nginx.org STABLE repository"
-    info "(not Debian's package, not the mainline branch; stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR} or newer):"
+    info "(not ${OS_ID^}'s package, not the mainline branch; stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR} or newer):"
     info "  repository: deb [signed-by=${NGX_KEYRING}] ${NGX_ORG_REPO_URL} ${NGX_CODENAME} nginx"
     info "  signing key: ${NGX_ORG_KEY_URL} (checked against pinned fingerprints, stored in ${NGX_KEYRING})"
     info "  apt pin:     ${NGX_APT_PREF} (origin nginx.org, priority 900), so upgrades stay on nginx.org stable"
-    info "  then 'apt-get install nginx', a check with 'nginx -v' (abort if below ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}, mainline or a Debian build),"
+    info "  then 'apt-get install nginx', a check with 'nginx -v' (abort if below ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}, mainline or a ${OS_ID^} build),"
     info "  enable at boot and start. The firewall is not changed."
     if (($# > 0)); then
         info "  first: apt-get install ${*} (needed to fetch and check the key)"
@@ -1520,7 +1586,7 @@ ngx_install_plan() { # ngx_install_plan <replace 0|1> <tools to install...>
         if [[ "$NGX_SRC" == "org-bad" ]]; then
             warn "The installed nginx package ${NGX_PKGVER} is from nginx.org but is not stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}+."
         else
-            warn "An nginx package that is not from nginx.org is installed (${NGX_PKGVER}; for example Debian's). It will be REPLACED:"
+            warn "An nginx package that is not from nginx.org is installed (${NGX_PKGVER}; for example ${OS_ID^}'s). It will be REPLACED:"
         fi
         info "  1. ${NGX_DIR} is backed up to ${NGX_BACKUP_BASE}/nginx-etc.<timestamp>.<pid>"
         info "  2. the old package(s) are purged:${NGX_PURGE_PKGS[*]:+ ${NGX_PURGE_PKGS[*]}}"
@@ -1533,8 +1599,8 @@ ngx_install_plan() { # ngx_install_plan <replace 0|1> <tools to install...>
 
 ngx_install() {
     require_root || return 0
-    require_debian13 "Nginx install" || return 0
-    ngx_codename || return 0
+    require_supported_os "Nginx install" || return 0
+    ngx_select_repo || return 0
     ngx_classify
 
     case "$NGX_SRC" in
@@ -2490,7 +2556,7 @@ main_menu() {
 # ---------------------------------------------------------------------------
 
 usage() {
-    info "ezvps ${EZVPS_VERSION} - VPS manager for Debian 13
+    info "ezvps ${EZVPS_VERSION} - VPS manager for Debian 13 and Ubuntu 24.04 LTS
 
 Usage:
   ezvps                 open the interactive menu

@@ -2,15 +2,53 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6).
 
 ## 1. What ezvps is
 
-A bash TUI/CLI VPS manager for **Debian 13**, run as **root**. One script,
-installed as `/usr/local/bin/ezvps`. It has no dependencies beyond what a
-Debian 13 install already has (bash, coreutils, systemd); anything else a
+A bash TUI/CLI VPS manager for **Debian 13** and **Ubuntu 24.04 LTS**, run as
+**root**. One script, installed as `/usr/local/bin/ezvps`. It has no
+dependencies beyond what a Debian 13 or Ubuntu 24.04 install already has (bash,
+coreutils, systemd); anything else a
 module needs is checked with `command -v` first and installed only with the
 user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself).
+
+### 1.1 Supported systems
+
+| System | Version | Codename | Status | L2TP (ezl2tp) | 3x-ui | Nginx |
+|--------|---------|----------|--------|---------------|-------|-------|
+| Debian | 13 | `trixie` | **supported** | yes | yes | yes (`nginx.org/packages/debian`) |
+| Ubuntu | 24.04 LTS | `noble` | **supported** (PR 6) | **no: Debian 13 only for now** | yes | yes (`nginx.org/packages/ubuntu`) |
+| any other | Ubuntu 22.04, Debian 12, Fedora, derivatives such as Linux Mint, ... | n/a | **rejected** | n/a | n/a | n/a |
+
+* **One shared check.** `detect_os` reads `/etc/os-release` (the `ID`,
+  `VERSION_ID` and `VERSION_CODENAME` lines; the file is parsed, never sourced,
+  and `ID_LIKE` is ignored) and sets `OS_ID`, `OS_VERSION`, `OS_CODENAME`.
+  `require_supported_os "<action>"` calls it and accepts exactly `debian 13` and
+  `ubuntu 24.04`; everything else (other versions, other distros, derivatives, a
+  missing or unreadable file, a Debian without `VERSION_ID`) is refused with
+  `<action> needs Debian 13 or Ubuntu 24.04 LTS; found '<id> <version>'. Nothing
+  was changed.` and the module returns to the menu. The 3x-ui and Nginx installs,
+  L2TP and `install.sh` all use this rule; there is no separate Debian-only
+  check any more.
+* **Branch on the distro only where they differ,** with a comment: the nginx.org
+  repository path (6.3) and L2TP (6.1). Everything else is one code path.
+* **Audit of Debian-specific assumptions** (done for PR 6; re-check it when a
+  module is added):
+
+  | Area | Debian 13 | Ubuntu 24.04 | Result |
+  |------|-----------|--------------|--------|
+  | L2TP | ezl2tp supported | ezl2tp not ported | branch: Ubuntu prints a message and returns |
+  | 3x-ui installer | upstream `install.sh` handles `debian` | handles `ubuntu` the same way (`apt-get` dependencies, `x-ui.service.debian` unit) | one path |
+  | 3x-ui paths and service | `/usr/local/x-ui`, `/etc/x-ui`, `x-ui.service` | identical | one path |
+  | apt tooling | `apt-get`, `apt-cache`, `dpkg-query` | identical | one path |
+  | nginx package and service names | `nginx`, `nginx-common`, `libnginx-mod-*`, `nginx.service` | identical | one path |
+  | nginx.org repository | `packages/debian`, codename `trixie` | `packages/ubuntu`, codename `noble` | branch: URL and codename from the detected distro |
+  | nginx.org package version suffix | `~trixie` | `~noble` | one path (suffix is the detected codename) |
+  | distribution's own nginx | Debian's `1.26.x...+deb13...` | Ubuntu's `1.24.x...ubuntu...` | one path (anything not ending in `~<codename>` is replaced) |
+  | `/etc/nginx` layout and nginx.org `conf.d/default.conf` | `sites-*` plus `conf.d` | identical | one path |
+  | signing key, pin | `nginx.org` key fingerprints, `origin nginx.org` at 900 | identical | one path |
+  | 3x-ui/nginx prerequisites (`curl`, `gnupg`, `ca-certificates`) | same package names | same package names | one path |
 
 ## 2. Principles (same as easyl2tp)
 
@@ -106,10 +144,19 @@ redraws. EOF on stdin exits 0.
 | 11| Check For Updates | not implemented yet | later      |
 | 12| Uninstall         | not implemented yet | later      |
 
-One module per PR.
+One module per PR. Every implemented module runs on Debian 13 and Ubuntu 24.04
+LTS (section 1.1), **except L2TP, which is Debian 13 only** for now.
 
-### 6.1 L2TP (PR 1, done)
+### 6.1 L2TP (PR 1, done; Debian 13 only)
 
+* **Debian 13 only for now.** ezl2tp is not ported to Ubuntu in PR 6 and ezvps
+  does not try. The module first applies the shared OS check: an unsupported
+  system is refused (`L2TP needs Debian 13 or Ubuntu 24.04 LTS; found ...`).
+  On **Ubuntu 24.04** it prints `L2TP via ezl2tp is Debian 13 only for now
+  (found Ubuntu 24.04).` and `ezvps does not launch or install ezl2tp on Ubuntu.
+  Nothing was changed.`, then returns to the menu; it neither launches an
+  `ezl2tp` that happens to be on `PATH` nor prints install instructions. The
+  rest of this section describes Debian 13.
 * If `ezl2tp` exists on `PATH`: print `Launching ezl2tp...`, run it as a
   child process (not `exec`), then print `Returned to ezvps.` and go back to
   the menu. A non-zero exit from ezl2tp is reported but never fails ezvps.
@@ -164,8 +211,8 @@ continue...". Invalid input prints `Invalid choice: <input>`.
 #### Prechecks (both install modes)
 
 1. Root (`require_root`).
-2. Debian 13 (`/etc/os-release`: `ID=debian`, `VERSION_ID=13`); otherwise
-   refuse, nothing changed.
+2. Debian 13 or Ubuntu 24.04 LTS (`require_supported_os`, section 1.1);
+   otherwise refuse, nothing changed.
 3. Required commands present: coreutils, `systemctl`, `sha256sum`. `curl` is
    offered for install via `apt-get` (only after a yes) if missing.
 4. **Existing panel detection first**: panel binary `/usr/local/x-ui/x-ui`,
@@ -352,23 +399,23 @@ config is valid and nothing was reloaded.
 
 #### Install source: nginx.org stable only
 
-nginx is **never** installed from the Debian repository and **never** from the
-nginx.org mainline branch. The only source is the official nginx.org *stable*
+nginx is **never** installed from the Debian or Ubuntu repository and **never**
+from the nginx.org mainline branch. The only source is the official nginx.org *stable*
 repository, so the installed version is **stable 1.30 or newer** (stable
 branches have an even minor number; 1.31 is mainline).
 
 | Item | Value |
 |------|-------|
-| apt source (`/etc/apt/sources.list.d/nginx.list`) | `deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/debian <codename> nginx` (stable; the codename is `VERSION_CODENAME` from `/etc/os-release`, `trixie` on Debian 13) |
+| apt source (`/etc/apt/sources.list.d/nginx.list`) | `deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] <repo> <codename> nginx` (stable). `<repo>` and `<codename>` follow the detected system (`ngx_select_repo`): **Debian 13:** `https://nginx.org/packages/debian` + `trixie`; **Ubuntu 24.04 LTS:** `https://nginx.org/packages/ubuntu` + `noble`. The codename is `VERSION_CODENAME` from `/etc/os-release` and must match the supported release (an Ubuntu 24.04 file that says `jammy`, or a Debian 13 file that says `noble`, is refused); a missing codename or any other distro is refused. |
 | signing key | `https://nginx.org/keys/nginx_signing.key`, dearmored into `/usr/share/keyrings/nginx-archive-keyring.gpg` |
 | key check | every primary key in the downloaded file must have one of the **pinned fingerprints** (`NGX_ORG_KEY_FPRS` in `ezvps`: `8540A6F18833A80E9C1653A42FD21310B49F6B46`, `573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62`, `9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3`); anything else, or no key, is refused before anything is written. If nginx.org rotates its keys the install refuses until the pins are updated here and in the script. |
-| apt pin (`/etc/apt/preferences.d/99nginx`) | `Package: *` / `Pin: origin nginx.org` / `Pin-Priority: 900`, so later upgrades stay on nginx.org and Debian's `nginx` (priority 500) can never win |
+| apt pin (`/etc/apt/preferences.d/99nginx`) | `Package: *` / `Pin: origin nginx.org` / `Pin-Priority: 900`, so later upgrades stay on nginx.org and the distribution's `nginx` (priority 500) can never win |
 | download | only the key, with `curl --proto '=https' --tlsv1.2`, into a private temp dir, in `ngx_fetch_key` (the only Nginx function that may use `curl`) |
 
 Install steps:
 
-1. Root and Debian 13 (`/etc/os-release`) and a readable codename; otherwise
-   refuse, nothing changed.
+1. Root and a supported system (Debian 13 or Ubuntu 24.04 LTS, section 1.1) and a
+   readable codename matching it; otherwise refuse, nothing changed.
 2. **What is installed already?** (apt package `nginx` via `dpkg-query`, else the
    `nginx` command):
    * nginx.org package, stable >= 1.30 (`<version>~<codename>`): do not
@@ -376,7 +423,7 @@ Install steps:
      the Status block (plus a warning if the apt pin file is missing);
    * `nginx` command but no apt package (built by hand): not touched, same
      message;
-   * a package that is **not** from nginx.org (for example Debian's), or an
+   * a package that is **not** from nginx.org (for example Debian's or Ubuntu's own), or an
      nginx.org package that is mainline or older than 1.30: it is **replaced**
      (see below);
    * nothing: fresh install.
@@ -395,10 +442,11 @@ Install steps:
    update -q`. A failure here rolls the new files back and stops.
 7. **Candidate check before anything is removed or installed**: `apt-cache
    policy nginx` must name a candidate ending in `~<codename>` (nginx.org),
-   stable and >= 1.30. A Debian candidate (the pin is not working), a
-   mainline (1.31) candidate, an older one or none: refuse, roll the
-   repository files back, leave any installed nginx alone. This is the "never
-   install over a Debian nginx without the pin" guard.
+   stable and >= 1.30. A Debian/Ubuntu candidate (the pin is not working), a
+   candidate built for another codename, a mainline (1.31) candidate, an older
+   one or none: refuse, roll the repository files back, leave any installed
+   nginx alone. This is the "never install over a Debian/Ubuntu nginx without
+   the pin" guard.
 8. Replacing another nginx (only after step 7 passed): `/etc/nginx` is backed
    up first to `/var/backups/ezvps/nginx-etc.<timestamp>.<pid>`; then the old
    packages (`nginx`, `nginx-common`, `nginx-*`, `libnginx-mod-*`) are
@@ -408,7 +456,7 @@ Install steps:
    Dpkg::Options::=--force-confold nginx`.
 10. **Version check** with `nginx -v` (and `dpkg-query`): abort with a clear
     error, without starting nginx or restoring anything, if the package is
-    still a Debian version (not `~<codename>`), if the version is below 1.30,
+    still a Debian/Ubuntu version (not `~<codename>`), if the version is below 1.30,
     or if it is a mainline build (odd minor, such as 1.31). The error names
     the backup of the previous `/etc/nginx` when one was taken.
 11. `systemctl enable --now nginx`; `nginx -t`.
@@ -592,7 +640,10 @@ ezl2tp unless the user explicitly picks it.
 
 * Installs `ezvps` to `/usr/local/bin/ezvps` (mode 0755) from the checkout
   it is run from. Downloads nothing.
-* Requires root; warns (does not fail) when the OS is not Debian 13.
+* Requires root; **refuses** (exit 1, nothing installed) when the OS is not
+  Debian 13 or Ubuntu 24.04 LTS, using the same rule as `require_supported_os`
+  (section 1.1; it reads `/etc/os-release`, or `EZVPS_OS_RELEASE`, without
+  sourcing it).
 * Refuses to install a script that fails `bash -n` or `--version`.
 * Safe to re-run: identical file => "already up to date", no backup. Changed
   file => old copy saved to `/var/backups/ezvps/ezvps.<timestamp>.<pid>`,
@@ -609,8 +660,8 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx), install.sh | skip the Debian 13 check |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx) | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP still refuses to run on Ubuntu, and Nginx still picks the repository from the detected distro (an unknown distro gets none) |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
@@ -690,4 +741,25 @@ Defaults are the real paths; none of these relax a check on a real server.
   one (never mainline), the key URL, the fingerprint pins and the priority-900
   pin are present, and that `curl` is used only in the 3x-ui download/probe
   functions and `ngx_fetch_key`.
-* `tests/fresh-vps-test.md`: manual checklist on a throwaway Debian 13 VPS.
+* **Operating systems** (`== operating systems` in the smoke test, always with
+  fake os-release files in a temp dir and the check switched ON): Debian 13 and
+  Ubuntu 24.04 (also with a quoted `ID="ubuntu"`) are accepted; Ubuntu 22.04,
+  Debian 12, an unknown distro (Fedora), a derivative whose `ID_LIKE` says
+  ubuntu (Linux Mint), a Debian without `VERSION_ID` and a missing file are
+  rejected with the exact message, by 3x-ui, Nginx, L2TP and `install.sh`, and
+  nothing is changed. Nginx repository selection: the plan and
+  `nginx.list` carry `packages/debian ... trixie` on Debian and
+  `packages/ubuntu ... noble` on Ubuntu (never the other path, never mainline);
+  the fake apt only honours the pin when the source line names the right path
+  and codename, which is how the tests prove it. A full fake install flow runs
+  on both systems (key check, order key -> update -> install, `~<codename>`
+  package, version check, enable, config test, no-op re-run) as does the
+  replacement of the distribution's own nginx (backup of `/etc/nginx` before the
+  purge, restore of the ezvps sites), plus Ubuntu refusals (pin not working,
+  wrong repository path, mainline source/candidate, old candidate, candidate for
+  another codename, Ubuntu package after install, wrong or missing codename).
+  L2TP on Ubuntu prints the Debian-only message, does not launch ezl2tp even
+  when it is present and shows no install instructions. A default 3x-ui install
+  runs on Ubuntu 24.04.
+* `tests/fresh-vps-test.md`: manual checklist on a throwaway Debian 13 VPS and
+  on a throwaway Ubuntu 24.04 LTS VPS.
