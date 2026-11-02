@@ -1349,8 +1349,9 @@ connections, and to keep the session until a new one works.
    planted in a user's home); a missing home is not created.
 2. Asks for the public key **without echo** (`read -s`), as one line; a multi-line paste's leftover
    lines are drained on a terminal so they cannot answer later prompts.
-3. **Validation** (the key is never echoed back, even on failure): a line that contains `PRIVATE KEY`,
-   starts with `-----` or `PuTTY-User-Key-File` is **refused as a private key** and discarded;
+3. **Validation** (the key is never echoed back, even on failure): a line that contains `PRIVATE KEY`
+   or starts with `PuTTY-User-Key-File` is **refused as a private key** and discarded (any other
+   PEM block, such as `BEGIN PUBLIC KEY`, is refused as not an OpenSSH public key);
    control characters or more than 8192 characters are refused; otherwise it must be exactly
    `<type> <base64> [comment]` with a type in `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256|384|521`,
    `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, a base64 blob (length a multiple

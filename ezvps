@@ -4960,7 +4960,7 @@ ssh_key_prefix() {
 ssh_key_validate() {
     local line="$1" type blob comment pre
     SSH_KEY_TYPE="" SSH_KEY_BLOB="" SSH_KEY_COMMENT="" SSH_KEY_ERR=""
-    if [[ "$line" == *"PRIVATE KEY"* || "$line" == -----* || "$line" == PuTTY-User-Key-File* ]]; then
+    if [[ "$line" == *"PRIVATE KEY"* || "$line" == PuTTY-User-Key-File* ]]; then
         SSH_KEY_ERR="That looks like a PRIVATE key. Never paste a private key; ezvps did not keep it. Paste the public key (the one-line .pub file) instead."
         return 1
     fi

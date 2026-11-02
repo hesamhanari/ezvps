@@ -4688,6 +4688,8 @@ done
 ssh_new
 run_ssh "5\ntestuser\nssh-rsa ${SSH_BLOB_RSA}\ny\n0\n"
 check "key type ssh-rsa (no comment) is accepted" test -s "$FIX/home/testuser/.ssh/authorized_keys"
+run_ssh "5\ntestuser\n-----BEGIN PUBLIC"" KEY-----\n0\n"
+check "key: a PEM public key is refused as not an OpenSSH key, not mislabelled as a private key" equals "$(contains "$OUT" "does not look like an OpenSSH public key" && ! contains "$OUT" "PRIVATE key" && echo ok)" ok
 run_ssh "5\ntestuser\n\n0\n"
 check "key: an empty key cancels" contains "$OUT" "Cancelled. Nothing was changed."
 # bad users / paths
