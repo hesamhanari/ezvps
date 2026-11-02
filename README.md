@@ -3,9 +3,9 @@
 A bash TUI/CLI VPS manager for **Debian 13**, run as **root**. One script, no
 extra dependencies.
 
-> **Status: v0.0.1 in development.** **L2TP** and **3x-ui** work so far. The
-> other menu items (Backpack, ctunnel, Nginx, Certificates, Lazyports, SSH and
-> Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
+> **Status: v0.0.1 in development.** **L2TP**, **3x-ui** and **Nginx** work so
+> far. The other menu items (Backpack, ctunnel, Certificates, Lazyports, SSH
+> and Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
 > they print "not implemented yet" and return to the menu. They arrive in
 > later releases, one module per PR. See [SPEC.md](SPEC.md).
 
@@ -93,6 +93,41 @@ Menu:
 
 The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
 
+### Nginx
+
+`ezvps` -> `5` opens a submenu:
+
+```
+ 1) Install Nginx
+ 2) Status
+ 3) Restart
+ 4) List sites
+ 5) Add site
+ 6) Remove site
+ 0) Back
+```
+
+* **Install Nginx** installs the `nginx` package from apt, enables and starts
+  the service and checks that it answers. If nginx is already installed it is
+  not reinstalled, only its status is shown. Port 80 is checked first and a
+  conflicting service is reported.
+* **Status** shows whether the service runs and whether `nginx -t` passes.
+  **Restart** runs the config test first and never restarts or reloads a
+  broken config.
+* **List sites** shows the enabled sites of the Debian
+  `sites-available`/`sites-enabled` layout with their domain and, for sites
+  created by ezvps, the upstream.
+* **Add site** asks for a domain and an upstream `host:port`, writes a
+  reverse-proxy file to `sites-available`, enables it with a symlink, and
+  reloads nginx only if `nginx -t` passes (otherwise the change is rolled
+  back). It never duplicates a site and asks before overwriting; the old file
+  is backed up to `/var/backups/ezvps/` first. **Remove site** asks for
+  confirmation, backs the file up, removes it and reloads only after a passing
+  test.
+
+Sites are **HTTP only** for now. For HTTPS use the Certificates module once it
+exists (a later release); the Nginx module does not touch certificates.
+
 ## Principles
 
 Check before installing. Back up before overwriting. Idempotent re-runs. No
@@ -103,7 +138,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui against a fake panel CLI, pending modules, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui and Nginx against fakes, pending modules, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway Debian 13

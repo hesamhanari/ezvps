@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3).
 
 ## 1. What ezvps is
 
@@ -10,7 +10,7 @@ A bash TUI/CLI VPS manager for **Debian 13**, run as **root**. One script,
 installed as `/usr/local/bin/ezvps`. It has no dependencies beyond what a
 Debian 13 install already has (bash, coreutils, systemd); anything else a
 module needs is checked with `command -v` first and installed only with the
-user's say-so (for 3x-ui that is only `curl`).
+user's say-so (3x-ui: `curl`; Nginx: the `nginx` package itself).
 
 ## 2. Principles (same as easyl2tp)
 
@@ -97,7 +97,7 @@ redraws. EOF on stdin exits 0.
 | 2 | 3x-ui             | **implemented**     | PR 2       |
 | 3 | Backpack          | not implemented yet | later      |
 | 4 | ctunnel           | not implemented yet | later      |
-| 5 | Nginx             | not implemented yet | later      |
+| 5 | Nginx             | **implemented**     | PR 3       |
 | 6 | Certificates      | not implemented yet | later      |
 | 7 | Lazyports         | not implemented yet | later      |
 | 8 | SSH and Users     | not implemented yet | later      |
@@ -285,11 +285,128 @@ the panel database if `sqlite3` is installed, else says it is unknown.
   **No password is ever stored.**
 * Module key `3x-ui` maps to the function `module_3x_ui`.
 
-### 6.3 Nginx (later PR)
+### 6.3 Nginx (PR 3, done)
 
-Detect/install nginx; manage reverse-proxy site configs (list, add, enable,
-disable, remove) with backup before overwrite, `nginx -t` before every
-reload, rollback to the backup if the test fails.
+Menu item 5 opens a submenu. Clean labels only:
+
+```
+ 1) Install Nginx
+ 2) Status
+ 3) Restart
+ 4) List sites
+ 5) Add site
+ 6) Remove site
+ 0) Back
+```
+
+`0` or EOF returns to the main menu; after each action "Press Enter to
+continue..."; invalid input prints `Invalid choice: <input>`. Module key
+`nginx` maps to `module_nginx`; its helpers are prefixed `ngx_`.
+
+**HTTP only.** This module never issues, stores or references a certificate
+and writes no `listen 443` / `ssl_*` directives. A site that needs HTTPS is
+told to use the Certificates module (section 6.4) once it exists; until then
+the message says it is not available yet.
+
+#### The one rule: test before reload
+
+`nginx -t` must pass before nginx is reloaded or restarted, every time. A
+change whose test fails is **rolled back** (new files removed, an overwritten
+or removed site restored byte for byte, symlink restored), nginx is left
+alone, the nginx error output is shown, and the menu continues. A reload is
+only attempted when the `nginx` service is running; otherwise ezvps says the
+config is valid and nothing was reloaded.
+
+#### 1) Install Nginx
+
+1. Root and Debian 13 (`/etc/os-release`); otherwise refuse, nothing changed.
+2. **Installed already?** (`nginx` command in `PATH`, or `dpkg-query` says the
+   package is installed): do not reinstall; print
+   `Nginx is already installed (...). Not reinstalling` and the Status block.
+3. Fresh install: if port 80 is already in use (`ss`, else a `/dev/tcp`
+   connect) warn, show who listens (`ss -ltnp`) and ask whether to install
+   anyway (nginx cannot start until the port is free).
+4. Show what will happen (apt package `nginx`; firewall not changed), ask.
+5. `apt-get update -q` then `DEBIAN_FRONTEND=noninteractive apt-get install
+   -y -q nginx`; `systemctl enable --now nginx`; `nginx -t`.
+6. **Verify it responds**: an HTTP `HEAD /` to `127.0.0.1:80` (pure bash
+   `/dev/tcp`, so it works without curl), retried up to 15 s; prints the HTTP
+   status. Then the HTTP-only / Certificates note.
+
+#### 2) Status
+
+Read-only: installed + version, service running/not running and enabled at
+boot, **config test passes/FAILS** (with the nginx error output when it
+fails), and whether it responds on port 80.
+
+#### 3) Restart
+
+Runs the config test **first**. Test fails: `nginx was NOT restarted or
+reloaded`, error output shown, nothing else happens. Test passes:
+`systemctl restart nginx`, then the same responds check. Never reloads or
+restarts a broken config.
+
+#### 4) List sites
+
+Lists the entries of `/etc/nginx/sites-enabled` (Debian layout) as a table
+`NAME  DOMAIN  UPSTREAM  CREATED BY`:
+
+* sites created by ezvps (they carry a `# Managed by ezvps` header and
+  `# ezvps:domain=` / `# ezvps:upstream=` marker lines): domain and upstream
+  from the markers, `ezvps`;
+* any other site (including Debian's `default`): its first `server_name`, no
+  upstream, `not ezvps`;
+* a dangling symlink is flagged.
+
+Sites present in `sites-available` but not enabled are listed on a separate
+line. Read-only.
+
+#### 5) Add site
+
+1. Needs nginx installed and the Debian `sites-available`/`sites-enabled`
+   layout.
+2. Asks for the **domain** (lower-cased; hostname with at least two labels,
+   no paths or spaces) and the **upstream** `host:port` (IPv4, hostname or
+   `[IPv6]`; optional `http://` and trailing `/` are accepted and normalised;
+   `https://` upstreams and a missing/invalid port are rejected). Invalid
+   input changes nothing.
+3. **No duplicates.** If another enabled file already serves the domain
+   (`server_name`) the add is refused. If `sites-available/<domain>` exists:
+   identical (ezvps-made, same upstream, enabled) => `Nothing to do`, no
+   change, no reload; otherwise it is described and ezvps **asks before
+   overwriting**, then backs the old file up first.
+4. Writes `/etc/nginx/sites-available/<domain>` (temp file + `mv`) and enables
+   it with the symlink `/etc/nginx/sites-enabled/<domain>`. The generated
+   file is a plain `listen 80` server (plus `listen [::]:80` only when the
+   kernel has IPv6, i.e. `/proc/net/if_inet6` exists; otherwise `nginx -t`
+   fails on such hosts) with
+   `proxy_pass http://<upstream>`, `proxy_http_version 1.1` and
+   `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `Upgrade`,
+   `Connection` headers.
+5. `nginx -t`: pass => reload; fail => rollback (see above). Note that nginx
+   resolves a hostname upstream when it loads the config, so a name that does
+   not resolve fails the test and the site is rolled back; use an IP or a
+   resolvable name.
+6. Reminders: point DNS at the server, port 80 must be open (the firewall is
+   not changed here); a warning if nothing listens on a loopback upstream yet;
+   the HTTP-only / Certificates note.
+
+#### 6) Remove site
+
+Asks for the domain, shows the files (and whether ezvps created them; a site
+not created by ezvps gets an explicit warning), **requires a yes**, backs the
+file up, removes the symlink and the `sites-available` file, runs `nginx -t`,
+and reloads only if it passes (otherwise rolls back and does not reload). An
+unknown domain changes nothing.
+
+#### Backups
+
+Before overwriting or removing, the file is copied to
+`/var/backups/ezvps/nginx-site-<domain>.<timestamp>.<pid>` (dir mode 700; a
+real file enabled without a symlink gets
+`nginx-site-<domain>.enabled.<timestamp>.<pid>`). A failed backup aborts the
+action before anything is changed. Adding a brand-new site makes no backup
+(nothing existed).
 
 ### 6.4 Certificates (later PR)
 
@@ -363,12 +480,16 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui), install.sh | skip the Debian 13 check |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui) | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx), install.sh | skip the Debian 13 check |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx) | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
-| `EZVPS_BACKUP_DIR` | ezvps (3x-ui), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
+| `EZVPS_NGINX_HTTP_PORT` | ezvps (Nginx) | port used for the port-in-use check and the responds probe (default `80`; generated sites always listen on 80) |
+| `EZVPS_IF_INET6_FILE` | ezvps (Nginx) | file whose existence means "kernel has IPv6" (default `/proc/net/if_inet6`) |
+| `EZVPS_NGINX_WAIT_SECONDS` | ezvps (Nginx) | how long to wait for nginx to answer (default 15) |
 | `EZVPS_XUI_WAIT_SECONDS` | ezvps (3x-ui) | how long to wait for the panel to answer (default 30) |
 | `EZVPS_NO_PAUSE=1` | ezvps | do not wait for Enter |
 
@@ -392,5 +513,19 @@ Defaults are the real paths; none of these relax a check on a real server.
   hash mismatch / download failure / installer failure, self installer launch
   (no defaults forced), status, restart (only `x-ui`), panel info for all
   three install origins, and change password (never printed or stored).
+  Nginx is tested against a **fake `nginx`** (its `-t` fails on a site
+  containing `BROKEN_DIRECTIVE`, on a named domain, or always on request) with
+  stub `systemctl`, `apt-get`, `ss`, `dpkg-query`, and a small local HTTP
+  server standing in for "nginx answers on port 80" (those checks are skipped
+  without `python3`): submenu labels; install detection (command, dpkg, no
+  reinstall, no apt call); fresh install (apt, enable --now, config test,
+  verify), declined / non-Debian / apt failure / port 80 busy; status
+  (running, stopped, failing config); restart with the config test before the
+  restart, and a failing test that must neither restart nor reload; list
+  sites (ezvps, foreign, default, disabled, dangling); add site (generated
+  file, symlink, test before reload, no duplicates on re-run, overwrite with
+  backup, declined overwrite, input validation, conflicting domain, failing
+  test rolls back, nginx stopped); remove site (confirmation, backup, test
+  before reload, failing test rolls back); no certificate/TLS code at all.
   It touches nothing outside its temp dir and uses no network.
 * `tests/fresh-vps-test.md`: manual checklist on a throwaway Debian 13 VPS.

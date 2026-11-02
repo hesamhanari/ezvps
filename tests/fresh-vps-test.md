@@ -65,10 +65,11 @@ script it from ezvps)
 - [ ] menu lines match exactly (no description text):
       `L2TP, 3x-ui, Backpack, ctunnel, Nginx, Certificates, Lazyports,
       SSH and Users, Firewall, Backup, Check For Updates, Uninstall`, then `0) Exit`
-- [ ] each of `3` to `12` prints `<Label> is not implemented yet.` and
-      returns to the menu after Enter (`2` opens the 3x-ui submenu, see section 5)
+- [ ] each of `3`, `4` and `6` to `12` prints `<Label> is not implemented yet.`
+      and returns to the menu after Enter (`2` opens the 3x-ui submenu, section 5;
+      `5` opens the Nginx submenu, section 6)
 - [ ] `abc`, `13`, empty input -> `Invalid choice`, menu continues
-- [ ] `ezvps nginx` (and the other keys) print the same message, exit 0
+- [ ] `ezvps backpack` (and the other pending keys) print the same message, exit 0
 - [ ] `ezvps bogus` prints usage, exit 2
 - [ ] Ctrl-D at the prompt exits cleanly
 
@@ -161,15 +162,105 @@ credentials; the default password is a known value and the VPS is throwaway.
 - [ ] run it again over the existing panel: a backup including the `x-ui`
       binary exists before the installer starts
 
-## 6. Non-root
+## 6. Nginx
+
+Needs outbound HTTPS to the Debian mirrors (apt). Start from an image where
+`command -v nginx` prints nothing and nothing listens on port 80
+(`ss -ltn | grep ':80 '` prints nothing). Use `example.com`-style placeholder
+domains and a throwaway backend such as `python3 -m http.server 3000
+--bind 127.0.0.1`; do not use real domains or paste real IPs into notes.
+
+**6a. Submenu and detection**
+
+- [ ] `ezvps` -> `5` shows exactly: `1) Install Nginx`, `2) Status`,
+      `3) Restart`, `4) List sites`, `5) Add site`, `6) Remove site`,
+      `0) Back` (no description text); `0` returns to the main menu
+- [ ] before installing, items `2` to `6` print `Nginx is not installed.` and
+      return to the submenu
+- [ ] with another program on port 80 (`python3 -m http.server 80 &`),
+      `1) Install Nginx` warns `Port 80 is already in use by another service`,
+      shows the listener and asks before going on; answer `n`, nothing is
+      installed; stop the listener
+
+**6b. Install**
+
+- [ ] `1) Install Nginx` -> `y`: apt installs the `nginx` package;
+      `systemctl is-enabled nginx` is `enabled`, `systemctl is-active nginx` is `active`
+- [ ] output shows `Config test passes.` and `Verified: nginx answers on
+      127.0.0.1:80 (HTTP 200)`, then the HTTP-only / Certificates note
+- [ ] `curl -sI http://127.0.0.1/` shows the default Debian welcome page headers
+- [ ] running `1) Install Nginx` again says `already installed ... Not
+      reinstalling`, shows the status, and `apt` is not run (check
+      `grep nginx /var/log/apt/history.log` shows a single install)
+
+**6c. Status and Restart**
+
+- [ ] `2) Status`: version, `nginx - running (boot: enabled)`, `Config test:
+      passes`, `Responds: yes (HTTP 200 ...)`
+- [ ] `3) Restart`: prints `Config test passes. Restarting nginx...` and
+      `Verified`; `systemctl status nginx` shows a fresh start time
+- [ ] break the config on purpose (`echo 'BROKEN_DIRECTIVE on;' >>
+      /etc/nginx/sites-available/default`), then: `2) Status` shows `Config
+      test: FAILS` with nginx's error; `3) Restart` says `nginx was NOT
+      restarted or reloaded` and the nginx process id / start time is
+      unchanged (`systemctl show -p MainPID,ActiveEnterTimestamp nginx`)
+- [ ] remove the broken line again; `3) Restart` works
+
+**6d. Add site**
+
+- [ ] start the backend: `python3 -m http.server 3000 --bind 127.0.0.1 &`
+- [ ] `5) Add site` with `Example.COM` and `127.0.0.1:3000`:
+      `/etc/nginx/sites-available/example.com` exists with the `# Managed by
+      ezvps` header and `# ezvps:domain=` / `# ezvps:upstream=` lines;
+      `/etc/nginx/sites-enabled/example.com` is a symlink to it; output says
+      `Config test passes.` and `nginx reloaded.`; no `ssl` or `443` anywhere in the file
+- [ ] `curl -s -H 'Host: example.com' http://127.0.0.1/` returns the backend's
+      directory listing (reverse proxy works); with the backend stopped it returns 502
+- [ ] the message says the site is HTTP only and to use the Certificates
+      module once it exists; no certificate was created (`ls /etc/letsencrypt` fails / empty)
+- [ ] the same `5) Add site` again: `already exists with the same upstream ...
+      Nothing to do`; no new file, no backup, no second reload (journal)
+- [ ] `5) Add site` `example.com` with `127.0.0.1:4000`: asks before
+      overwriting; `n` changes nothing; `y` backs up the old file to
+      `/var/backups/ezvps/nginx-site-example.com.<timestamp>.<pid>` (contains
+      the old upstream) and updates the site
+- [ ] invalid input is rejected without changes: domain `localhost`, `bad_name.com`,
+      `a b.com`; upstream `127.0.0.1` (no port), `127.0.0.1:99999`, `https://127.0.0.1:443`
+- [ ] domain already served by a hand-made enabled file (create
+      `/etc/nginx/sites-available/legacy` with `server_name taken.example.com;`
+      and enable it): adding `taken.example.com` is refused
+- [ ] failing test is rolled back: add a hand-made file with
+      `BROKEN_DIRECTIVE on;` to `/etc/nginx/conf.d/zz.conf`, then `Add site`
+      `new.example.com`: `config test FAILED`, `Rolled back`, no
+      `sites-available/new.example.com`, nginx not reloaded; remove `zz.conf`
+- [ ] `systemctl stop nginx`, `Add site` `idle.example.com`: file written,
+      `nginx is not running, so nothing was reloaded`; `systemctl start nginx`
+
+**6e. List and Remove**
+
+- [ ] `4) List sites`: table with `example.com  example.com  127.0.0.1:4000
+      ezvps`, `default ... not ezvps`, `legacy taken.example.com ... not ezvps`;
+      `Available but not enabled:` lists any disabled site files
+- [ ] `6) Remove site` with an unknown domain: `No site named ...`, nothing changed
+- [ ] `6) Remove site` `example.com`, answer `n`: files remain, no backup
+- [ ] `6) Remove site` `example.com`, answer `y`: backup
+      `nginx-site-example.com.<timestamp>.<pid>` exists and matches the old
+      file, both the file and symlink are gone, `Config test passes.`,
+      `nginx reloaded.`, other sites untouched
+- [ ] `6) Remove site` on the hand-made `legacy`-style domain warns `NOT
+      created by ezvps` before asking
+- [ ] clean up: remove `legacy`, `idle.example.com` and the other test sites, stop the backend
+
+## 7. Non-root
 
 - [ ] as a normal user: `ezvps` prints `ezvps must be run as root.`, exit 1
 - [ ] as a normal user: `ezvps --version` still works
 
-## 7. Cleanup (no uninstall module yet)
+## 8. Cleanup (no uninstall module yet)
 
 ```bash
 x-ui uninstall            # 3x-ui's own uninstaller, if you installed it
+apt-get purge -y nginx    # if you installed nginx for this test
 rm -f /usr/local/bin/ezvps
 rm -rf /var/backups/ezvps /var/lib/ezvps
 ```

@@ -53,7 +53,10 @@ SPEC.md  README.md  AGENTS.md
   variables; functions named `module_<key>` for modules.
 * Menu and L2TP use bash builtins only. Module code may use coreutils and
   the few external commands its SPEC section lists (3x-ui: `systemctl`,
-  `sha256sum`, `curl`, optionally `ss`/`sqlite3`/`hostname`). Adding another
+  `sha256sum`, `curl`, optionally `ss`/`sqlite3`/`hostname`; Nginx:
+  `systemctl`, `apt-get`, `nginx`, optionally `ss`/`dpkg-query`). Shared
+  helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_debian13`,
+  `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
   message; do not assume it.
 * Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`
