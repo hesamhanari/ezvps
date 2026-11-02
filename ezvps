@@ -1077,6 +1077,415 @@ backup_file() {
     return 0
 }
 
+# --- nginx.org stable source ----------------------------------------------------------------
+# nginx is installed ONLY from the official nginx.org stable repository (never
+# Debian's package, never the mainline branch). The repository, its signing key
+# and an apt pin (origin nginx.org, priority 900) are set up first, so apt can
+# not fall back to Debian's newer-looking or higher-ranked package later.
+
+NGX_ORG_REPO_URL="https://nginx.org/packages/debian"
+NGX_ORG_KEY_URL="https://nginx.org/keys/nginx_signing.key"
+# Primary-key fingerprints published in nginx_signing.key. Every key in the
+# downloaded file must be one of these; if nginx.org rotates its keys the
+# install refuses until this list (and SPEC 6.3) is updated.
+NGX_ORG_KEY_FPRS=(
+    8540A6F18833A80E9C1653A42FD21310B49F6B46
+    573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+    9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3
+)
+NGX_MIN_MAJOR=1 NGX_MIN_MINOR=30 # stable 1.30 or newer (even minor = stable)
+NGX_KEYRING="${EZVPS_KEYRING_DIR:-/usr/share/keyrings}/nginx-archive-keyring.gpg"
+NGX_APT_DIR="${EZVPS_APT_DIR:-/etc/apt}"
+NGX_APT_LIST="${NGX_APT_DIR}/sources.list.d/nginx.list"
+NGX_APT_PREF="${NGX_APT_DIR}/preferences.d/99nginx"
+
+# Filled by the helpers below.
+NGX_CODENAME="" NGX_SRC="" NGX_PKGVER="" NGX_CAND=""
+NGX_VER_MAJOR=0 NGX_VER_MINOR=0 NGX_VER_CLASS=""
+NGX_KEY_FPS=() NGX_KEY_TMP="" NGX_PURGE_PKGS=()
+NGX_REPO_UNDO_PATH=() NGX_REPO_UNDO_BK=()
+NGX_RESTORED=() NGX_NOT_RESTORED=()
+
+ngx_codename() {
+    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line
+    NGX_CODENAME=""
+    if [[ -r "$f" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == VERSION_CODENAME=* ]] && NGX_CODENAME="${line#VERSION_CODENAME=}"
+        done <"$f"
+    fi
+    NGX_CODENAME="${NGX_CODENAME//\"/}"
+    if [[ ! "$NGX_CODENAME" =~ ^[a-z]+$ ]]; then
+        err "Could not read the Debian codename (VERSION_CODENAME) from ${f}; the nginx.org repository needs it. Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
+# ngx_ver_parse <text>: first MAJOR.MINOR in the text -> NGX_VER_MAJOR/MINOR and
+# NGX_VER_CLASS (ok = stable and new enough, old = below 1.30, mainline = odd minor).
+ngx_ver_parse() {
+    NGX_VER_MAJOR=0 NGX_VER_MINOR=0 NGX_VER_CLASS=""
+    [[ "$1" =~ ([0-9]+)\.([0-9]+) ]] || return 1
+    NGX_VER_MAJOR=$((10#${BASH_REMATCH[1]}))
+    NGX_VER_MINOR=$((10#${BASH_REMATCH[2]}))
+    if ((NGX_VER_MAJOR > NGX_MIN_MAJOR)); then
+        NGX_VER_CLASS="ok"
+    elif ((NGX_VER_MAJOR < NGX_MIN_MAJOR || NGX_VER_MINOR < NGX_MIN_MINOR)); then
+        NGX_VER_CLASS="old"
+    elif ((NGX_VER_MINOR % 2 == 1)); then
+        NGX_VER_CLASS="mainline"
+    else
+        NGX_VER_CLASS="ok"
+    fi
+    return 0
+}
+
+# Version of the installed apt package "nginx" -> NGX_PKGVER (empty if not installed).
+ngx_pkg_version() {
+    local st
+    NGX_PKGVER=""
+    have_cmd dpkg-query || return 1
+    # shellcheck disable=SC2016 # ${db:...} is a dpkg-query format, not a shell expansion
+    st="$(dpkg-query -W -f='${db:Status-Abbrev}' nginx 2>/dev/null)"
+    [[ "$st" == ii* ]] || return 1
+    # shellcheck disable=SC2016
+    NGX_PKGVER="$(dpkg-query -W -f='${Version}' nginx 2>/dev/null)"
+    [[ -n "$NGX_PKGVER" ]]
+}
+
+# Where did the installed nginx come from? Sets NGX_SRC:
+#   none       nothing installed
+#   org-ok     nginx.org package, stable 1.30 or newer
+#   org-bad    nginx.org package that is mainline or older than 1.30
+#   other      an apt package that is not from nginx.org (for example Debian's)
+#   unmanaged  an nginx command but no apt package (built by hand)
+ngx_classify() {
+    NGX_SRC="none"
+    if ngx_pkg_version; then
+        if [[ "$NGX_PKGVER" == *"~${NGX_CODENAME}" ]]; then
+            ngx_ver_parse "$NGX_PKGVER" || NGX_VER_CLASS="old"
+            if [[ "$NGX_VER_CLASS" == "ok" ]]; then
+                NGX_SRC="org-ok"
+            else
+                NGX_SRC="org-bad"
+            fi
+        else
+            NGX_SRC="other"
+        fi
+    elif have_cmd nginx; then
+        NGX_SRC="unmanaged"
+    fi
+    return 0
+}
+
+# A mainline nginx.org source anywhere in apt's config would let the pin pick a
+# mainline build. Prints the file name.
+ngx_find_mainline_source() {
+    local f line
+    for f in "${NGX_APT_DIR}/sources.list" "${NGX_APT_DIR}"/sources.list.d/*; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            [[ "$line" == \#* ]] && continue
+            if [[ "$line" == *nginx.org/packages/mainline* ]]; then
+                printf '%s' "$f"
+                return 0
+            fi
+        done <"$f"
+    done
+    return 1
+}
+
+# Download the signing key (the only network access of the Nginx module).
+ngx_fetch_key() { # ngx_fetch_key <outfile>
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 --max-time 60 \
+        -o "$1" "$NGX_ORG_KEY_URL"
+}
+
+# ngx_key_fps <binary keyring file>: primary-key fingerprints -> NGX_KEY_FPS.
+ngx_key_fps() {
+    local gh line prev="" f
+    NGX_KEY_FPS=()
+    gh="$(mktemp -d)" || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            pub:*) prev="pub" ;;
+            sub:* | sec:* | ssb:*) prev="other" ;;
+            fpr:*)
+                if [[ "$prev" == "pub" ]]; then
+                    IFS=: read -ra f <<<"$line"
+                    NGX_KEY_FPS+=("${f[9]^^}")
+                fi
+                prev="other"
+                ;;
+        esac
+    done < <(GNUPGHOME="$gh" gpg --batch --with-colons --show-keys "$1" 2>/dev/null)
+    rm -rf "$gh"
+    ((${#NGX_KEY_FPS[@]} > 0))
+}
+
+ngx_cleanup_key_tmp() {
+    [[ -n "$NGX_KEY_TMP" && -d "$NGX_KEY_TMP" ]] && rm -rf "$NGX_KEY_TMP"
+    NGX_KEY_TMP=""
+    return 0
+}
+
+# Download nginx_signing.key, convert it and verify every key in it against the
+# pinned fingerprints. Leaves ${NGX_KEY_TMP}/key.gpg on success.
+ngx_verify_key() {
+    local gh fp known allowed bad=0
+    NGX_KEY_TMP="$(mktemp -d)" || {
+        err "Cannot create a temporary directory."
+        return 1
+    }
+    info "Downloading the signing key: ${NGX_ORG_KEY_URL}"
+    if ! ngx_fetch_key "${NGX_KEY_TMP}/key.asc"; then
+        err "Download failed: ${NGX_ORG_KEY_URL}. Nothing was changed."
+        return 1
+    fi
+    gh="$(mktemp -d)" || return 1
+    if ! GNUPGHOME="$gh" gpg --batch --yes --dearmor -o "${NGX_KEY_TMP}/key.gpg" "${NGX_KEY_TMP}/key.asc" 2>/dev/null; then
+        rm -rf "$gh"
+        err "gpg could not read the downloaded key. Nothing was changed."
+        return 1
+    fi
+    rm -rf "$gh"
+    if ! ngx_key_fps "${NGX_KEY_TMP}/key.gpg"; then
+        err "No key fingerprints found in the downloaded file. Nothing was changed."
+        return 1
+    fi
+    for fp in "${NGX_KEY_FPS[@]}"; do
+        allowed=0
+        for known in "${NGX_ORG_KEY_FPRS[@]}"; do
+            [[ "$fp" == "$known" ]] && allowed=1
+        done
+        if ((allowed == 1)); then
+            info "  key fingerprint ${fp}: matches the pinned nginx.org key"
+        else
+            err "  key fingerprint ${fp}: NOT a pinned nginx.org key"
+            bad=1
+        fi
+    done
+    if ((bad == 1)); then
+        err "Fingerprint check FAILED; the key is not trusted. Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
+ngx_same_text() { # <a> <b>: same text content
+    [[ -f "$1" && -f "$2" && "$(<"$1")" == "$(<"$2")" ]]
+}
+
+ngx_same_keyring() { # <new> <existing>: same set of primary fingerprints
+    local mine
+    ngx_key_fps "$1" || return 1
+    mine="${NGX_KEY_FPS[*]}"
+    ngx_key_fps "$2" || return 1
+    [[ "$mine" == "${NGX_KEY_FPS[*]}" ]]
+}
+
+# ngx_put_file <src> <dest> <mode> <same-function>: install <src> as <dest>;
+# an identical file is left alone, a different one is backed up first. What was
+# done is recorded so ngx_repo_undo can put it back.
+ngx_put_file() {
+    local src="$1" dst="$2" mode="$3" same="$4" bk="" tmp
+    if [[ -e "$dst" || -L "$dst" ]]; then
+        if "$same" "$src" "$dst"; then
+            info "  ${dst}: already up to date"
+            return 0
+        fi
+        backup_file "$dst" "apt-${dst##*/}" || return 1
+        bk="$BACKUP_FILE_PATH"
+    fi
+    if ! mkdir -p "${dst%/*}"; then
+        err "Could not create ${dst%/*}."
+        return 1
+    fi
+    tmp="${dst%/*}/.${dst##*/}.ezvps-tmp.$$"
+    if ! { cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst"; }; then
+        rm -f "$tmp"
+        err "Could not write ${dst}."
+        return 1
+    fi
+    NGX_REPO_UNDO_PATH+=("$dst")
+    NGX_REPO_UNDO_BK+=("$bk")
+    info "  ${dst}: written${bk:+ (old file backed up to ${bk})}"
+    return 0
+}
+
+ngx_repo_undo() {
+    local i
+    for i in "${!NGX_REPO_UNDO_PATH[@]}"; do
+        rm -f "${NGX_REPO_UNDO_PATH[$i]}"
+        [[ -n "${NGX_REPO_UNDO_BK[$i]}" ]] && cp -a "${NGX_REPO_UNDO_BK[$i]}" "${NGX_REPO_UNDO_PATH[$i]}"
+    done
+    if ((${#NGX_REPO_UNDO_PATH[@]} > 0)); then
+        info "Rolled back the apt repository files written by this run."
+    fi
+    NGX_REPO_UNDO_PATH=() NGX_REPO_UNDO_BK=()
+    return 0
+}
+
+# Keyring (verified key), apt source and the apt pin.
+ngx_setup_repo() {
+    NGX_REPO_UNDO_PATH=() NGX_REPO_UNDO_BK=()
+    printf '%s\n' "deb [signed-by=${NGX_KEYRING}] ${NGX_ORG_REPO_URL} ${NGX_CODENAME} nginx" >"${NGX_KEY_TMP}/nginx.list" || return 1
+    printf '%s\n' "Package: *" "Pin: origin nginx.org" "Pin-Priority: 900" >"${NGX_KEY_TMP}/99nginx" || return 1
+    ngx_put_file "${NGX_KEY_TMP}/key.gpg" "$NGX_KEYRING" 644 ngx_same_keyring || return 1
+    ngx_put_file "${NGX_KEY_TMP}/nginx.list" "$NGX_APT_LIST" 644 ngx_same_text || return 1
+    ngx_put_file "${NGX_KEY_TMP}/99nginx" "$NGX_APT_PREF" 644 ngx_same_text || return 1
+    return 0
+}
+
+# What apt would install for "nginx" now -> NGX_CAND.
+ngx_apt_candidate() {
+    local line
+    NGX_CAND=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*Candidate:[[:space:]]+([^[:space:]]+) ]]; then
+            NGX_CAND="${BASH_REMATCH[1]}"
+        fi
+    done < <(LC_ALL=C apt-cache policy nginx 2>/dev/null)
+    [[ -n "$NGX_CAND" && "$NGX_CAND" != "(none)" ]]
+}
+
+# The pin must make apt choose the nginx.org STABLE package; checked before
+# anything is removed or installed.
+ngx_check_candidate() {
+    if ! ngx_apt_candidate; then
+        err "apt has no installation candidate for nginx after adding the nginx.org repository"
+        err "(does nginx.org publish packages for '${NGX_CODENAME}'?)."
+        return 1
+    fi
+    if [[ "$NGX_CAND" != *"~${NGX_CODENAME}" ]]; then
+        err "apt would install nginx ${NGX_CAND}, which is not the nginx.org package (expected a version ending in ~${NGX_CODENAME})."
+        err "The repository pin is not taking effect; refusing to install."
+        return 1
+    fi
+    ngx_ver_parse "$NGX_CAND" || NGX_VER_CLASS="old"
+    case "$NGX_VER_CLASS" in
+        ok) ;;
+        mainline)
+            err "apt would install nginx ${NGX_CAND}, a MAINLINE build. ezvps installs only the stable branch; refusing."
+            return 1
+            ;;
+        *)
+            err "apt would install nginx ${NGX_CAND}, which is older than ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}; refusing."
+            return 1
+            ;;
+    esac
+    info "apt will install nginx ${NGX_CAND} from nginx.org (stable)."
+    return 0
+}
+
+# After the install: `nginx -v` must report stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}+ from the nginx.org package.
+ngx_verify_version() {
+    local v
+    if ! have_cmd nginx; then
+        err "nginx is not available (not in PATH) after the install; see the apt output above."
+        return 1
+    fi
+    v="$(ngx_version)"
+    if ngx_pkg_version && [[ "$NGX_PKGVER" != *"~${NGX_CODENAME}" ]]; then
+        err "VERSION CHECK FAILED: the installed nginx is still a Debian package version (${NGX_PKGVER}), not nginx.org stable."
+        return 1
+    fi
+    if ! ngx_ver_parse "$v"; then
+        err "VERSION CHECK FAILED: could not read the version from 'nginx -v' (got '${v}')."
+        return 1
+    fi
+    case "$NGX_VER_CLASS" in
+        old)
+            err "VERSION CHECK FAILED: ${v} is older than ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}; nginx.org stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR} or newer is required."
+            return 1
+            ;;
+        mainline)
+            err "VERSION CHECK FAILED: ${v} is a mainline build (odd minor version); only the stable branch is allowed."
+            return 1
+            ;;
+    esac
+    info "Version check passes: ${v} (nginx.org stable)."
+    return 0
+}
+
+# Installed apt packages that belong to a different nginx build (nginx, nginx-common, nginx-core,
+# libnginx-mod-*, ...), including ones only left as config files.
+ngx_pkgs_to_purge() {
+    local st pkg
+    NGX_PURGE_PKGS=()
+    have_cmd dpkg-query || return 0
+    while IFS=$'\t' read -r st pkg; do
+        case "$st" in
+            ii* | hi* | rc*) [[ -n "$pkg" ]] && NGX_PURGE_PKGS+=("$pkg") ;;
+        esac
+    done < <(
+        # shellcheck disable=SC2016
+        dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'nginx' 'nginx-*' 'libnginx-mod-*' 2>/dev/null
+    )
+    return 0
+}
+
+# ngx_restore_sites <backup of /etc/nginx>: after a replacement, bring back the
+# ezvps-made sites (conf.d files and old-layout sites, which are then migrated
+# to conf.d). Hand-written sites are not touched; they are listed.
+ngx_restore_sites() {
+    local bk="$1" f name d
+    NGX_RESTORED=() NGX_NOT_RESTORED=()
+    # old layout: put the files back where they were if the removal took them, then migrate
+    for f in "$bk/sites-available"/*; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        name="${f##*/}"
+        ngx_read_site "$f" || continue
+        if ((NGX_SITE_MANAGED == 1)); then
+            if [[ ! -e "${NGX_AVAIL}/${name}" ]]; then
+                mkdir -p "$NGX_AVAIL" && cp -a "$f" "${NGX_AVAIL}/${name}"
+            fi
+            if [[ -L "$bk/sites-enabled/${name}" && ! -e "${NGX_ENABLED}/${name}" && ! -L "${NGX_ENABLED}/${name}" ]]; then
+                mkdir -p "$NGX_ENABLED" && ln -s "${NGX_AVAIL}/${name}" "${NGX_ENABLED}/${name}"
+            fi
+        elif [[ "$name" != "default" ]]; then
+            NGX_NOT_RESTORED+=("sites-available/${name}")
+        fi
+    done
+    ngx_legacy_scan
+    if ((${#NGX_LEG_NAMES[@]} > 0)); then
+        info "Moving the ezvps sites of the old layout to ${NGX_CONFD}..."
+        ngx_migrate_run || true
+    fi
+    # conf.d: ezvps-made sites that are missing again
+    for f in "$bk/conf.d"/*.conf; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        name="${f##*/}"
+        ngx_read_site "$f" || continue
+        if ((NGX_SITE_MANAGED == 1)); then
+            d="$NGX_SITE_DOMAIN"
+            if ngx_valid_domain "$d" && [[ "$name" == "${d}.conf" && ! -e "${NGX_CONFD}/${name}" && ! -L "${NGX_CONFD}/${name}" ]]; then
+                mkdir -p "$NGX_CONFD" && cp -a "$f" "${NGX_CONFD}/${name}" && NGX_RESTORED+=("${NGX_CONFD}/${name}")
+            fi
+        elif [[ "$name" != "default.conf" ]]; then
+            NGX_NOT_RESTORED+=("conf.d/${name}")
+        fi
+    done
+    if ((${#NGX_RESTORED[@]} > 0)); then
+        if ngx_ensure_confd_include && ngx_config_test; then
+            info "Restored ${#NGX_RESTORED[@]} ezvps site(s) to ${NGX_CONFD}. Config test passes."
+            ngx_reload
+        else
+            err "The config test FAILED with the restored sites; nginx was NOT reloaded."
+            ngx_print_test_output
+            for f in "${NGX_RESTORED[@]}"; do rm -f "$f"; done
+            err "The restored files were removed again. They are still in the backup: ${bk}"
+        fi
+    fi
+    if ((${#NGX_NOT_RESTORED[@]} > 0)); then
+        warn "Not restored automatically (not made by ezvps; they are in ${bk}):"
+        for f in "${NGX_NOT_RESTORED[@]}"; do warn "  ${f}"; done
+    fi
+    return 0
+}
+
 # --- install -----------------------------------------------------------------
 
 # Names who listens on a port (best effort; needs ss).
@@ -1092,19 +1501,73 @@ port_listener_info() {
     printf '(could not tell which program; run: ss -ltnp)'
 }
 
+ngx_install_plan() { # ngx_install_plan <replace 0|1> <tools to install...>
+    local replace="$1" pkg
+    shift
+    info ""
+    info "ezvps will install nginx ONLY from the official nginx.org STABLE repository"
+    info "(not Debian's package, not the mainline branch; stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR} or newer):"
+    info "  repository: deb [signed-by=${NGX_KEYRING}] ${NGX_ORG_REPO_URL} ${NGX_CODENAME} nginx"
+    info "  signing key: ${NGX_ORG_KEY_URL} (checked against pinned fingerprints, stored in ${NGX_KEYRING})"
+    info "  apt pin:     ${NGX_APT_PREF} (origin nginx.org, priority 900), so upgrades stay on nginx.org stable"
+    info "  then 'apt-get install nginx', a check with 'nginx -v' (abort if below ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}, mainline or a Debian build),"
+    info "  enable at boot and start. The firewall is not changed."
+    if (($# > 0)); then
+        info "  first: apt-get install ${*} (needed to fetch and check the key)"
+    fi
+    if ((replace == 1)); then
+        warn ""
+        if [[ "$NGX_SRC" == "org-bad" ]]; then
+            warn "The installed nginx package ${NGX_PKGVER} is from nginx.org but is not stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}+."
+        else
+            warn "An nginx package that is not from nginx.org is installed (${NGX_PKGVER}; for example Debian's). It will be REPLACED:"
+        fi
+        info "  1. ${NGX_DIR} is backed up to ${NGX_BACKUP_BASE}/nginx-etc.<timestamp>.<pid>"
+        info "  2. the old package(s) are purged:${NGX_PURGE_PKGS[*]:+ ${NGX_PURGE_PKGS[*]}}"
+        info "  3. the nginx.org package is installed"
+        info "  4. ezvps-made sites are restored/moved to ${NGX_CONFD}; config test before any reload"
+        info "     (hand-written sites are not restored automatically; they stay in the backup)"
+    fi
+    return 0
+}
+
 ngx_install() {
     require_root || return 0
     require_debian13 "Nginx install" || return 0
+    ngx_codename || return 0
+    ngx_classify
 
-    if ngx_installed; then
-        info ""
-        info "Nginx is already installed ($(ngx_version || true)). Not reinstalling; current status:"
-        ngx_status
+    case "$NGX_SRC" in
+        org-ok)
+            info ""
+            info "Nginx is already installed ($(ngx_version || true); nginx.org stable package ${NGX_PKGVER}). Not reinstalling; current status:"
+            if [[ ! -f "$NGX_APT_PREF" ]]; then
+                warn "The apt pin ${NGX_APT_PREF} is missing, so apt could move nginx to another source on upgrade."
+            fi
+            ngx_status
+            return 0
+            ;;
+        unmanaged)
+            info ""
+            info "Nginx is installed ($(ngx_version || true)) but not as an apt package, so ezvps will not replace it."
+            info "Not reinstalling; current status:"
+            ngx_status
+            return 0
+            ;;
+    esac
+
+    require_cmds apt-get apt-cache systemctl cp mkdir mv rm mktemp date chmod || return 0
+    local src replace=0 tools=()
+    if src="$(ngx_find_mainline_source)"; then
+        err "A nginx.org MAINLINE source is configured in ${src}."
+        err "ezvps installs only the stable branch and a mainline source would let apt pick a 1.31 build."
+        err "Remove that source and try again. Nothing was changed."
         return 0
     fi
-
-    require_cmds apt-get systemctl || return 0
-    if port_in_use "$NGX_HTTP_PORT"; then
+    if [[ "$NGX_SRC" != "none" ]]; then
+        replace=1
+        ngx_pkgs_to_purge
+    elif port_in_use "$NGX_HTTP_PORT"; then
         warn ""
         warn "Port ${NGX_HTTP_PORT} is already in use by another service:"
         warn "  $(port_listener_info "$NGX_HTTP_PORT")"
@@ -1114,17 +1577,72 @@ ngx_install() {
             return 0
         }
     fi
-
-    info ""
-    info "ezvps will install the 'nginx' package from the Debian apt repositories,"
-    info "then enable it at boot and start it. The firewall is not changed."
-    ask_yes_no "Install nginx now?" || {
+    have_cmd curl || tools+=(curl)
+    have_cmd gpg || tools+=(gnupg)
+    ((${#tools[@]} > 0)) && tools+=(ca-certificates)
+    ngx_install_plan "$replace" "${tools[@]}"
+    ask_yes_no "Continue?" || {
         info "Cancelled. Nothing was changed."
         return 0
     }
-    apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx
-    if ! have_cmd nginx; then
-        err "nginx is still not available after the apt install; see the apt output above."
+
+    if ((${#tools[@]} > 0)); then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${tools[@]}"
+        if ! have_cmd curl || ! have_cmd gpg; then
+            err "curl and gpg are still missing after the apt install; see the apt output above. Nothing else was changed."
+            return 0
+        fi
+    fi
+
+    # 1. key (verified), source and pin; apt must then pick nginx.org stable.
+    if ! ngx_verify_key; then
+        ngx_cleanup_key_tmp
+        return 0
+    fi
+    info "Setting up the nginx.org stable repository:"
+    if ! ngx_setup_repo; then
+        ngx_cleanup_key_tmp
+        ngx_repo_undo
+        return 0
+    fi
+    ngx_cleanup_key_tmp
+    if ! apt-get update -q; then
+        err "apt-get update failed; the repository files were rolled back. Nothing else was changed."
+        ngx_repo_undo
+        return 0
+    fi
+    if ! ngx_check_candidate; then
+        ngx_repo_undo
+        info "The repository files were rolled back. Nothing else was changed."
+        return 0
+    fi
+
+    # 2. replacing another nginx build: back up /etc/nginx, then purge it.
+    local etc_bk=""
+    if ((replace == 1)); then
+        if [[ -e "$NGX_DIR" ]]; then
+            backup_file "$NGX_DIR" "nginx-etc" || return 0
+            etc_bk="$BACKUP_FILE_PATH"
+        fi
+        if ((${#NGX_PURGE_PKGS[@]} > 0)); then
+            info "Removing the old nginx package(s): ${NGX_PURGE_PKGS[*]}"
+            if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y -q "${NGX_PURGE_PKGS[@]}"; then
+                err "Removing the old package(s) failed; nginx.org was NOT installed. ${NGX_DIR} is backed up in ${etc_bk:-n/a}."
+                return 0
+            fi
+        fi
+    fi
+
+    # 3. install from nginx.org and verify what we got.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o Dpkg::Options::=--force-confold nginx; then
+        err "apt-get install nginx failed; see the output above."
+        ((replace == 1)) && err "The old package was already removed. Your previous /etc/nginx is backed up in ${etc_bk:-n/a}."
+        return 0
+    fi
+    if ! ngx_verify_version; then
+        err "Aborting: nginx was NOT started and no site was restored."
+        err "Check the apt pin (${NGX_APT_PREF}) and run: apt-cache policy nginx"
+        ((replace == 1)) && err "Your previous /etc/nginx is backed up in ${etc_bk:-n/a}."
         return 0
     fi
     if ! systemctl enable --now "$NGX_SERVICE_NAME"; then
@@ -1137,9 +1655,16 @@ ngx_install() {
         err "The nginx config test failed:"
         ngx_print_test_output
     fi
+
+    # 4. bring the ezvps sites back (config test before any reload).
+    if ((replace == 1)) && [[ -n "$etc_bk" ]]; then
+        ngx_restore_sites "$etc_bk"
+    fi
     ngx_verify_response
     info ""
-    info "Nginx is installed ($(ngx_version)). Add reverse-proxy sites with 'Add site'."
+    info "Nginx is installed ($(ngx_version)) from the nginx.org stable repository."
+    info "Upgrades stay on nginx.org stable through the apt pin ${NGX_APT_PREF}."
+    info "Add reverse-proxy sites with 'Add site' (they live in ${NGX_CONFD})."
     info "This module serves plain HTTP only. For HTTPS use the Certificates module"
     info "once it exists (not available yet)."
     return 0
@@ -1313,15 +1838,14 @@ ngx_render_site() { # ngx_render_site <domain> <upstream>
 }
 
 # Another site file (not <domain>.conf itself) that already serves <domain>:
-# any other conf.d/*.conf, or a file in the legacy sites-enabled (the Debian
-# `default` site is handled separately). Prints "conf.d/<file>" or
+# any other conf.d/*.conf (default.conf is handled separately only in that it
+# is offered for disabling), or a file in the legacy sites-enabled. Prints "conf.d/<file>" or
 # "sites-enabled/<file>". Read-only.
 ngx_find_conflict() {
     local f line tok code hit=0
     for f in "$NGX_CONFD"/*.conf "$NGX_ENABLED"/*; do
         [[ -f "$f" ]] || continue
-        [[ "$f" == "${NGX_CONFD}/${1}.conf" ]] && continue
-        [[ "$f" == "${NGX_ENABLED}/default" ]] && continue
+        [[ "$f" == "${NGX_CONFD}/${1}.conf" || "$f" == "$NGX_DEFAULT_CONF" ]] && continue
         while IFS= read -r line; do
             code="${line%%#*}"
             if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
@@ -1343,30 +1867,37 @@ ngx_find_conflict() {
     return 1
 }
 
-# Debian's default site (sites-enabled/default) conflicts with a new site when
-# it is the default_server for port 80 or lists the domain itself. Sets
-# NGX_DEFAULT_REASON. Read-only.
+# The nginx.org package ships conf.d/default.conf (a "Welcome to nginx" server
+# on port 80). It conflicts with a new site when it also listens on port 80
+# (loaded first, it is the catch-all server for requests that match no
+# server_name) or lists the domain itself. Only a default.conf that ezvps did
+# not create is considered. Sets NGX_DEFAULT_REASON. Read-only.
 NGX_DEFAULT_REASON=""
-NGX_LISTEN80_DEFAULT_RE='^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9.]+:)?80[[:space:]]+[^;]*default_server'
+NGX_DEFAULT_CONF="${NGX_CONFD}/default.conf"
+NGX_LISTEN80_RE='^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9.]+:)?80([[:space:];]|$)'
 ngx_default_site_conflicts() {
-    local f="${NGX_ENABLED}/default" line tok code
+    local f="$NGX_DEFAULT_CONF" line tok code listens=0 serves=0
     NGX_DEFAULT_REASON=""
     [[ -f "$f" ]] || return 1
+    ngx_read_site "$f" || return 1
+    ((NGX_SITE_MANAGED == 0)) || return 1
     while IFS= read -r line; do
         code="${line%%#*}"
-        if [[ "$code" =~ $NGX_LISTEN80_DEFAULT_RE ]]; then
-            NGX_DEFAULT_REASON="it is the default_server for port 80"
-            return 0
-        fi
+        [[ "$code" =~ $NGX_LISTEN80_RE ]] && listens=1
         if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
             for tok in ${BASH_REMATCH[1]}; do
-                if [[ "$tok" == "$1" ]]; then
-                    NGX_DEFAULT_REASON="it also serves ${1}"
-                    return 0
-                fi
+                [[ "$tok" == "$1" ]] && serves=1
             done
         fi
     done <"$f"
+    if ((serves == 1)); then
+        NGX_DEFAULT_REASON="it also serves ${1}"
+        return 0
+    fi
+    if ((listens == 1)); then
+        NGX_DEFAULT_REASON="it listens on port 80 too and, loaded first, answers every request that matches no server_name"
+        return 0
+    fi
     return 1
 }
 
@@ -1698,14 +2229,14 @@ ngx_list_sites() {
 
 # --- add ---------------------------------------------------------------------------
 
-# ngx_rollback_site <file> <backup|""> <default_backup|"">
+# ngx_rollback_site <file> <backup|""> <default_conf_backup|"">
 ngx_rollback_site() {
     local ok=0
     rm -f "$1" || ok=1
     [[ -n "$2" ]] && { cp -a "$2" "$1" || ok=1; }
     if [[ -n "$3" ]]; then
-        rm -f "${NGX_ENABLED}/default"
-        cp -a "$3" "${NGX_ENABLED}/default" || ok=1
+        rm -f "${NGX_DEFAULT_CONF}.disabled" "$NGX_DEFAULT_CONF"
+        cp -a "$3" "$NGX_DEFAULT_CONF" || ok=1
     fi
     if ((ok != 0)); then
         err "ROLLBACK PROBLEM: could not fully restore ${1}. Backups: ${2:-none} ${3:-}"
@@ -1765,19 +2296,18 @@ ngx_add_site() {
         old_bk="$BACKUP_FILE_PATH"
     fi
 
-    # Debian's default site: offer to disable it (remove its symlink only).
+    # The nginx.org default site (conf.d/default.conf): offer to disable it.
+    # It is backed up and renamed to default.conf.disabled, never deleted.
     if ngx_default_site_conflicts "$domain"; then
         warn ""
-        warn "The Debian default site (${NGX_ENABLED}/default) may conflict with ${domain}: ${NGX_DEFAULT_REASON}."
-        if [[ -L "${NGX_ENABLED}/default" ]]; then
-            if ask_yes_no "Disable the default site? Only its symlink is removed (the file in sites-available stays); a backup is kept."; then
-                backup_file "${NGX_ENABLED}/default" "nginx-default-site" || return 0
-                default_bk="$BACKUP_FILE_PATH"
-            else
-                info "Leaving the default site enabled."
-            fi
+        warn "The nginx.org default site (${NGX_DEFAULT_CONF}) may conflict with ${domain}: ${NGX_DEFAULT_REASON}."
+        if [[ -L "$NGX_DEFAULT_CONF" ]]; then
+            warn "It is a symlink, so ezvps will not touch it."
+        elif ask_yes_no "Disable the default site? It is backed up and renamed to default.conf.disabled (not deleted)."; then
+            backup_file "$NGX_DEFAULT_CONF" "nginx-default-conf" || return 0
+            default_bk="$BACKUP_FILE_PATH"
         else
-            warn "It is a regular file, not a symlink, so ezvps will not touch it."
+            info "Leaving the default site enabled."
         fi
     fi
 
@@ -1792,8 +2322,8 @@ ngx_add_site() {
         err "Could not write ${f}. Nothing was changed."
         return 0
     fi
-    if [[ -n "$default_bk" ]] && ! rm -f "${NGX_ENABLED}/default"; then
-        err "Could not remove the default site symlink."
+    if [[ -n "$default_bk" ]] && ! mv -f "$NGX_DEFAULT_CONF" "${NGX_DEFAULT_CONF}.disabled"; then
+        err "Could not disable the default site."
         ngx_rollback_site "$f" "$old_bk" "$default_bk"
         return 0
     fi
@@ -1805,7 +2335,7 @@ ngx_add_site() {
         return 0
     fi
     info "Site ${domain} -> ${up} written to ${f}. Config test passes."
-    [[ -n "$default_bk" ]] && info "The Debian default site was disabled (backup: ${default_bk})."
+    [[ -n "$default_bk" ]] && info "The nginx.org default site was disabled: ${NGX_DEFAULT_CONF} is now default.conf.disabled (backup: ${default_bk})."
     ngx_reload
     if [[ "$up" == 127.0.0.1:* || "$up" == localhost:* ]] && ! port_in_use "${up##*:}"; then
         warn "Nothing is listening on ${up} right now; visitors get a 502 until the backend is up."

@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5).
 
 ## 1. What ezvps is
 
@@ -10,7 +10,7 @@ A bash TUI/CLI VPS manager for **Debian 13**, run as **root**. One script,
 installed as `/usr/local/bin/ezvps`. It has no dependencies beyond what a
 Debian 13 install already has (bash, coreutils, systemd); anything else a
 module needs is checked with `command -v` first and installed only with the
-user's say-so (3x-ui: `curl`; Nginx: the `nginx` package itself).
+user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself).
 
 ## 2. Principles (same as easyl2tp)
 
@@ -285,7 +285,7 @@ the panel database if `sqlite3` is installed, else says it is unknown.
   **No password is ever stored.**
 * Module key `3x-ui` maps to the function `module_3x_ui`.
 
-### 6.3 Nginx (PR 3, done; conf.d layout in PR 4)
+### 6.3 Nginx (PR 3, done; conf.d layout in PR 4; nginx.org stable in PR 5)
 
 Menu item 5 opens a submenu. Clean labels only:
 
@@ -315,8 +315,10 @@ domain, named `/etc/nginx/conf.d/<domain>.conf`. ezvps does not create, read
 or manage `sites-available`/`sites-enabled` files for its own sites. The only
 uses of those directories are (a) the legacy migration below, which reads
 `sites-available` files that carry the ezvps marker, (b) the duplicate check,
-which looks for another file already serving the domain, and (c) the optional
-disabling of Debian's `default` site (section 5).
+which looks for another file already serving the domain. This matches the
+nginx.org package, whose `nginx.conf` includes `conf.d/*.conf` and has no
+`sites-available`/`sites-enabled` at all. The one file shipped by that package
+that matters here is `conf.d/default.conf` (section 5).
 
 * **Domain sanitising.** The domain is trimmed and lower-cased, then rejected
   unless it contains only letters, digits, dot and hyphen (anything with a
@@ -342,27 +344,86 @@ disabling of Debian's `default` site (section 5).
 
 `nginx -t` must pass before nginx is reloaded or restarted, every time. A
 change whose test fails is **rolled back** (new files removed, an overwritten
-or removed site restored byte for byte, `nginx.conf` or a disabled default
-site restored), nginx is left
+or removed site restored byte for byte, `nginx.conf` or a disabled
+`default.conf` restored), nginx is left
 alone, the nginx error output is shown, and the menu continues. A reload is
 only attempted when the `nginx` service is running; otherwise ezvps says the
 config is valid and nothing was reloaded.
 
-#### 1) Install Nginx
+#### Install source: nginx.org stable only
 
-1. Root and Debian 13 (`/etc/os-release`); otherwise refuse, nothing changed.
-2. **Installed already?** (`nginx` command in `PATH`, or `dpkg-query` says the
-   package is installed): do not reinstall; print
-   `Nginx is already installed (...). Not reinstalling` and the Status block.
-3. Fresh install: if port 80 is already in use (`ss`, else a `/dev/tcp`
+nginx is **never** installed from the Debian repository and **never** from the
+nginx.org mainline branch. The only source is the official nginx.org *stable*
+repository, so the installed version is **stable 1.30 or newer** (stable
+branches have an even minor number; 1.31 is mainline).
+
+| Item | Value |
+|------|-------|
+| apt source (`/etc/apt/sources.list.d/nginx.list`) | `deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/debian <codename> nginx` (stable; the codename is `VERSION_CODENAME` from `/etc/os-release`, `trixie` on Debian 13) |
+| signing key | `https://nginx.org/keys/nginx_signing.key`, dearmored into `/usr/share/keyrings/nginx-archive-keyring.gpg` |
+| key check | every primary key in the downloaded file must have one of the **pinned fingerprints** (`NGX_ORG_KEY_FPRS` in `ezvps`: `8540A6F18833A80E9C1653A42FD21310B49F6B46`, `573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62`, `9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3`); anything else, or no key, is refused before anything is written. If nginx.org rotates its keys the install refuses until the pins are updated here and in the script. |
+| apt pin (`/etc/apt/preferences.d/99nginx`) | `Package: *` / `Pin: origin nginx.org` / `Pin-Priority: 900`, so later upgrades stay on nginx.org and Debian's `nginx` (priority 500) can never win |
+| download | only the key, with `curl --proto '=https' --tlsv1.2`, into a private temp dir, in `ngx_fetch_key` (the only Nginx function that may use `curl`) |
+
+Install steps:
+
+1. Root and Debian 13 (`/etc/os-release`) and a readable codename; otherwise
+   refuse, nothing changed.
+2. **What is installed already?** (apt package `nginx` via `dpkg-query`, else the
+   `nginx` command):
+   * nginx.org package, stable >= 1.30 (`<version>~<codename>`): do not
+     reinstall; print `Nginx is already installed (...). Not reinstalling` and
+     the Status block (plus a warning if the apt pin file is missing);
+   * `nginx` command but no apt package (built by hand): not touched, same
+     message;
+   * a package that is **not** from nginx.org (for example Debian's), or an
+     nginx.org package that is mainline or older than 1.30: it is **replaced**
+     (see below);
+   * nothing: fresh install.
+3. A `nginx.org/packages/mainline` source anywhere in apt's config
+   (`sources.list`, `sources.list.d/*`, comments ignored) is refused: the pin
+   could otherwise select a mainline build. Nothing is changed.
+4. Fresh install only: if port 80 is already in use (`ss`, else a `/dev/tcp`
    connect) warn, show who listens (`ss -ltnp`) and ask whether to install
-   anyway (nginx cannot start until the port is free).
-4. Show what will happen (apt package `nginx`; firewall not changed), ask.
-5. `apt-get update -q` then `DEBIAN_FRONTEND=noninteractive apt-get install
-   -y -q nginx`; `systemctl enable --now nginx`; `nginx -t`.
-6. **Verify it responds**: an HTTP `HEAD /` to `127.0.0.1:80` (pure bash
-   `/dev/tcp`, so it works without curl), retried up to 15 s; prints the HTTP
-   status. Then the HTTP-only / Certificates note.
+   anyway.
+5. Show the plan (repository line, key URL, pin, version rule, what is
+   replaced) and ask once. If `curl` or `gpg` is missing the plan says so and
+   they (`curl gnupg ca-certificates`) are installed with `apt-get` first.
+6. Download and verify the key (above); write the keyring, the apt source and
+   the pin (an identical existing file is left alone, a different one is backed
+   up as `/var/backups/ezvps/apt-<name>.<timestamp>.<pid>` first); `apt-get
+   update -q`. A failure here rolls the new files back and stops.
+7. **Candidate check before anything is removed or installed**: `apt-cache
+   policy nginx` must name a candidate ending in `~<codename>` (nginx.org),
+   stable and >= 1.30. A Debian candidate (the pin is not working), a
+   mainline (1.31) candidate, an older one or none: refuse, roll the
+   repository files back, leave any installed nginx alone. This is the "never
+   install over a Debian nginx without the pin" guard.
+8. Replacing another nginx (only after step 7 passed): `/etc/nginx` is backed
+   up first to `/var/backups/ezvps/nginx-etc.<timestamp>.<pid>`; then the old
+   packages (`nginx`, `nginx-common`, `nginx-*`, `libnginx-mod-*`) are
+   **purged** so the nginx.org package installs its own clean configuration.
+   A failing purge stops the install and says where the backup is.
+9. `DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o
+   Dpkg::Options::=--force-confold nginx`.
+10. **Version check** with `nginx -v` (and `dpkg-query`): abort with a clear
+    error, without starting nginx or restoring anything, if the package is
+    still a Debian version (not `~<codename>`), if the version is below 1.30,
+    or if it is a mainline build (odd minor, such as 1.31). The error names
+    the backup of the previous `/etc/nginx` when one was taken.
+11. `systemctl enable --now nginx`; `nginx -t`.
+12. If a package was replaced, **restore/migrate the ezvps sites** from the
+    backup: ezvps-made old-layout sites (if the purge removed them they are put
+    back first) are moved to `conf.d` with the usual migration (backup, copy,
+    config test, remove, config test); ezvps-made `conf.d/<domain>.conf` files
+    that are missing are copied back; then `nginx.conf` is checked for the
+    `conf.d` include and `nginx -t` must pass **before any reload**. If the
+    test fails the restored files are removed again, nginx is not reloaded and
+    the backup path is shown. Hand-written sites are not restored
+    automatically; they are listed with the backup path, as is the old
+    default site.
+13. **Verify it responds** (pure bash `/dev/tcp` HEAD, retried up to 15 s) and
+    print the HTTP-only / Certificates note.
 
 #### 2) Status
 
@@ -406,14 +467,16 @@ Apart from the migration offer it is read-only.
    (ezvps-made, same upstream) => `Nothing to do`, no change, no reload;
    otherwise it is described and ezvps **asks before overwriting**, then backs
    the old file up first.
-4. **Debian default site.** If `sites-enabled/default` exists and conflicts
-   (it is the `default_server` for port 80, or lists the domain in its
-   `server_name`), ezvps warns and asks whether to disable **that site only**.
-   Yes: a backup of the symlink is taken
-   (`/var/backups/ezvps/nginx-default-site.<timestamp>.<pid>`) and only the
-   symlink is removed; the file in `sites-available` stays. Other files in
-   `sites-enabled` are never deleted. A `default` that is a regular file, not a
-   symlink, is left alone.
+4. **nginx.org default site.** The package ships `conf.d/default.conf`
+   (`listen 80; server_name localhost;`). If it exists, was not made by ezvps
+   and either lists the domain in `server_name` or listens on port 80 (so,
+   loaded first, it answers every request that matches no `server_name`),
+   ezvps warns and asks whether to disable **that file only**. Yes: it is
+   backed up (`/var/backups/ezvps/nginx-default-conf.<timestamp>.<pid>`) and
+   renamed to `default.conf.disabled`, which nginx does not load; it is never
+   deleted, and a failing config test renames it back. No: it stays as it is.
+   A symlinked `default.conf` is left alone. Files in `sites-enabled` are
+   never deleted.
 5. Checks that `nginx.conf` includes `conf.d` (see above).
 6. Writes `/etc/nginx/conf.d/<domain>.conf` (temp file in `conf.d` + `mv`).
    The generated file is a plain `listen 80` server (plus `listen [::]:80`
@@ -423,7 +486,7 @@ Apart from the migration offer it is read-only.
    `X-Forwarded-Proto`, `Upgrade`, `Connection` headers.
 7. `nginx -t`: pass => reload; fail => rollback (see above: the new file is
    removed, or the previous file restored, and a disabled default site is
-   re-enabled). Note that nginx resolves a hostname upstream when it loads the
+   renamed back). Note that nginx resolves a hostname upstream when it loads the
    config, so a name that does not resolve fails the test and the site is
    rolled back; use an IP or a resolvable name.
 8. Reminders: point DNS at the server, port 80 must be open (the firewall is
@@ -467,7 +530,9 @@ them. Hand-written files are never migrated or touched.
 Before overwriting, removing, migrating or editing a file, it is copied to
 `/var/backups/ezvps/` (dir mode 700): `nginx-site-<domain>.<timestamp>.<pid>`
 (overwritten or removed site), `nginx.conf.<timestamp>.<pid>`,
-`nginx-default-site.<timestamp>.<pid>` (the symlink),
+`nginx-default-conf.<timestamp>.<pid>` (the disabled default site),
+`apt-<file>.<timestamp>.<pid>` (a different apt source, pin or keyring that is replaced),
+`nginx-etc.<timestamp>.<pid>` (the whole of `/etc/nginx` before a package is replaced),
 `nginx-legacy-<domain>[.enabled].<timestamp>.<pid>` (migration). A failed
 backup aborts the action before anything is changed. Adding a brand-new site
 makes no backup (nothing existed).
@@ -551,6 +616,8 @@ Defaults are the real paths; none of these relax a check on a real server.
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
 | `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx), install.sh | backup dir (default `/var/backups/ezvps`) |
 | `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
+| `EZVPS_APT_DIR` | ezvps (Nginx) | apt config dir for the nginx.org source and pin (default `/etc/apt`) |
+| `EZVPS_KEYRING_DIR` | ezvps (Nginx) | where `nginx-archive-keyring.gpg` is stored (default `/usr/share/keyrings`) |
 | `EZVPS_NGINX_HTTP_PORT` | ezvps (Nginx) | port used for the port-in-use check and the responds probe (default `80`; generated sites always listen on 80) |
 | `EZVPS_IF_INET6_FILE` | ezvps (Nginx) | file whose existence means "kernel has IPv6" (default `/proc/net/if_inet6`) |
 | `EZVPS_NGINX_WAIT_SECONDS` | ezvps (Nginx) | how long to wait for nginx to answer (default 15) |
@@ -577,13 +644,28 @@ Defaults are the real paths; none of these relax a check on a real server.
   hash mismatch / download failure / installer failure, self installer launch
   (no defaults forced), status, restart (only `x-ui`), panel info for all
   three install origins, and change password (never printed or stored).
-  Nginx is tested against a **fake `nginx`** (its `-t` fails on a site
-  containing `BROKEN_DIRECTIVE`, on a named domain, or always on request) with
-  stub `systemctl`, `apt-get`, `ss`, `dpkg-query`, and a small local HTTP
-  server standing in for "nginx answers on port 80" (those checks are skipped
-  without `python3`): submenu labels; install detection (command, dpkg, no
-  reinstall, no apt call); fresh install (apt, enable --now, config test,
-  verify), declined / non-Debian / apt failure / port 80 busy; status
+  Nginx is tested against a **fake `nginx`** (its version comes from the fake
+  dpkg state; its `-t` fails on a site containing `BROKEN_DIRECTIVE`, on a
+  named domain, on the Nth call, or always on request) with stub `systemctl`,
+  `apt-get`, `apt-cache`, `dpkg-query`, `gpg`, `curl` (the key download), `ss`,
+  and a small local HTTP server standing in for "nginx answers on port 80"
+  (those checks are skipped without `python3`). The fake apt installs Debian's
+  package unless both the nginx.org source and the pin exist, which is how the
+  tests prove the pin matters. Covered: submenu labels; install detection
+  (nginx.org stable, dpkg only, built by hand: no reinstall, no apt call);
+  fresh install from nginx.org stable (key download flags, pinned
+  fingerprints, keyring/source/pin contents, order key -> update -> install,
+  `nginx -v` check, enable --now, config test, verify), identical or different
+  repository files, wrong/extra key fingerprint, key download failure, a
+  mainline source in apt, a candidate that is Debian / mainline 1.31 / older /
+  missing (nothing installed, repository files rolled back), an installed
+  build that is mainline / below 1.30 / a Debian version (abort, not started),
+  declined / non-Debian / missing codename / apt failure / missing curl+gpg /
+  port 80 busy; replacing a Debian nginx (backup of `/etc/nginx` before the
+  purge, order, sites kept or restored from the backup, old-layout sites
+  migrated, hand-written sites listed not restored, failing config test after
+  the restore, no working pin leaves Debian's nginx untouched, wrong version
+  after install, nginx.org mainline replaced); status
   (running, stopped, failing config); restart with the config test before the
   restart, and a failing test that must neither restart nor reload; against a
   **fake `conf.d` layout** (a fixture `nginx.conf`, `conf.d/`, and the legacy
@@ -595,12 +677,17 @@ Defaults are the real paths; none of these relax a check on a real server.
   conflicts with `conf.d` and legacy files, failing test rolls back and does
   not reload, nginx stopped); missing `conf.d` include in `nginx.conf` (backup,
   inserted once inside `http`, commented-out include ignored, failing test
-  restores, no `http` block, no `nginx.conf`); the Debian default site (ask,
-  symlink-only removal with backup, restore on a failing test, other
+  restores, no `http` block, no `nginx.conf`); the nginx.org
+  `default.conf` (ask, backup and rename to `default.conf.disabled`, restore
+  on a failing test, symlink and non-conflicting cases left alone, other
   `sites-enabled` files untouched); remove site (confirmation, backup, test
   before reload, failing test restores); migration from `sites-available`
   (accepted, declined, failing test after the copy, failing final test,
   missing include, existing `conf.d` file, disabled and hand-written sites
   left alone, re-run is a no-op); no certificate/TLS code at all.
   It touches nothing outside its temp dir and uses no network.
+  `tests/lint.sh` additionally checks that the repository URL is the stable
+  one (never mainline), the key URL, the fingerprint pins and the priority-900
+  pin are present, and that `curl` is used only in the 3x-ui download/probe
+  functions and `ngx_fetch_key`.
 * `tests/fresh-vps-test.md`: manual checklist on a throwaway Debian 13 VPS.

@@ -54,15 +54,20 @@ SPEC.md  README.md  AGENTS.md
 * Menu and L2TP use bash builtins only. Module code may use coreutils and
   the few external commands its SPEC section lists (3x-ui: `systemctl`,
   `sha256sum`, `curl`, optionally `ss`/`sqlite3`/`hostname`; Nginx:
-  `systemctl`, `apt-get`, `nginx`, optionally `ss`/`dpkg-query`). Shared
+  `systemctl`, `apt-get`, `apt-cache`, `nginx`, `gpg`, `curl` (key only),
+  `dpkg-query`, optionally `ss`). Shared
   helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_debian13`,
   `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
   message; do not assume it.
 * Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`
-  (lint enforces it). Download to a temp file, show URL and hash, verify,
-  ask, then run. Never pipe or process-substitute a download into a shell.
-  Pin a tag/version plus a SHA-256; never `master`/`main`.
+  and in `ngx_fetch_key` (the nginx.org signing key); lint enforces it.
+  Download to a temp file, show URL and hash, verify, ask, then run. Never
+  pipe or process-substitute a download into a shell. Pin a tag/version plus
+  a SHA-256 (the nginx.org key is pinned by fingerprint); never
+  `master`/`main`.
+* nginx comes only from the nginx.org **stable** repository (never Debian's
+  package, never mainline) with the apt pin; do not weaken that (SPEC 6.3).
 * Output goes through `info` / `warn` / `err`. Colour only on a TTY and
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
