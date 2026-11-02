@@ -285,7 +285,7 @@ the panel database if `sqlite3` is installed, else says it is unknown.
   **No password is ever stored.**
 * Module key `3x-ui` maps to the function `module_3x_ui`.
 
-### 6.3 Nginx (PR 3, done)
+### 6.3 Nginx (PR 3, done; conf.d layout in PR 4)
 
 Menu item 5 opens a submenu. Clean labels only:
 
@@ -308,11 +308,42 @@ and writes no `listen 443` / `ssl_*` directives. A site that needs HTTPS is
 told to use the Certificates module (section 6.4) once it exists; until then
 the message says it is not available yet.
 
+#### Where sites live: `conf.d`
+
+Nginx sites managed by ezvps live **only** in `/etc/nginx/conf.d`, one file per
+domain, named `/etc/nginx/conf.d/<domain>.conf`. ezvps does not create, read
+or manage `sites-available`/`sites-enabled` files for its own sites. The only
+uses of those directories are (a) the legacy migration below, which reads
+`sites-available` files that carry the ezvps marker, (b) the duplicate check,
+which looks for another file already serving the domain, and (c) the optional
+disabling of Debian's `default` site (section 5).
+
+* **Domain sanitising.** The domain is trimmed and lower-cased, then rejected
+  unless it contains only letters, digits, dot and hyphen (anything with a
+  `/` or `\` is rejected with a path-separator message) and is a hostname with
+  at least two labels. Only a validated domain is ever used to build a file
+  name, so `../x`, `a/b`, `x;y`, spaces or non-ASCII characters never reach
+  the file system.
+* **ezvps-made sites** carry a `# Managed by ezvps` header and
+  `# ezvps:domain=` / `# ezvps:upstream=` marker lines (the same markers the
+  older sites-available layout used, so old files can be moved unchanged).
+* **nginx.conf must load conf.d** (checked by Add site and by the migration;
+  List sites only warns). The check is a small brace-aware scan for an
+  `include .../conf.d/*...;` directly inside the `http { }` block, ignoring
+  comments. If it is missing: `nginx.conf` is backed up
+  (`/var/backups/ezvps/nginx.conf.<timestamp>.<pid>`), the line
+  `include <nginx dir>/conf.d/*.conf;` is added just before the closing brace
+  of the `http` block, and `nginx -t` must pass; if it fails `nginx.conf` is
+  restored and the action stops. No `http` block, an unreadable layout or a
+  missing `nginx.conf` also stop the action with an explanation (nothing is
+  guessed). A missing `conf.d` directory is created.
+
 #### The one rule: test before reload
 
 `nginx -t` must pass before nginx is reloaded or restarted, every time. A
 change whose test fails is **rolled back** (new files removed, an overwritten
-or removed site restored byte for byte, symlink restored), nginx is left
+or removed site restored byte for byte, `nginx.conf` or a disabled default
+site restored), nginx is left
 alone, the nginx error output is shown, and the menu continues. A reload is
 only attempted when the `nginx` service is running; otherwise ezvps says the
 config is valid and nothing was reloaded.
@@ -348,65 +379,98 @@ restarts a broken config.
 
 #### 4) List sites
 
-Lists the entries of `/etc/nginx/sites-enabled` (Debian layout) as a table
+Offers the legacy migration first if there is anything to migrate (see
+Migration), then lists `/etc/nginx/conf.d/*.conf` as a table
 `NAME  DOMAIN  UPSTREAM  CREATED BY`:
 
-* sites created by ezvps (they carry a `# Managed by ezvps` header and
-  `# ezvps:domain=` / `# ezvps:upstream=` marker lines): domain and upstream
-  from the markers, `ezvps`;
-* any other site (including Debian's `default`): its first `server_name`, no
-  upstream, `not ezvps`;
-* a dangling symlink is flagged.
+* sites created by ezvps: domain and upstream from the markers, `ezvps`;
+* any other `*.conf` file: its first `server_name`, no upstream, `not ezvps`;
+* a dangling symlink or a non-regular file is flagged.
 
-Sites present in `sites-available` but not enabled are listed on a separate
-line. Read-only.
+Files in `conf.d` that do not end in `.conf` are not loaded by nginx and are
+not listed; `sites-available`/`sites-enabled` are not listed. If `nginx.conf`
+does not include `conf.d` a warning says the listed sites are not loaded.
+Apart from the migration offer it is read-only.
 
 #### 5) Add site
 
-1. Needs nginx installed and the Debian `sites-available`/`sites-enabled`
-   layout.
-2. Asks for the **domain** (lower-cased; hostname with at least two labels,
-   no paths or spaces) and the **upstream** `host:port` (IPv4, hostname or
-   `[IPv6]`; optional `http://` and trailing `/` are accepted and normalised;
-   `https://` upstreams and a missing/invalid port are rejected). Invalid
-   input changes nothing.
-3. **No duplicates.** If another enabled file already serves the domain
-   (`server_name`) the add is refused. If `sites-available/<domain>` exists:
-   identical (ezvps-made, same upstream, enabled) => `Nothing to do`, no
-   change, no reload; otherwise it is described and ezvps **asks before
-   overwriting**, then backs the old file up first.
-4. Writes `/etc/nginx/sites-available/<domain>` (temp file + `mv`) and enables
-   it with the symlink `/etc/nginx/sites-enabled/<domain>`. The generated
-   file is a plain `listen 80` server (plus `listen [::]:80` only when the
-   kernel has IPv6, i.e. `/proc/net/if_inet6` exists; otherwise `nginx -t`
-   fails on such hosts) with
-   `proxy_pass http://<upstream>`, `proxy_http_version 1.1` and
-   `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `Upgrade`,
-   `Connection` headers.
-5. `nginx -t`: pass => reload; fail => rollback (see above). Note that nginx
-   resolves a hostname upstream when it loads the config, so a name that does
-   not resolve fails the test and the site is rolled back; use an IP or a
-   resolvable name.
-6. Reminders: point DNS at the server, port 80 must be open (the firewall is
+1. Needs nginx installed. Offers the legacy migration if there is anything to
+   migrate.
+2. Asks for the **domain** (sanitised as above) and the **upstream**
+   `host:port` (IPv4, hostname or `[IPv6]`; optional `http://` and trailing
+   `/` are accepted and normalised; `https://` upstreams and a missing/invalid
+   port are rejected). Invalid input changes nothing.
+3. **No duplicates.** If another file already serves the domain
+   (`server_name` in another `conf.d/*.conf`, or in a legacy `sites-enabled`
+   file) the add is refused. If `conf.d/<domain>.conf` exists: identical
+   (ezvps-made, same upstream) => `Nothing to do`, no change, no reload;
+   otherwise it is described and ezvps **asks before overwriting**, then backs
+   the old file up first.
+4. **Debian default site.** If `sites-enabled/default` exists and conflicts
+   (it is the `default_server` for port 80, or lists the domain in its
+   `server_name`), ezvps warns and asks whether to disable **that site only**.
+   Yes: a backup of the symlink is taken
+   (`/var/backups/ezvps/nginx-default-site.<timestamp>.<pid>`) and only the
+   symlink is removed; the file in `sites-available` stays. Other files in
+   `sites-enabled` are never deleted. A `default` that is a regular file, not a
+   symlink, is left alone.
+5. Checks that `nginx.conf` includes `conf.d` (see above).
+6. Writes `/etc/nginx/conf.d/<domain>.conf` (temp file in `conf.d` + `mv`).
+   The generated file is a plain `listen 80` server (plus `listen [::]:80`
+   only when the kernel has IPv6, i.e. `/proc/net/if_inet6` exists; otherwise
+   `nginx -t` fails on such hosts) with `proxy_pass http://<upstream>`,
+   `proxy_http_version 1.1` and `Host`, `X-Real-IP`, `X-Forwarded-For`,
+   `X-Forwarded-Proto`, `Upgrade`, `Connection` headers.
+7. `nginx -t`: pass => reload; fail => rollback (see above: the new file is
+   removed, or the previous file restored, and a disabled default site is
+   re-enabled). Note that nginx resolves a hostname upstream when it loads the
+   config, so a name that does not resolve fails the test and the site is
+   rolled back; use an IP or a resolvable name.
+8. Reminders: point DNS at the server, port 80 must be open (the firewall is
    not changed here); a warning if nothing listens on a loopback upstream yet;
    the HTTP-only / Certificates note.
 
 #### 6) Remove site
 
-Asks for the domain, shows the files (and whether ezvps created them; a site
-not created by ezvps gets an explicit warning), **requires a yes**, backs the
-file up, removes the symlink and the `sites-available` file, runs `nginx -t`,
-and reloads only if it passes (otherwise rolls back and does not reload). An
-unknown domain changes nothing.
+Offers the legacy migration if there is anything to migrate, asks for the
+domain (sanitised as above), shows `conf.d/<domain>.conf` (and whether ezvps
+created it; a file not created by ezvps gets an explicit warning), **requires
+a yes**, backs the file up, deletes it, runs `nginx -t`, and reloads only if
+it passes (otherwise the file is restored and nginx is not reloaded). An
+unknown domain changes nothing. Nothing in `sites-enabled` is touched.
+
+#### Migration from the legacy layout
+
+Earlier ezvps versions wrote `sites-available/<domain>` plus a symlink in
+`sites-enabled`. List sites, Add site and Remove site look for **ezvps-made**
+files there (regular files in `sites-available` that carry the
+`# Managed by ezvps` marker with a valid `# ezvps:domain=`) and offer to move
+them. Hand-written files are never migrated or touched.
+
+* Only a site that is **enabled** (a `sites-enabled` symlink to that file) and
+  whose `conf.d/<domain>.conf` does not exist yet is moved; a disabled one
+  would be switched on by conf.d, and an existing conf.d file is never
+  overwritten. Those stay where they are and are named in the warning.
+* On yes: `nginx.conf` is checked/fixed first; every file and symlink is
+  backed up (`nginx-legacy-<domain>.<ts>.<pid>` and
+  `nginx-legacy-<domain>.enabled.<ts>.<pid>`); the files are **copied** to
+  `conf.d/<domain>.conf`; `nginx -t` must pass; only then the `sites-enabled`
+  symlink and the `sites-available` file are removed; `nginx -t` runs again
+  and nginx is reloaded only if it passes. A failure at any step restores the
+  legacy files and removes the copies, and nginx is not reloaded.
+* On no: nothing is changed, and ezvps **warns that those sites are still in
+  the legacy layout** (they keep working, but ezvps no longer manages them).
+  The offer comes back the next time one of the three actions is used.
 
 #### Backups
 
-Before overwriting or removing, the file is copied to
-`/var/backups/ezvps/nginx-site-<domain>.<timestamp>.<pid>` (dir mode 700; a
-real file enabled without a symlink gets
-`nginx-site-<domain>.enabled.<timestamp>.<pid>`). A failed backup aborts the
-action before anything is changed. Adding a brand-new site makes no backup
-(nothing existed).
+Before overwriting, removing, migrating or editing a file, it is copied to
+`/var/backups/ezvps/` (dir mode 700): `nginx-site-<domain>.<timestamp>.<pid>`
+(overwritten or removed site), `nginx.conf.<timestamp>.<pid>`,
+`nginx-default-site.<timestamp>.<pid>` (the symlink),
+`nginx-legacy-<domain>[.enabled].<timestamp>.<pid>` (migration). A failed
+backup aborts the action before anything is changed. Adding a brand-new site
+makes no backup (nothing existed).
 
 ### 6.4 Certificates (later PR)
 
@@ -521,11 +585,22 @@ Defaults are the real paths; none of these relax a check on a real server.
   reinstall, no apt call); fresh install (apt, enable --now, config test,
   verify), declined / non-Debian / apt failure / port 80 busy; status
   (running, stopped, failing config); restart with the config test before the
-  restart, and a failing test that must neither restart nor reload; list
-  sites (ezvps, foreign, default, disabled, dangling); add site (generated
-  file, symlink, test before reload, no duplicates on re-run, overwrite with
-  backup, declined overwrite, input validation, conflicting domain, failing
-  test rolls back, nginx stopped); remove site (confirmation, backup, test
-  before reload, failing test rolls back); no certificate/TLS code at all.
+  restart, and a failing test that must neither restart nor reload; against a
+  **fake `conf.d` layout** (a fixture `nginx.conf`, `conf.d/`, and the legacy
+  directories for the negative and migration cases): list sites (ezvps,
+  foreign, dangling, non-`.conf` files, legacy files not listed); add site
+  (generated `conf.d/<domain>.conf`, nothing created in `sites-*`, test
+  before reload, no duplicates on re-run, overwrite with backup, declined
+  overwrite, domain sanitising incl. path separators, input validation,
+  conflicts with `conf.d` and legacy files, failing test rolls back and does
+  not reload, nginx stopped); missing `conf.d` include in `nginx.conf` (backup,
+  inserted once inside `http`, commented-out include ignored, failing test
+  restores, no `http` block, no `nginx.conf`); the Debian default site (ask,
+  symlink-only removal with backup, restore on a failing test, other
+  `sites-enabled` files untouched); remove site (confirmation, backup, test
+  before reload, failing test restores); migration from `sites-available`
+  (accepted, declined, failing test after the copy, failing final test,
+  missing include, existing `conf.d` file, disabled and hand-written sites
+  left alone, re-run is a no-op); no certificate/TLS code at all.
   It touches nothing outside its temp dir and uses no network.
 * `tests/fresh-vps-test.md`: manual checklist on a throwaway Debian 13 VPS.
