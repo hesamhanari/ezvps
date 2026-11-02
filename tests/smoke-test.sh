@@ -55,8 +55,23 @@ printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"' 'NAME="Debian GNU/Lin
 printf '%s\n' 'PRETTY_NAME="Ubuntu 24.04.2 LTS"' 'NAME="Ubuntu"' 'VERSION_ID="24.04"' 'VERSION="24.04.2 LTS (Noble Numbat)"' 'VERSION_CODENAME=noble' 'ID=ubuntu' 'ID_LIKE=debian' 'UBUNTU_CODENAME=noble' >"$OSD/ubuntu2404"
 printf '%s\n' 'PRETTY_NAME="Ubuntu 22.04.5 LTS"' 'NAME="Ubuntu"' 'VERSION_ID="22.04"' 'VERSION="22.04.5 LTS (Jammy Jellyfish)"' 'VERSION_CODENAME=jammy' 'ID=ubuntu' 'ID_LIKE=debian' 'UBUNTU_CODENAME=jammy' >"$OSD/ubuntu2204"
 printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"' 'NAME="Debian GNU/Linux"' 'VERSION_ID="12"' 'VERSION="12 (bookworm)"' 'VERSION_CODENAME=bookworm' 'ID=debian' >"$OSD/debian12"
+# Ubuntu 26.04 LTS, and releases/combinations that must be rejected (fake data).
+printf '%s\n' 'PRETTY_NAME="Ubuntu 26.04 LTS"' 'NAME="Ubuntu"' 'VERSION_ID="26.04"' 'VERSION="26.04 LTS (Resolute Raccoon)"' 'VERSION_CODENAME=resolute' 'ID=ubuntu' 'ID_LIKE=debian' 'UBUNTU_CODENAME=resolute' >"$OSD/ubuntu2604"
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="25.10"' 'VERSION_CODENAME=questing' 'ID=ubuntu' 'ID_LIKE=debian' >"$OSD/ubuntu2510"
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="25.04"' 'VERSION_CODENAME=plucky' 'ID=ubuntu' 'ID_LIKE=debian' >"$OSD/ubuntu2504"
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="23.10"' 'VERSION_CODENAME=mantic' 'ID=ubuntu' 'ID_LIKE=debian' >"$OSD/ubuntu2310"
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="26.10"' 'VERSION_CODENAME=nextrelease' 'ID=ubuntu' 'ID_LIKE=debian' >"$OSD/ubuntu2610"
+printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 11 (bullseye)"' 'NAME="Debian GNU/Linux"' 'VERSION_ID="11"' 'VERSION_CODENAME=bullseye' 'ID=debian' >"$OSD/debian11"
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="24.04"' 'VERSION_CODENAME=jammy' 'ID=ubuntu' 'ID_LIKE=debian' >"$OSD/ubuntu2404-jammy" # version/codename mismatch
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="22.04"' 'VERSION_CODENAME=noble' 'ID=ubuntu' >"$OSD/ubuntu2204-noble"                  # mismatch the other way
+printf '%s\n' 'NAME="Debian GNU/Linux"' 'VERSION_ID="13"' 'VERSION_CODENAME=bookworm' 'ID=debian' >"$OSD/debian13-bookworm"         # mismatch
+printf '%s\n' 'NAME="Debian GNU/Linux"' 'VERSION_ID="12"' 'VERSION_CODENAME=noble' 'ID=debian' >"$OSD/debian12-noble"              # Ubuntu codename on Debian
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="22.04"' 'ID=ubuntu' >"$OSD/ubuntu2204-nocodename"                                       # no VERSION_CODENAME
+printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux forky/sid"' 'ID=debian' 'VERSION_CODENAME=forky' >"$OSD/debian-testing"               # testing/sid: no VERSION_ID
 printf '%s\n' 'NAME="Fedora Linux"' 'VERSION_ID=40' 'VERSION_CODENAME=""' 'ID=fedora' 'ID_LIKE="rhel centos"' >"$OSD/unknown"
 export EZVPS_OS_RELEASE="$OSD/debian13"
+# The one error text for an unsupported system (SPEC 1.1), as ezvps and install.sh print it.
+OS_LIST_TEXT="Debian 12 (bookworm), Debian 13 (trixie), Ubuntu 22.04 LTS (jammy), Ubuntu 24.04 LTS (noble) or Ubuntu 26.04 LTS (resolute)"
 
 # Sandbox PATHs. ezvps only needs bash builtins, so an empty dir is a PATH
 # with no ezl2tp even if the host has one installed.
@@ -636,9 +651,9 @@ check "3x-ui is no longer reported as not implemented" not_contains "$OUT" "not 
 
 echo "-- prechecks"
 new_scn pre
-OUT="$(printf '2\n1\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2204" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
+OUT="$(printf '2\n1\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
 RC=$?
-check "unsupported system (Ubuntu 22.04) is refused" contains "$OUT" "3x-ui install needs Debian 13 or Ubuntu 24.04 LTS; found 'ubuntu 22.04'"
+check "unsupported system (Ubuntu 25.10) is refused" contains "$OUT" "3x-ui install needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'"
 check "unsupported system: nothing downloaded" no_download
 check "unsupported system: menu survives" equals "$RC" 0
 OUT="$(printf '2\n1\nn\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/debian13" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
@@ -1301,9 +1316,9 @@ FAKE_NGX_NOSTART=1
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
 check "a package that does not auto-start is started by enable --now" equals "$(<"$FAKE_NGX_SVC")" active
 new_ngx inst_deb
-OUT="$(printf '%b' "${N}1\ny\n\n0\n\n0\n" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2204" PATH="$NGX_BOX" "$BASH_BIN" "$EZVPS" 2>&1)"
+OUT="$(printf '%b' "${N}1\ny\n\n0\n\n0\n" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$NGX_BOX" "$BASH_BIN" "$EZVPS" 2>&1)"
 RC=$?
-check "unsupported system (Ubuntu 22.04) is refused" contains "$OUT" "Nginx install needs Debian 13 or Ubuntu 24.04 LTS"
+check "unsupported system (Ubuntu 25.10) is refused" contains "$OUT" "Nginx install needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'"
 check "unsupported system: apt-get never called" no_apt
 check "unsupported system: menu survives" equals "$RC" 0
 new_ngx inst_nocodename
@@ -1959,32 +1974,53 @@ run_os() {
 printf '%s\n' 'NAME="Linux Mint"' 'VERSION_ID="22"' 'VERSION_CODENAME=wilma' 'ID=linuxmint' 'ID_LIKE="ubuntu debian"' 'UBUNTU_CODENAME=noble' >"$OSD/mint"
 printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="24.04"' 'VERSION_CODENAME=noble' 'ID="ubuntu"' >"$OSD/ubuntu2404-quoted"
 printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux trixie/sid"' 'ID=debian' 'VERSION_CODENAME=trixie' >"$OSD/debian-sid" # no VERSION_ID
-# name:accepted:what the refusal message must say it found
+# The five supported systems (SPEC 1.1) as "fixture:id:Label:version:codename".
+SUPPORTED_OS=(
+    "debian12:debian:Debian:12:bookworm"
+    "debian13:debian:Debian:13:trixie"
+    "ubuntu2204:ubuntu:Ubuntu:22.04:jammy"
+    "ubuntu2404:ubuntu:Ubuntu:24.04:noble"
+    "ubuntu2604:ubuntu:Ubuntu:26.04:resolute"
+)
+# Accepted: the five systems, plus Ubuntu 24.04 with a quoted ID.
+# Rejected, with what the refusal message must say it found:
+#   fixture:found[:yes if the message must also say the codename does not match]
 OS_CASES=(
+    "debian12:yes:"
     "debian13:yes:"
+    "ubuntu2204:yes:"
     "ubuntu2404:yes:"
     "ubuntu2404-quoted:yes:"
-    "ubuntu2204:no:ubuntu 22.04"
-    "debian12:no:debian 12"
-    "unknown:no:fedora 40"
-    "mint:no:linuxmint 22"
-    "debian-sid:no:debian unknown"
-    "missing-file:no:unknown unknown"
+    "ubuntu2604:yes:"
+    "ubuntu2510:no:ubuntu 25.10 questing"
+    "ubuntu2504:no:ubuntu 25.04 plucky"
+    "ubuntu2310:no:ubuntu 23.10 mantic"
+    "ubuntu2610:no:ubuntu 26.10 nextrelease"
+    "ubuntu2404-jammy:no:ubuntu 24.04 jammy:mismatch"
+    "ubuntu2204-noble:no:ubuntu 22.04 noble:mismatch"
+    "debian13-bookworm:no:debian 13 bookworm:mismatch"
+    "debian12-noble:no:debian 12 noble:mismatch"
+    "ubuntu2204-nocodename:no:ubuntu 22.04 unknown:mismatch"
+    "debian11:no:debian 11 bullseye"
+    "debian-sid:no:debian unknown trixie"
+    "debian-testing:no:debian unknown forky"
+    "unknown:no:fedora 40 unknown"
+    "mint:no:linuxmint 22 wilma"
+    "missing-file:no:unknown unknown unknown"
 )
 for c in "${OS_CASES[@]}"; do
-    f="${c%%:*}"
-    rest="${c#*:}"
-    ok="${rest%%:*}"
-    found="${rest#*:}"
+    IFS=: read -r f ok found mism <<<"$c"
     osf="$OSD/$f"
     echo "-- os-release: ${f}"
     new_scn "os-xui-$f"
     run_os "$osf" "$SBOX" "2\n1\nn\n\n0\n\n0\n"
     if [[ "$ok" == yes ]]; then
         check "${f}: 3x-ui is accepted" contains "$OUT" "will download the official 3x-ui installer"
-        check "${f}: 3x-ui shows no OS refusal" not_contains "$OUT" "needs Debian 13 or Ubuntu 24.04 LTS"
+        check "${f}: 3x-ui shows no OS refusal" not_contains "$OUT" "needs a supported system"
     else
-        check "${f}: 3x-ui is rejected with a clear message" contains "$OUT" "3x-ui install needs Debian 13 or Ubuntu 24.04 LTS; found '${found}'. Nothing was changed."
+        check "${f}: 3x-ui is rejected with the shared message" contains "$OUT" "3x-ui install needs a supported system: ${OS_LIST_TEXT}; found '${found}'"
+        check "${f}: 3x-ui rejection says nothing was changed" contains "$OUT" "Nothing was changed."
+        [[ -n "$mism" ]] && check "${f}: 3x-ui rejection names the codename mismatch" contains "$OUT" "the codename does not match the version"
         check "${f}: 3x-ui rejected: nothing downloaded or installed" no_download
         check "${f}: 3x-ui rejected: no panel" no_panel_installed
         check "${f}: 3x-ui rejected: menu survives" equals "$RC" 0
@@ -1995,7 +2031,7 @@ for c in "${OS_CASES[@]}"; do
         check "${f}: Nginx is accepted" contains "$OUT" "ONLY from the official nginx.org STABLE repository"
         check "${f}: Nginx accepted, declined at the prompt: apt untouched" no_apt
     else
-        check "${f}: Nginx is rejected with a clear message" contains "$OUT" "Nginx install needs Debian 13 or Ubuntu 24.04 LTS; found '${found}'. Nothing was changed."
+        check "${f}: Nginx is rejected with the shared message" contains "$OUT" "Nginx install needs a supported system: ${OS_LIST_TEXT}; found '${found}'"
         check "${f}: Nginx rejected: apt never called, no repository files" no_apt
         check "${f}: Nginx rejected: no key download" no_key_download
         check "${f}: Nginx rejected: no repository files" repo_absent
@@ -2003,39 +2039,50 @@ for c in "${OS_CASES[@]}"; do
     fi
 done
 
-echo "-- the switch that skips the check still never picks a repository for an unknown distro"
+echo "-- the switch that skips the check still never picks a repository for an unknown or inconsistent system"
 new_ngx os_skip_unknown
 EZVPS_OS_RELEASE="$OSD/unknown" run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
 check "skip + unknown distro: no nginx.org repository is chosen" contains "$OUT" "nginx.org packages are only set up for Debian and Ubuntu; found 'fedora'"
 check "skip + unknown distro: apt never called, nothing written" no_apt
 check "skip + unknown distro: repository files absent" repo_absent
+for f in ubuntu2404-jammy ubuntu2510 debian13-bookworm debian11 ubuntu2204-noble; do
+    new_ngx "os_skip_$f"
+    EZVPS_OS_RELEASE="$OSD/$f" run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+    check "skip + ${f}: no repository is guessed" contains "$OUT" "Nginx install needs a supported system"
+    check "skip + ${f}: apt never called, nothing written" no_apt
+    check "skip + ${f}: repository files absent" repo_absent
+done
 
-echo "-- L2TP is Debian 13 only"
+echo "-- L2TP stays gated by ezl2tp: Debian 13 only"
 run_os "$OSD/debian13" "$STUB_BIN" "1\n\n0\n"
 check "L2TP on Debian 13: ezl2tp is launched" contains "$OUT" "FAKE-EZL2TP-RAN"
 check "L2TP on Debian 13: no Debian-only message" not_contains "$OUT" "Debian 13 only"
 run_os "$OSD/debian13" "$EMPTY_BIN" "1\n\n0\n"
 check "L2TP on Debian 13 without ezl2tp: git clone help as before" contains "$OUT" "git clone"
-for stub in "$STUB_BIN" "$EMPTY_BIN"; do
-    kind="ezl2tp present"
-    [[ "$stub" == "$EMPTY_BIN" ]] && kind="ezl2tp absent"
-    run_os "$OSD/ubuntu2404" "$stub" "1\n\n0\n"
-    check "L2TP on Ubuntu 24.04 (${kind}): says Debian 13 only for now" contains "$OUT" "L2TP via ezl2tp is Debian 13 only for now (found Ubuntu 24.04)"
-    check "L2TP on Ubuntu 24.04 (${kind}): ezl2tp is not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
-    check "L2TP on Ubuntu 24.04 (${kind}): no install instructions" not_contains "$OUT" "git clone"
-    check "L2TP on Ubuntu 24.04 (${kind}): nothing changed, said so" contains "$OUT" "Nothing was changed."
-    check "L2TP on Ubuntu 24.04 (${kind}): back to the menu" at_least_menus "$OUT" 2
-    check "L2TP on Ubuntu 24.04 (${kind}): exit 0" equals "$RC" 0
+# Every other supported system: a message, nothing launched, nothing installed, back to the menu.
+for c in "debian12:Debian 12:bookworm" "ubuntu2204:Ubuntu 22.04:jammy" "ubuntu2404:Ubuntu 24.04:noble" "ubuntu2604:Ubuntu 26.04:resolute"; do
+    IFS=: read -r f pretty cn <<<"$c"
+    for stub in "$STUB_BIN" "$EMPTY_BIN"; do
+        kind="ezl2tp present"
+        [[ "$stub" == "$EMPTY_BIN" ]] && kind="ezl2tp absent"
+        run_os "$OSD/$f" "$stub" "1\n\n0\n"
+        check "L2TP on ${pretty} (${kind}): says Debian 13 only for now" contains "$OUT" "L2TP via ezl2tp is Debian 13 only for now (found ${pretty}, ${cn})"
+        check "L2TP on ${pretty} (${kind}): ezl2tp is not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
+        check "L2TP on ${pretty} (${kind}): no install instructions" not_contains "$OUT" "git clone"
+        check "L2TP on ${pretty} (${kind}): nothing changed, said so" contains "$OUT" "Nothing was changed."
+        check "L2TP on ${pretty} (${kind}): back to the menu" at_least_menus "$OUT" 2
+        check "L2TP on ${pretty} (${kind}): exit 0" equals "$RC" 0
+    done
+    run_os "$OSD/$f" "$STUB_BIN" "" l2tp
+    check "'ezvps l2tp' on ${pretty}: message, nothing launched" contains "$OUT" "Debian 13 only for now"
+    check "'ezvps l2tp' on ${pretty}: ezl2tp not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
+    check "'ezvps l2tp' on ${pretty}: exit 0" equals "$RC" 0
+    EZVPS_OS_RELEASE="$OSD/$f" run_ezvps "$STUB_BIN" "" l2tp
+    check "L2TP stays gated even with the OS-check switch on (${pretty}, tests)" not_contains "$OUT" "FAKE-EZL2TP-RAN"
 done
-run_os "$OSD/ubuntu2404" "$STUB_BIN" "" l2tp
-check "'ezvps l2tp' on Ubuntu 24.04: message, nothing launched, exit 0" contains "$OUT" "Debian 13 only for now"
-check "'ezvps l2tp' on Ubuntu 24.04: ezl2tp not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
-check "'ezvps l2tp' on Ubuntu 24.04: exit 0" equals "$RC" 0
-EZVPS_OS_RELEASE="$OSD/ubuntu2404" run_ezvps "$STUB_BIN" "" l2tp
-check "L2TP stays Debian-only even with the OS-check switch on (tests)" not_contains "$OUT" "FAKE-EZL2TP-RAN"
-for f in ubuntu2204 debian12 unknown; do
+for f in ubuntu2510 debian11 unknown ubuntu2404-jammy; do
     run_os "$OSD/$f" "$STUB_BIN" "1\n\n0\n"
-    check "L2TP on ${f}: rejected as an unsupported system" contains "$OUT" "L2TP needs Debian 13 or Ubuntu 24.04 LTS"
+    check "L2TP on ${f}: rejected as an unsupported system" contains "$OUT" "L2TP needs a supported system: ${OS_LIST_TEXT}"
     check "L2TP on ${f}: ezl2tp is not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
     check "L2TP on ${f}: menu survives" equals "$RC" 0
 done
@@ -2100,9 +2147,39 @@ ngx_flow() {
     check "${label} replace: config test before any reload" runs_before '^nginx-t-state' '^systemctl reload nginx$'
     check "${label} replace: exit 0" equals "$RC" 0
 }
-ngx_flow debian "$OSD/debian13" Debian debian trixie 1.26.3-3+deb13u1 ubuntu
-ngx_flow ubuntu "$OSD/ubuntu2404" Ubuntu ubuntu noble 1.24.0-2ubuntu7.1 debian
-ngx_flow ubuntu_quoted "$OSD/ubuntu2404-quoted" Ubuntu ubuntu noble 1.24.0-2ubuntu7.1 debian
+# The distribution's own nginx versions below are fake; only their shape (not "~<codename>") matters.
+ngx_flow debian12 "$OSD/debian12" Debian debian bookworm 1.22.1-9+deb12u3 ubuntu
+ngx_flow debian13 "$OSD/debian13" Debian debian trixie 1.26.3-3+deb13u1 ubuntu
+ngx_flow ubuntu2204 "$OSD/ubuntu2204" Ubuntu ubuntu jammy 1.18.0-6ubuntu14.6 debian
+ngx_flow ubuntu2404 "$OSD/ubuntu2404" Ubuntu ubuntu noble 1.24.0-2ubuntu7.1 debian
+ngx_flow ubuntu2404_quoted "$OSD/ubuntu2404-quoted" Ubuntu ubuntu noble 1.24.0-2ubuntu7.1 debian
+ngx_flow ubuntu2604 "$OSD/ubuntu2604" Ubuntu ubuntu resolute 1.28.0-1ubuntu1 debian
+
+echo "-- every supported system: repository path and suite come from the detected codename"
+for c in "${SUPPORTED_OS[@]}"; do
+    IFS=: read -r f distro label ver cn <<<"$c"
+    new_ngx "repo-$f"
+    FAKE_DISTRO="$distro" FAKE_CODENAME="$cn" FAKE_ORG_VERSION="1.30.2-1~${cn}"
+    run_os "$OSD/$f" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+    check "${label} ${ver}: apt source is exactly one line, packages/${distro} + suite ${cn}" equals "$(<"$(LST)")" "deb [signed-by=$(KR)] https://nginx.org/packages/${distro} ${cn} nginx"
+    check "${label} ${ver}: installed package ends in ~${cn}" file_has "$FAKE_DPKG" "ii nginx 1.30.2-1~${cn}"
+    check "${label} ${ver}: same signing key URL" has_line "$(log)" "curl KEY https://nginx.org/keys/nginx_signing.key"
+    check "${label} ${ver}: same pin" file_has "$(PRF)" "Pin: origin nginx.org"
+    check "${label} ${ver}: same pin priority" file_has "$(PRF)" "Pin-Priority: 900"
+    # a candidate built for a different suite is refused (the codename is not hardcoded per distro)
+    new_ngx "repo-other-$f"
+    FAKE_DISTRO="$distro" FAKE_CODENAME="$cn" FAKE_ORG_VERSION="1.30.2-1~elsewhere"
+    run_os "$OSD/$f" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+    check "${label} ${ver}: a candidate for another suite is refused" contains "$OUT" "expected a version ending in ~${cn}"
+    check "${label} ${ver}: other-suite candidate: nothing installed" no_apt_install_or_purge
+    # a mainline source anywhere in apt's config is refused on every system
+    new_ngx "repo-main-$f"
+    mkdir -p "$EZVPS_APT_DIR/sources.list.d"
+    printf 'Types: deb\nURIs: https://nginx.org/packages/mainline/%s\nSuites: %s\nComponents: nginx\n' "$distro" "$cn" >"$EZVPS_APT_DIR/sources.list.d/other.sources"
+    run_os "$OSD/$f" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+    check "${label} ${ver}: a mainline deb822 source is refused" contains "$OUT" "MAINLINE source is configured in"
+    check "${label} ${ver}: mainline source: apt never called" no_apt
+done
 
 echo "-- Ubuntu 24.04: refusals keep the system untouched"
 UB="$OSD/ubuntu2404"
@@ -2155,29 +2232,31 @@ run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
 check "Ubuntu: a mainline build after install aborts" contains "$OUT" "VERSION CHECK FAILED: nginx/1.31.0 is a mainline build"
 check "Ubuntu mainline build: nginx not started" no_mutation
 new_ngx ub_badcodename
-printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' 'VERSION_CODENAME=jammy' >"$SCN/os-badcodename"
-run_os "$SCN/os-badcodename" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "Ubuntu 24.04 with another codename in os-release is refused" contains "$OUT" "the codename 'jammy' (expected 'noble')"
+run_os "$OSD/ubuntu2404-jammy" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu 24.04 with codename jammy is refused as a mismatch, not accepted as Ubuntu" contains "$OUT" "Nginx install needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 24.04 jammy' (the codename does not match the version; ubuntu 24.04 is 'noble')"
 check "Ubuntu wrong codename: nothing changed" nothing_installed
 new_ngx ub_nocodename
-printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' >"$SCN/os-nocodename"
-run_os "$SCN/os-nocodename" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "Ubuntu without a codename is refused" contains "$OUT" "Could not read the Ubuntu codename"
+run_os "$OSD/ubuntu2204-nocodename" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu without a codename is refused" contains "$OUT" "found 'ubuntu 22.04 unknown'"
 check "Ubuntu without a codename: nothing changed" nothing_installed
 new_ngx deb_badcodename
-printf '%s\n' 'ID=debian' 'VERSION_ID="13"' 'VERSION_CODENAME=noble' >"$SCN/os-debbad"
-run_os "$SCN/os-debbad" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "Debian 13 with the Ubuntu codename is refused" contains "$OUT" "the codename 'noble' (expected 'trixie')"
-check "Debian 13 wrong codename: nothing changed" nothing_installed
+run_os "$OSD/debian12-noble" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Debian 12 with the Ubuntu codename is refused" contains "$OUT" "found 'debian 12 noble' (the codename does not match the version; debian 12 is 'bookworm')"
+check "Debian 12 wrong codename: nothing changed" nothing_installed
 
-echo "-- 3x-ui default install on Ubuntu 24.04 (check on)"
-new_scn xui_ubuntu
-run_os "$OSD/ubuntu2404" "$SBOX" "2\n1\ny\n\n0\n\n0\n"
-check "Ubuntu 24.04: 3x-ui installer ran with the pinned tag" contains "$(log)" "FAKE-INSTALLER-RAN args=${PINNED_TAG} noninteractive=1 ssl=none port=3389"
-check "Ubuntu 24.04: panel settings applied" db_has "port=3389"
-check "Ubuntu 24.04: panel verified" contains "$OUT" "Verified: the panel answers on http://127.0.0.1:3389/xuipanel/"
-check "Ubuntu 24.04: change-password warning shown" contains "$OUT" "WARNING: CHANGE THE PANEL PASSWORD NOW"
-check "Ubuntu 24.04: exit 0" equals "$RC" 0
+echo "-- 3x-ui default install on every supported system (check on)"
+# The pinned upstream installer branches on ID (debian | ubuntu) only, so the
+# flow is the same on all five releases.
+for c in "${SUPPORTED_OS[@]}"; do
+    IFS=: read -r f distro label ver cn <<<"$c"
+    new_scn "xui_$f"
+    run_os "$OSD/$f" "$SBOX" "2\n1\ny\n\n0\n\n0\n"
+    check "${label} ${ver}: 3x-ui installer ran with the pinned tag" contains "$(log)" "FAKE-INSTALLER-RAN args=${PINNED_TAG} noninteractive=1 ssl=none port=3389"
+    check "${label} ${ver}: panel settings applied" db_has "port=3389"
+    check "${label} ${ver}: panel verified" contains "$OUT" "Verified: the panel answers on http://127.0.0.1:3389/xuipanel/"
+    check "${label} ${ver}: change-password warning shown" contains "$OUT" "WARNING: CHANGE THE PANEL PASSWORD NOW"
+    check "${label} ${ver}: exit 0" equals "$RC" 0
+done
 
 echo "-- Nginx stays HTTP only"
 no_tls_code() { ! grep -vE '^[[:space:]]*#' "$1" | grep -qiE 'ssl_certificate|certbot|acme\.sh|letsencrypt|listen 443|443 ssl'; }
@@ -2282,7 +2361,7 @@ RC=$?
 check "syntax-broken source is refused" test "$RC" -ne 0
 check "installed file untouched after refused install" equals "$(file_sum "$IBIN/ezvps")" "$BEFORE"
 
-# The installer applies the same rule as ezvps: Debian 13 or Ubuntu 24.04 LTS, nothing else.
+# The installer applies the same rule as ezvps: the five supported systems, nothing else.
 echo "-- install.sh: operating systems (fake os-release, check on)"
 os_install() { # os_install <os-release file> -> OUT / RC; installs into a fresh dir
     OSBIN="$WORK/inst-os/$(basename "$1")/bin"
@@ -2290,17 +2369,18 @@ os_install() { # os_install <os-release file> -> OUT / RC; installs into a fresh
     OUT="$(env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$1" EZVPS_BIN_DIR="$OSBIN" EZVPS_BACKUP_DIR="$WORK/inst-os/$(basename "$1")/backup" "$BASH_BIN" "$INSTALL" 2>&1)"
     RC=$?
 }
-for f in debian13 ubuntu2404 ubuntu2404-quoted; do
+for c in "${OS_CASES[@]}"; do
+    IFS=: read -r f ok found mism <<<"$c"
     os_install "$OSD/$f"
-    check "install.sh accepts ${f}" equals "$RC" 0
-    check "install.sh on ${f}: ezvps is installed" test -x "$OSBIN/ezvps"
-done
-for c in "ubuntu2204:ubuntu 22.04" "debian12:debian 12" "unknown:fedora 40" "mint:linuxmint 22" "missing-file:unknown unknown"; do
-    f="${c%%:*}"
-    os_install "$OSD/$f"
-    check "install.sh refuses ${f}" test "$RC" -ne 0
-    check "install.sh refusal on ${f} is clear" contains "$OUT" "supports Debian 13 and Ubuntu 24.04 LTS only; found '${c#*:}'. Nothing was installed."
-    check "install.sh on ${f}: nothing installed" test ! -e "$OSBIN/ezvps"
+    if [[ "$ok" == yes ]]; then
+        check "install.sh accepts ${f}" equals "$RC" 0
+        check "install.sh on ${f}: ezvps is installed" test -x "$OSBIN/ezvps"
+    else
+        check "install.sh refuses ${f}" test "$RC" -ne 0
+        check "install.sh refusal on ${f} is the shared message" contains "$OUT" "ezvps install needs a supported system: ${OS_LIST_TEXT}; found '${found}'"
+        [[ -n "$mism" ]] && check "install.sh refusal on ${f} names the codename mismatch" contains "$OUT" "the codename does not match the version"
+        check "install.sh on ${f}: nothing installed" test ! -e "$OSBIN/ezvps"
+    fi
 done
 
 echo

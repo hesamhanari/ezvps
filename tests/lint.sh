@@ -94,16 +94,31 @@ if grep -vE '^[[:space:]]*#' ezvps | grep -oE 'https://nginx\.org/packages/[a-z/
     grep -vxE 'https://nginx\.org/packages/(debian|ubuntu)'; then
     bad "ezvps: unexpected nginx.org repository URL (only packages/debian and packages/ubuntu are allowed)"
 fi
-# One shared OS check: the Debian-only function must not come back, and the
-# supported list must stay Debian 13 + Ubuntu 24.04 LTS.
+# One shared OS check: the Debian-only function must not come back, the
+# allowlist must be exactly the five supported id + version + codename triples,
+# and the block must be byte-identical in ezvps and install.sh.
 if grep -q 'require_debian13' ezvps; then
-    bad "ezvps: require_debian13 is gone; use require_supported_os (Debian 13 and Ubuntu 24.04 LTS)"
+    bad "ezvps: require_debian13 is gone; use require_supported_os"
 fi
-if ! grep -qF '"debian 13") printf '"'"'trixie'"'"' ;;' ezvps || ! grep -qF '"ubuntu 24.04") printf '"'"'noble'"'"' ;;' ezvps; then
-    bad "ezvps: os_expected_codename must list exactly Debian 13 (trixie) and Ubuntu 24.04 (noble)"
+os_block() { sed -n '/^# BEGIN ezvps-os-allowlist/,/^# END ezvps-os-allowlist/p' "$1"; }
+if [[ -z "$(os_block ezvps)" ]] || [[ "$(os_block ezvps)" != "$(os_block install.sh)" ]]; then
+    bad "ezvps and install.sh must carry the identical '# BEGIN/END ezvps-os-allowlist' block"
 fi
-if [[ "$(grep -cE '^        "(debian|ubuntu) [0-9.]+"\) printf ' ezvps)" -ne 2 ]]; then
-    bad "ezvps: only Debian 13 and Ubuntu 24.04 may be listed as supported systems"
+want_allow='    "debian 12 bookworm"
+    "debian 13 trixie"
+    "ubuntu 22.04 jammy"
+    "ubuntu 24.04 noble"
+    "ubuntu 26.04 resolute"'
+got_allow="$(os_block ezvps | sed -n '/^OS_ALLOWLIST=(/,/^)/p' | sed '1d;$d')"
+if [[ "$got_allow" != "$want_allow" ]]; then
+    bad "ezvps: OS_ALLOWLIST must list exactly Debian 12/13 and Ubuntu 22.04/24.04/26.04 (bookworm trixie jammy noble resolute)"
+fi
+if grep -vE '^[[:space:]]*#' ezvps install.sh | grep -qE 'ID_LIKE|(source|\.)[[:space:]]+[^ ]*os-release'; then
+    bad "os-release must be parsed, never sourced, and ID_LIKE must be ignored"
+fi
+# The nginx.org suite is the detected codename, never a per-distro constant.
+if grep -vE '^[[:space:]]*#' ezvps | grep -E 'nginx\.org/packages|NGX_CODENAME=' | grep -E '(bookworm|trixie|jammy|noble|resolute)'; then
+    bad "ezvps: the nginx.org suite must come from the detected codename, not a hardcoded one"
 fi
 if ! grep -qE '^NGX_ORG_KEY_URL="https://nginx\.org/keys/nginx_signing\.key"$' ezvps; then
     bad "ezvps: NGX_ORG_KEY_URL missing or changed"

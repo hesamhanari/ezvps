@@ -6,7 +6,7 @@ first; it is the source of truth for scope.
 ## Project
 
 `ezvps` is a single bash script (`ezvps`) that gives a TUI menu and CLI for
-managing a Debian 13 or Ubuntu 24.04 LTS VPS as root. `install.sh` installs it to
+managing a Debian (12, 13) or Ubuntu LTS (22.04, 24.04, 26.04) VPS as root. `install.sh` installs it to
 `/usr/local/bin/ezvps`. Same principles as easyl2tp.
 
 ## Rules that must never be broken
@@ -69,14 +69,19 @@ SPEC.md  README.md  AGENTS.md
 * nginx comes only from the nginx.org **stable** repository (never the Debian
   or Ubuntu package, never mainline) with the apt pin; do not weaken that
   (SPEC 6.3). The repository path follows the detected distro
-  (`packages/debian` + `trixie`, `packages/ubuntu` + `noble`).
-* Supported systems are exactly Debian 13 and Ubuntu 24.04 LTS (SPEC 1.1).
+  (`packages/debian`, `packages/ubuntu`) and the suite is the detected codename
+  (`bookworm`, `trixie`, `jammy`, `noble`, `resolute`), never a per-distro constant.
+* Supported systems are exactly the five `ID` + `VERSION_ID` + `VERSION_CODENAME`
+  triples in SPEC 1.1 (Debian 12/13, Ubuntu 22.04/24.04/26.04); all three must
+  agree. The allowlist block is duplicated verbatim in `ezvps` and `install.sh`
+  and lint keeps the copies identical.
   Every module that needs a supported system calls `require_supported_os` (which
   runs `detect_os` and sets `OS_ID` / `OS_VERSION` / `OS_CODENAME`); never read
   `/etc/os-release` yourself and never add a version to the list without a
   tested module change. Where Debian and Ubuntu really differ, branch on
   `$OS_ID` with a comment saying why; where they behave the same keep one code
-  path. L2TP (ezl2tp) stays Debian 13 only until the owner says otherwise.
+  path. L2TP (ezl2tp) is gated by `L2TP_SUPPORTED` (Debian 13 only) until the
+  owner says otherwise; never claim L2TP works where ezl2tp does not.
 * Output goes through `info` / `warn` / `err`. Colour only on a TTY and
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
