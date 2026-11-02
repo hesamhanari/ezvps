@@ -294,8 +294,10 @@ case "$verb" in
 esac
 EOF
 
-# fake nginx: `-t` fails if an enabled site contains BROKEN_DIRECTIVE, if an
-# enabled file is named $FAKE_NGX_FAIL_DOMAIN, or always when FAKE_NGX_TEST_FAIL=1
+# fake nginx: `-t` fails if nginx.conf, a conf.d/*.conf or a sites-enabled file
+# contains BROKEN_DIRECTIVE, if conf.d/$FAKE_NGX_FAIL_DOMAIN.conf exists, on the
+# $FAKE_NGX_FAIL_NTH-th call, or always when FAKE_NGX_TEST_FAIL=1. Each call
+# also logs how many legacy/conf.d site files were present (nginx-t-state).
 mkstub "$STUBS/nginx" <<'EOF'
 case "${1:-}" in
     -v)
@@ -303,12 +305,21 @@ case "${1:-}" in
         exit 0 ;;
     -t)
         echo "nginx -t" >>"$FAKE_LOG"
+        n=0 c=0
+        for f in "$EZVPS_NGINX_DIR"/sites-enabled/*; do [[ -e "$f" || -L "$f" ]] && n=$((n + 1)); done
+        for f in "$EZVPS_NGINX_DIR"/conf.d/*.conf; do [[ -e "$f" ]] && c=$((c + 1)); done
+        echo "nginx-t-state enabled=$n confd=$c" >>"$FAKE_LOG"
+        calls=0
+        [[ -f "$FAKE_LOG.tcount" ]] && calls="$(<"$FAKE_LOG.tcount")"
+        calls=$((calls + 1))
+        echo "$calls" >"$FAKE_LOG.tcount"
         bad=""
         [[ "${FAKE_NGX_TEST_FAIL:-0}" == "1" ]] && bad="forced failure"
-        if [[ -n "${FAKE_NGX_FAIL_DOMAIN:-}" && -e "$EZVPS_NGINX_DIR/sites-enabled/$FAKE_NGX_FAIL_DOMAIN" ]]; then
+        [[ "${FAKE_NGX_FAIL_NTH:-0}" == "$calls" ]] && bad="forced failure on call $calls"
+        if [[ -n "${FAKE_NGX_FAIL_DOMAIN:-}" && -e "$EZVPS_NGINX_DIR/conf.d/$FAKE_NGX_FAIL_DOMAIN.conf" ]]; then
             bad="$FAKE_NGX_FAIL_DOMAIN"
         fi
-        for f in "$EZVPS_NGINX_DIR"/sites-enabled/*; do
+        for f in "$EZVPS_NGINX_DIR/nginx.conf" "$EZVPS_NGINX_DIR"/conf.d/*.conf "$EZVPS_NGINX_DIR"/sites-enabled/*; do
             [[ -f "$f" ]] || continue
             while IFS= read -r line; do
                 [[ "$line" == *BROKEN_DIRECTIVE* ]] && bad="$f"
@@ -391,7 +402,8 @@ fi
 if [[ "$*" == *"install"* && "$*" == *"nginx"* ]]; then
     [[ "${FAKE_APT_FAIL:-0}" == "1" ]] && exit 100
     cp "$STUBS_DIR/nginx" "$NGX_BOX_DIR/nginx"
-    mkdir -p "$EZVPS_NGINX_DIR/sites-available" "$EZVPS_NGINX_DIR/sites-enabled"
+    mkdir -p "$EZVPS_NGINX_DIR/conf.d" "$EZVPS_NGINX_DIR/sites-available" "$EZVPS_NGINX_DIR/sites-enabled"
+    printf '%s\n' "http {" "    include $EZVPS_NGINX_DIR/conf.d/*.conf;" "    include $EZVPS_NGINX_DIR/sites-enabled/*;" "}" >"$EZVPS_NGINX_DIR/nginx.conf"
     [[ "${FAKE_NGX_NOSTART:-0}" == "1" ]] || echo active >"$FAKE_NGX_SVC"
 fi
 exit 0
@@ -840,25 +852,65 @@ new_ngx() {
     export EZVPS_NGINX_DIR="$SCN/etc-nginx" FAKE_NGX_SVC="$SCN/ngx-svc"
     export EZVPS_NGINX_HTTP_PORT="$PORT_UP" EZVPS_NGINX_WAIT_SECONDS=0
     export FAKE_NGX_FAIL_DOMAIN="" FAKE_NGX_TEST_FAIL=0 FAKE_NGX_NOSTART=0 FAKE_APT_FAIL=0
-    export FAKE_NGX_RESTART_FAIL=0 FAKE_NGX_RELOAD_FAIL=0
+    export FAKE_NGX_RESTART_FAIL=0 FAKE_NGX_RELOAD_FAIL=0 FAKE_NGX_FAIL_NTH=0
     rm -f "$NGX_BOX/nginx"
 }
-ngx_layout() { mkdir -p "$EZVPS_NGINX_DIR/sites-available" "$EZVPS_NGINX_DIR/sites-enabled"; }
+# nginx.conf fixture shaped like Debian's: mk_nginx_conf [1|0] (0 = the conf.d
+# include is missing; only a commented-out one remains)
+mk_nginx_conf() {
+    {
+        printf '%s\n' "user www-data;" "events {" "    worker_connections 768;" "}" "http {" "    sendfile on;" "    include $EZVPS_NGINX_DIR/mime.types;"
+        if [[ "${1:-1}" == "1" ]]; then
+            printf '%s\n' "    include $EZVPS_NGINX_DIR/conf.d/*.conf;"
+        else
+            printf '%s\n' "    #include $EZVPS_NGINX_DIR/conf.d/*.conf;"
+        fi
+        printf '%s\n' "    include $EZVPS_NGINX_DIR/sites-enabled/*;" "}"
+    } >"$EZVPS_NGINX_DIR/nginx.conf"
+}
+ngx_layout() {
+    mkdir -p "$EZVPS_NGINX_DIR/conf.d" "$EZVPS_NGINX_DIR/sites-available" "$EZVPS_NGINX_DIR/sites-enabled"
+    mk_nginx_conf 1
+}
 ngx_up() { ngx_layout && echo active >"$FAKE_NGX_SVC"; }
 ngx_down() { ngx_layout && echo inactive >"$FAKE_NGX_SVC"; }
+CF() { printf '%s' "$EZVPS_NGINX_DIR/conf.d/$1.conf"; }
+# legacy layout (what an older ezvps wrote); used for the migration and "not touched" tests
 AV() { printf '%s' "$EZVPS_NGINX_DIR/sites-available/$1"; }
 EN() { printf '%s' "$EZVPS_NGINX_DIR/sites-enabled/$1"; }
 # fixtures written independently of the module's own renderer
-mk_ezvps_site() { # mk_ezvps_site <domain> <upstream>
+ezvps_site_text() { # ezvps_site_text <domain> <upstream>
     printf '%s\n' "# Managed by ezvps (Nginx module). fixture" "# ezvps:domain=$1" "# ezvps:upstream=$2" \
-        "server {" "    listen 80;" "    server_name $1;" "    location / { proxy_pass http://$2; }" "}" >"$(AV "$1")"
-    ln -s "$(AV "$1")" "$(EN "$1")"
+        "server {" "    listen 80;" "    server_name $1;" "    location / { proxy_pass http://$2; }" "}"
 }
-mk_foreign_site() { # mk_foreign_site <file-name> <server_name> [enable 1|0]
-    printf '%s\n' "server {" "    listen 80;" "    server_name $2;" "    return 200 'hand written';" "}" >"$(AV "$1")"
+mk_ezvps_site() { # mk_ezvps_site <domain> <upstream>   -> conf.d/<domain>.conf
+    ezvps_site_text "$1" "$2" >"$(CF "$1")"
+}
+mk_foreign_site() { # mk_foreign_site <file-name-without-.conf> <server_name>   -> conf.d
+    printf '%s\n' "server {" "    listen 80;" "    server_name $2;" "    return 200 'hand written';" "}" >"$(CF "$1")"
+}
+mk_legacy_site() { # mk_legacy_site <domain> <upstream> [enable 1|0]   -> sites-available (+ symlink)
+    ezvps_site_text "$1" "$2" >"$(AV "$1")"
     [[ "${3:-1}" == "1" ]] && ln -s "$(AV "$1")" "$(EN "$1")"
     return 0
 }
+mk_legacy_foreign() { # mk_legacy_foreign <name> <server_name> [enable 1|0] [listen line]
+    printf '%s\n' "server {" "    ${4:-listen 80;}" "    server_name $2;" "    return 200 'hand written';" "}" >"$(AV "$1")"
+    [[ "${3:-1}" == "1" ]] && ln -s "$(AV "$1")" "$(EN "$1")"
+    return 0
+}
+# does nginx.conf have the conf.d include inside the http block, exactly once?
+INC_RE='^[[:space:]]+include .*/conf\.d/\*\.conf;$'
+has_include() { grep -qE "$INC_RE" "$1"; }
+include_in_http() {
+    local start inc end
+    start="$(grep -n '^http {' "$1" | head -n1 | cut -d: -f1)"
+    end="$(grep -n '^}' "$1" | tail -n1 | cut -d: -f1)"
+    [[ "$(grep -cE "$INC_RE" "$1")" -eq 1 ]] || return 1
+    inc="$(grep -nE "$INC_RE" "$1" | cut -d: -f1)"
+    [[ -n "$start" && -n "$end" ]] && ((start < inc && inc < end))
+}
+bk_count() { find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name "$1" 2>/dev/null | wc -l; }
 nlog_count() { grep -cE -- "$1" "$FAKE_LOG"; }
 no_mutation() { [[ "$(nlog_count '^systemctl (restart|reload|start|enable)')" -eq 0 ]]; }
 no_apt() { [[ "$(nlog_count '^apt-get')" -eq 0 ]]; }
@@ -976,7 +1028,7 @@ check "status: stopped, exit 0" equals "$RC" 0
 new_ngx st_bad
 ngx_up
 mk_foreign_site broken.example.com broken.example.com
-echo "    BROKEN_DIRECTIVE on;" >>"$(AV broken.example.com)"
+echo "    BROKEN_DIRECTIVE on;" >>"$(CF broken.example.com)"
 run_ezvps "$NGX_BOX_INST" "${N}2\n\n0\n\n0\n"
 check "status: failing config test is reported" contains "$OUT" "Config test:  FAILS"
 check "status: shows the nginx error" contains "$OUT" 'unknown directive "BROKEN_DIRECTIVE"'
@@ -1000,7 +1052,7 @@ check "restart: exit 0" equals "$RC" 0
 new_ngx rs_bad
 ngx_up
 mk_foreign_site broken.example.com broken.example.com
-echo "    BROKEN_DIRECTIVE on;" >>"$(AV broken.example.com)"
+echo "    BROKEN_DIRECTIVE on;" >>"$(CF broken.example.com)"
 run_ezvps "$NGX_BOX_INST" "${N}3\n\n0\n\n0\n"
 check "restart: failing config test is reported" contains "$OUT" "config test FAILED"
 check "restart: says nginx was NOT restarted or reloaded" contains "$OUT" "NOT restarted or reloaded"
@@ -1029,39 +1081,57 @@ ngx_up
 mk_ezvps_site example.com 127.0.0.1:3000
 mk_ezvps_site api.example.com 127.0.0.1:8080
 mk_foreign_site legacy old.example.org
-mk_foreign_site default _
-mk_foreign_site spare.example.com spare.example.com 0
-ln -s "$SCN/does-not-exist" "$(EN dangling.example.com)"
+ln -s "$SCN/does-not-exist" "$(CF dangling.example.com)"
+printf 'server_name notes.example.com;\n' >"$EZVPS_NGINX_DIR/conf.d/notes.txt"
+printf 'server { server_name hidden.example.com; }\n' >"$EZVPS_NGINX_DIR/conf.d/old.conf.disabled"
+mk_legacy_foreign default _ 1 # Debian's own default site: not an ezvps site, not listed
+mk_legacy_foreign spare.example.com spare.example.com 0
+SUM_CONF="$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")"
 run_ezvps "$NGX_BOX_INST" "${N}4\n\n0\n\n0\n"
-check "list: header" contains "$OUT" "Enabled sites"
-check "list: ezvps site shows domain and upstream" has_row "$OUT" '^  example\.com +example\.com +127\.0\.0\.1:3000 +ezvps$'
-check "list: second ezvps site" has_row "$OUT" '^  api\.example\.com +api\.example\.com +127\.0\.0\.1:8080 +ezvps$'
-check "list: other site shows its server_name, no upstream" has_row "$OUT" '^  legacy +old\.example\.org +- +not ezvps$'
-check "list: Debian default site" has_row "$OUT" '^  default +_ +- +not ezvps$'
-check "list: broken symlink is flagged" has_row "$OUT" 'dangling\.example\.com .*broken symlink'
-check "list: disabled sites are listed separately" contains "$OUT" "Available but not enabled: spare.example.com"
-check "list: a disabled site is not in the enabled table" not_contains "$(printf '%s\n' "$OUT" | grep -E '^  spare')" "spare"
+check "list: header names conf.d" contains "$OUT" "Sites (${EZVPS_NGINX_DIR}/conf.d/*.conf):"
+check "list: ezvps site shows domain and upstream" has_row "$OUT" '^  example\.com\.conf +example\.com +127\.0\.0\.1:3000 +ezvps$'
+check "list: second ezvps site" has_row "$OUT" '^  api\.example\.com\.conf +api\.example\.com +127\.0\.0\.1:8080 +ezvps$'
+check "list: other conf.d file shows its server_name, no upstream" has_row "$OUT" '^  legacy\.conf +old\.example\.org +- +not ezvps$'
+check "list: broken symlink is flagged" has_row "$OUT" 'dangling\.example\.com\.conf .*broken symlink'
+check "list: files that are not *.conf are ignored" not_contains "$OUT" "notes"
+check "list: *.conf.disabled is ignored" not_contains "$OUT" "hidden.example.com"
+check "list: sites-enabled/sites-available are not read for listing" not_contains "$OUT" "spare.example.com"
+check "list: Debian default site is not listed" not_contains "$(printf '%s\n' "$OUT" | grep -E '^  default')" "default"
+check "list: no migration prompt without legacy ezvps sites" not_contains "$OUT" "old layout"
+check "list: nginx.conf with the include is left alone" equals "$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")" "$SUM_CONF"
 check "list changes nothing" no_mutation
+check "list runs no config test" equals "$(nlog_count '^nginx -t$')" 0
 check "list: exit 0" equals "$RC" 0
+new_ngx ls_inc
+ngx_up
+mk_nginx_conf 0
+SUM_CONF="$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")"
+run_ezvps "$NGX_BOX_INST" "${N}4\n\n0\n\n0\n"
+check "list: missing conf.d include is reported" contains "$OUT" "does not include ${EZVPS_NGINX_DIR}/conf.d/*.conf"
+check "list: read-only even when the include is missing" equals "$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")" "$SUM_CONF"
+check "list: missing include, no backup" equals "$(bk_count 'nginx.conf.*')" 0
 
 echo "-- add site"
 new_ngx add
 ngx_up
 run_ezvps "$NGX_BOX_INST" "${N}5\nExample.COM\n127.0.0.1:3000\n\n0\n\n0\n"
-A="$(AV example.com)"
-E="$(EN example.com)"
-check "add: site file created in sites-available (domain lower-cased)" test -f "$A"
-check "add: enabled by a symlink in sites-enabled" test "$(readlink "$E")" = "$A"
-check "add: marker with the domain" file_has "$A" "# ezvps:domain=example.com"
-check "add: marker with the upstream" file_has "$A" "# ezvps:upstream=127.0.0.1:3000"
-check "add: server_name" file_has "$A" "    server_name example.com;"
-check "add: reverse proxy to the upstream" file_has "$A" "        proxy_pass http://127.0.0.1:3000;"
+F="$(CF example.com)"
+check "add: site file is conf.d/<domain>.conf (domain lower-cased)" test -f "$F"
+check "add: a plain file, not a symlink" test ! -L "$F"
+check "add: nothing created in sites-available" dir_empty_or_missing "$EZVPS_NGINX_DIR/sites-available"
+check "add: nothing created in sites-enabled" dir_empty_or_missing "$EZVPS_NGINX_DIR/sites-enabled"
+check "add: marker with the domain" file_has "$F" "# ezvps:domain=example.com"
+check "add: marker with the upstream" file_has "$F" "# ezvps:upstream=127.0.0.1:3000"
+check "add: server_name" file_has "$F" "    server_name example.com;"
+check "add: reverse proxy to the upstream" file_has "$F" "        proxy_pass http://127.0.0.1:3000;"
 # shellcheck disable=SC2016 # $host is a literal nginx variable
-check "add: forwards the Host header" file_has "$A" '        proxy_set_header Host $host;'
-check "add: HTTP only (listens on 80)" file_has "$A" "    listen 80;"
-check "add: IPv6 listener only when the kernel has IPv6 (not here)" file_lacks "$A" "[::]:80"
-check "add: no TLS directives in the file" file_lacks "$A" "ssl"
-check "add: no port 443 in the file" file_lacks "$A" "443"
+check "add: forwards the Host header" file_has "$F" '        proxy_set_header Host $host;'
+check "add: HTTP only (listens on 80)" file_has "$F" "    listen 80;"
+check "add: IPv6 listener only when the kernel has IPv6 (not here)" file_lacks "$F" "[::]:80"
+check "add: no TLS directives in the file" file_lacks "$F" "ssl"
+check "add: no port 443 in the file" file_lacks "$F" "443"
+check "add: only the one site file exists in conf.d" equals "$(find "$EZVPS_NGINX_DIR/conf.d" -mindepth 1 | wc -l)" 1
+check "add: no temp file left in conf.d" equals "$(find "$EZVPS_NGINX_DIR/conf.d" -name '.*' | wc -l)" 0
 check "add: config test ran" equals "$(nlog_count '^nginx -t$')" 1
 check "add: config test ran BEFORE the reload" runs_before '^nginx -t$' '^systemctl reload nginx$'
 check "add: nginx reloaded once" equals "$(nlog_count '^systemctl reload nginx$')" 1
@@ -1069,53 +1139,57 @@ check "add: no restart" equals "$(nlog_count '^systemctl restart')" 0
 check "add: tells the user to use Certificates for HTTPS" contains "$OUT" "use the Certificates module once it"
 check "add: says HTTP only" contains "$OUT" "HTTP only"
 check "add: warns that nothing listens on the upstream yet" contains "$OUT" "Nothing is listening on 127.0.0.1:3000"
-check "add: nothing existed, so no backup" equals "$(ngx_backups example.com)" 0
+check "add: nothing existed, so no site backup" equals "$(ngx_backups example.com)" 0
+check "add: nginx.conf already had the include: not touched, no backup" equals "$(bk_count 'nginx.conf.*')" 0
 check "add: exit 0" equals "$RC" 0
-SUM="$(file_sum "$A")"
+SUM="$(file_sum "$F")"
 
 echo "-- add site: no duplicates"
 run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
 check "add again: recognised as existing" contains "$OUT" "already exists with the same upstream"
-check "add again: file unchanged" equals "$(file_sum "$A")" "$SUM"
-check "add again: still a single site file" equals "$(find "$EZVPS_NGINX_DIR/sites-available" -type f | wc -l)" 1
-check "add again: still a single enabled entry" equals "$(find "$EZVPS_NGINX_DIR/sites-enabled" -mindepth 1 | wc -l)" 1
+check "add again: file unchanged" equals "$(file_sum "$F")" "$SUM"
+check "add again: still a single site file" equals "$(find "$EZVPS_NGINX_DIR/conf.d" -type f | wc -l)" 1
 check "add again: no second reload" equals "$(nlog_count '^systemctl reload nginx$')" 1
 check "add again: no backup" equals "$(ngx_backups example.com)" 0
 run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:4000\nn\n\n0\n\n0\n"
 check "different upstream: finds the existing site and asks before overwriting" contains "$OUT" "A site for example.com already exists"
 check "different upstream, declined: cancelled" contains "$OUT" "Cancelled. Nothing was changed."
-check "different upstream, declined: file unchanged" equals "$(file_sum "$A")" "$SUM"
+check "different upstream, declined: file unchanged" equals "$(file_sum "$F")" "$SUM"
 check "different upstream, declined: no backup" equals "$(ngx_backups example.com)" 0
 check "different upstream, declined: no reload" equals "$(nlog_count '^systemctl reload nginx$')" 1
 run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:4000\ny\n\n0\n\n0\n"
-check "overwrite confirmed: new upstream written" file_has "$A" "# ezvps:upstream=127.0.0.1:4000"
-check "overwrite confirmed: proxy_pass updated" file_has "$A" "        proxy_pass http://127.0.0.1:4000;"
+check "overwrite confirmed: new upstream written" file_has "$F" "# ezvps:upstream=127.0.0.1:4000"
+check "overwrite confirmed: proxy_pass updated" file_has "$F" "        proxy_pass http://127.0.0.1:4000;"
 check "overwrite confirmed: old file backed up first" equals "$(ngx_backups example.com)" 1
 check "overwrite confirmed: backup holds the OLD upstream" file_has "$(ngx_backup_file example.com)" "# ezvps:upstream=127.0.0.1:3000"
 check "overwrite confirmed: backup dir is mode 700" equals "$(stat -c %a "$EZVPS_BACKUP_DIR")" 700
 check "overwrite confirmed: reloaded after the test" equals "$(nlog_count '^systemctl reload nginx$')" 2
-check "overwrite confirmed: still a single site file and link" equals "$(find "$EZVPS_NGINX_DIR" -type f -o -type l | wc -l)" 2
+check "overwrite confirmed: still a single site file" equals "$(find "$EZVPS_NGINX_DIR/conf.d" -type f | wc -l)" 1
 
 echo "-- add site: IPv6 listener follows the kernel"
 new_ngx add_v6
 ngx_up
 : >"$SCN/if_inet6"
 EZVPS_IF_INET6_FILE="$SCN/if_inet6" run_ezvps "$NGX_BOX_INST" "${N}5\nv6.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
-check "add: IPv6 listener written when IPv6 exists" file_has "$(AV v6.example.com)" "    listen [::]:80;"
-check "add: IPv4 listener always written" file_has "$(AV v6.example.com)" "    listen 80;"
+check "add: IPv6 listener written when IPv6 exists" file_has "$(CF v6.example.com)" "    listen [::]:80;"
+check "add: IPv4 listener always written" file_has "$(CF v6.example.com)" "    listen 80;"
 
-echo "-- add site: input validation"
+echo "-- add site: domain sanitising and input validation"
 new_ngx add_bad
 ngx_up
-for bad in "not a domain" "exam ple.com" "localhost" "-bad.example.com" "a..example.com" "exa_mple.com" "../etc/passwd" "example.com/x"; do
+for bad in "not a domain" "exam ple.com" "localhost" "-bad.example.com" "a..example.com" "exa_mple.com" "x.example.com;rm" "exämple.com" "a*.example.com"; do
     run_ezvps "$NGX_BOX_INST" "${N}5\n${bad}\n127.0.0.1:3000\n\n0\n\n0\n"
     check "invalid domain '${bad}' is rejected" contains "$OUT" "is not a valid domain name"
+done
+for bad in "../etc/passwd" "example.com/x" "/etc/passwd" "a/b.example.com" "..%2f.example.com/"; do
+    run_ezvps "$NGX_BOX_INST" "${N}5\n${bad}\n127.0.0.1:3000\n\n0\n\n0\n"
+    check "domain with a path separator '${bad}' is rejected" contains "$OUT" "contains a path separator"
 done
 for bad in "127.0.0.1" "127.0.0.1:0" "127.0.0.1:99999" "192.0.2.256:80" "https://127.0.0.1:443" "host name:80" ":80" "127.0.0.1:80x"; do
     run_ezvps "$NGX_BOX_INST" "${N}5\nok.example.com\n${bad}\n\n0\n\n0\n"
     check "invalid upstream '${bad}' is rejected" equals "$([[ "$OUT" == *"Upstream must look like"* || "$OUT" == *"Not a valid"* || "$OUT" == *"Port must be"* || "$OUT" == *"plain http upstreams"* ]] && echo yes)" yes
 done
-check "invalid input created no files" equals "$(find "$EZVPS_NGINX_DIR" -type f -o -type l | wc -l)" 0
+check "invalid input created no *.conf file anywhere (only nginx.conf)" equals "$(find "$SCN" -name '*.conf' | wc -l)" 1
 check "invalid input reloaded nothing" no_mutation
 check "invalid input ran no config test" equals "$(nlog_count '^nginx -t$')" 0
 run_ezvps "$NGX_BOX_INST" "${N}5\n\n\n0\n\n0\n"
@@ -1123,30 +1197,36 @@ check "empty domain cancels" contains "$OUT" "Cancelled. Nothing was changed."
 new_ngx add_forms
 ngx_up
 run_ezvps "$NGX_BOX_INST" "${N}5\na.example.com\nhttp://localhost:8080/\n\n0\n\n0\n"
-check "upstream with http:// and trailing slash is normalised" file_has "$(AV a.example.com)" "# ezvps:upstream=localhost:8080"
+check "upstream with http:// and trailing slash is normalised" file_has "$(CF a.example.com)" "# ezvps:upstream=localhost:8080"
 run_ezvps "$NGX_BOX_INST" "${N}5\nb.example.com\n[::1]:3000\n\n0\n\n0\n"
-check "IPv6 upstream is accepted" file_has "$(AV b.example.com)" "# ezvps:upstream=[::1]:3000"
+check "IPv6 upstream is accepted" file_has "$(CF b.example.com)" "# ezvps:upstream=[::1]:3000"
 run_ezvps "$NGX_BOX_INST" "${N}5\nc.example.com\nbackend.internal:9000\n\n0\n\n0\n"
-check "hostname upstream is accepted" file_has "$(AV c.example.com)" "        proxy_pass http://backend.internal:9000;"
+check "hostname upstream is accepted" file_has "$(CF c.example.com)" "        proxy_pass http://backend.internal:9000;"
 run_ezvps "$NGX_BOX_INST" "${N}5\nxn--bcher-kva.example\n192.0.2.5:0080\n\n0\n\n0\n"
-check "punycode domain and leading-zero port are accepted and normalised" file_has "$(AV xn--bcher-kva.example)" "# ezvps:upstream=192.0.2.5:80"
+check "punycode domain and leading-zero port are accepted and normalised" file_has "$(CF xn--bcher-kva.example)" "# ezvps:upstream=192.0.2.5:80"
 
 echo "-- add site: conflicts, foreign files, failing config test"
 new_ngx add_conf
 ngx_up
 mk_foreign_site legacy taken.example.com
 run_ezvps "$NGX_BOX_INST" "${N}5\ntaken.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
-check "domain served by another enabled file is refused" contains "$OUT" "already served by another enabled site file: legacy"
-check "conflict: no new site file" test ! -e "$(AV taken.example.com)"
+check "domain served by another conf.d file is refused" contains "$OUT" "already served by another nginx site file: conf.d/legacy.conf"
+check "conflict: no new site file" test ! -e "$(CF taken.example.com)"
 check "conflict: nothing reloaded" no_mutation
+new_ngx add_conf2
+ngx_up
+mk_legacy_foreign handmade taken.example.com 1
+run_ezvps "$NGX_BOX_INST" "${N}5\ntaken.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "domain served by a legacy sites-enabled file is refused too" contains "$OUT" "already served by another nginx site file: sites-enabled/handmade"
+check "legacy conflict: no new site file" test ! -e "$(CF taken.example.com)"
 new_ngx add_foreign
 ngx_up
 mk_foreign_site hand.example.com hand.example.com
-cp "$(AV hand.example.com)" "$SCN/hand-original"
+cp "$(CF hand.example.com)" "$SCN/hand-original"
 run_ezvps "$NGX_BOX_INST" "${N}5\nhand.example.com\n127.0.0.1:3000\ny\n\n0\n\n0\n"
 check "existing hand-written file for the domain: asks first" contains "$OUT" "NOT created by ezvps"
 check "existing hand-written file: backed up before overwrite" cmp -s "$SCN/hand-original" "$(ngx_backup_file hand.example.com)"
-check "existing hand-written file: replaced by the ezvps site" file_has "$(AV hand.example.com)" "# ezvps:domain=hand.example.com"
+check "existing hand-written file: replaced by the ezvps site" file_has "$(CF hand.example.com)" "# ezvps:domain=hand.example.com"
 new_ngx add_rb
 ngx_up
 FAKE_NGX_FAIL_DOMAIN="bad.example.com"
@@ -1154,18 +1234,18 @@ run_ezvps "$NGX_BOX_INST" "${N}5\nbad.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
 check "failing config test is reported" contains "$OUT" "config test FAILED after adding bad.example.com"
 check "failing config test: nginx is NOT reloaded" equals "$(nlog_count '^systemctl reload')" 0
 check "failing config test: no restart either" equals "$(nlog_count '^systemctl restart')" 0
-check "failing config test: new site file rolled back" test ! -e "$(AV bad.example.com)"
-check "failing config test: new symlink rolled back" test ! -L "$(EN bad.example.com)"
+check "failing config test: new file removed again" test ! -e "$(CF bad.example.com)"
+check "failing config test: conf.d is empty again" dir_empty_or_missing "$EZVPS_NGINX_DIR/conf.d"
 check "failing config test: says it rolled back" contains "$OUT" "Rolled back"
+check "failing config test: the test did run" equals "$(nlog_count '^nginx -t$')" 1
 check "failing config test: menu survives" equals "$RC" 0
 new_ngx add_rb2
 ngx_up
 mk_ezvps_site bad.example.com 127.0.0.1:3000
-SUM="$(file_sum "$(AV bad.example.com)")"
+SUM="$(file_sum "$(CF bad.example.com)")"
 FAKE_NGX_FAIL_DOMAIN="bad.example.com"
 run_ezvps "$NGX_BOX_INST" "${N}5\nbad.example.com\n127.0.0.1:4000\ny\n\n0\n\n0\n"
-check "failed overwrite: previous file restored byte for byte" equals "$(file_sum "$(AV bad.example.com)")" "$SUM"
-check "failed overwrite: previous symlink restored" test "$(readlink "$(EN bad.example.com)")" = "$(AV bad.example.com)"
+check "failed overwrite: previous file restored byte for byte" equals "$(file_sum "$(CF bad.example.com)")" "$SUM"
 check "failed overwrite: not reloaded" equals "$(nlog_count '^systemctl reload')" 0
 check "failed overwrite: backup was taken first" equals "$(ngx_backups bad.example.com)" 1
 new_ngx add_none
@@ -1174,46 +1254,140 @@ check "add: nginx not installed" contains "$OUT" "Nginx is not installed."
 new_ngx add_stopped
 ngx_down
 run_ezvps "$NGX_BOX_INST" "${N}5\nidle.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
-check "add while nginx is stopped: site is written" test -f "$(AV idle.example.com)"
+check "add while nginx is stopped: site is written" test -f "$(CF idle.example.com)"
 check "add while nginx is stopped: nothing is reloaded or started" no_mutation
 check "add while nginx is stopped: user is told" contains "$OUT" "nginx is not running, so nothing was reloaded"
+
+echo "-- add site: nginx.conf must include conf.d"
+new_ngx inc
+ngx_up
+mk_nginx_conf 0
+cp "$EZVPS_NGINX_DIR/nginx.conf" "$SCN/nginx-conf-original"
+run_ezvps "$NGX_BOX_INST" "${N}5\ninc.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "missing include: reported" contains "$OUT" "does not include ${EZVPS_NGINX_DIR}/conf.d/*.conf"
+check "missing include: nginx.conf backed up first, byte for byte" cmp -s "$SCN/nginx-conf-original" "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -type f -name 'nginx.conf.*' | head -n1)"
+check "missing include: exactly one nginx.conf backup" equals "$(bk_count 'nginx.conf.*')" 1
+check "missing include: include added" has_include "$EZVPS_NGINX_DIR/nginx.conf"
+check "missing include: added inside the http block, once" include_in_http "$EZVPS_NGINX_DIR/nginx.conf"
+check "missing include: the commented-out include was not mistaken for a real one" equals "$(grep -c 'conf.d/\*.conf;' "$EZVPS_NGINX_DIR/nginx.conf")" 2
+check "missing include: the rest of nginx.conf is unchanged" equals "$(grep -vc 'conf.d' "$EZVPS_NGINX_DIR/nginx.conf")" "$(grep -vc 'conf.d' "$SCN/nginx-conf-original")"
+check "missing include: config test ran for it and for the site" equals "$(nlog_count '^nginx -t$')" 2
+check "missing include: site written after the include" test -f "$(CF inc.example.com)"
+check "missing include: reloaded once, after the tests" equals "$(nlog_count '^systemctl reload nginx$')" 1
+check "missing include: reload came after both tests" runs_before '^nginx -t$' '^systemctl reload nginx$'
+check "missing include: exit 0" equals "$RC" 0
+run_ezvps "$NGX_BOX_INST" "${N}5\ninc2.example.com\n127.0.0.1:3001\n\n0\n\n0\n"
+check "include already present: not added a second time" include_in_http "$EZVPS_NGINX_DIR/nginx.conf"
+check "include already present: no further nginx.conf backup" equals "$(bk_count 'nginx.conf.*')" 1
+new_ngx inc_nodir
+ngx_up
+rm -rf "$EZVPS_NGINX_DIR/conf.d"
+mk_nginx_conf 0
+run_ezvps "$NGX_BOX_INST" "${N}5\nd.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "missing conf.d directory and include: both fixed, site added" test -f "$(CF d.example.com)"
+new_ngx inc_fail
+ngx_up
+mk_nginx_conf 0
+cp "$EZVPS_NGINX_DIR/nginx.conf" "$SCN/nginx-conf-original"
+FAKE_NGX_TEST_FAIL=1
+run_ezvps "$NGX_BOX_INST" "${N}5\ninc.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "include fix with a failing config test: reported" contains "$OUT" "config test FAILED after adding the conf.d include"
+check "include fix with a failing config test: nginx.conf restored byte for byte" cmp -s "$SCN/nginx-conf-original" "$EZVPS_NGINX_DIR/nginx.conf"
+check "include fix with a failing config test: nginx NOT reloaded" no_mutation
+check "include fix with a failing config test: no site written" test ! -e "$(CF inc.example.com)"
+check "include fix with a failing config test: backup kept" equals "$(bk_count 'nginx.conf.*')" 1
+check "include fix with a failing config test: menu survives" equals "$RC" 0
+new_ngx inc_nohttp
+ngx_up
+printf '%s\n' "events {" "}" >"$EZVPS_NGINX_DIR/nginx.conf"
+run_ezvps "$NGX_BOX_INST" "${N}5\nh.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "nginx.conf without an http block: explained, nothing guessed" contains "$OUT" "Found no http block"
+check "nginx.conf without an http block: no site written" test ! -e "$(CF h.example.com)"
+check "nginx.conf without an http block: nothing reloaded" no_mutation
+new_ngx inc_noconf
+ngx_up
+rm -f "$EZVPS_NGINX_DIR/nginx.conf"
+run_ezvps "$NGX_BOX_INST" "${N}5\nh.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "missing nginx.conf: reported, no site written" contains "$OUT" "nginx.conf not found"
+
+echo "-- add site: Debian default site"
+new_ngx def
+ngx_up
+mk_legacy_foreign default _ 1 "listen 80 default_server;"
+mk_legacy_foreign other.example.com other.example.com 1
+run_ezvps "$NGX_BOX_INST" "${N}5\ndef.example.com\n127.0.0.1:3000\nn\n\n0\n\n0\n"
+check "default site: conflict is warned about" contains "$OUT" "may conflict with def.example.com: it is the default_server for port 80"
+check "default site: declined, symlink stays" test -L "$(EN default)"
+check "default site: declined, no backup" equals "$(bk_count 'nginx-default-site.*')" 0
+check "default site: declined, the site is still added" test -f "$(CF def.example.com)"
+new_ngx def2
+ngx_up
+mk_legacy_foreign default _ 1 "listen 80 default_server;"
+mk_legacy_foreign other.example.com other.example.com 1
+DEF_TARGET="$(readlink "$(EN default)")"
+run_ezvps "$NGX_BOX_INST" "${N}5\ndef.example.com\n127.0.0.1:3000\ny\n\n0\n\n0\n"
+check "default site: confirmed, only its symlink is removed" test ! -e "$(EN default)" -a ! -L "$(EN default)"
+check "default site: its sites-available file stays" test -f "$(AV default)"
+check "default site: backup of the symlink taken (points at the same target)" equals "$(readlink "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'nginx-default-site.*' | head -n1)")" "$DEF_TARGET"
+check "default site: other files in sites-enabled are untouched" test -L "$(EN other.example.com)"
+check "default site: the site is added" test -f "$(CF def.example.com)"
+check "default site: one config test, then one reload" equals "$(nlog_count '^nginx -t$')" 1
+check "default site: reloaded after the test" runs_before '^nginx -t$' '^systemctl reload nginx$'
+new_ngx def3
+ngx_up
+mk_legacy_foreign default _ 1 "listen 80 default_server;"
+DEF_TARGET="$(readlink "$(EN default)")"
+FAKE_NGX_FAIL_DOMAIN="def.example.com"
+run_ezvps "$NGX_BOX_INST" "${N}5\ndef.example.com\n127.0.0.1:3000\ny\n\n0\n\n0\n"
+check "default site, failing test: not reloaded" equals "$(nlog_count '^systemctl reload')" 0
+check "default site, failing test: symlink restored" equals "$(readlink "$(EN default)")" "$DEF_TARGET"
+check "default site, failing test: new site removed" test ! -e "$(CF def.example.com)"
+new_ngx def4
+ngx_up
+mk_legacy_foreign default _ 1 "listen 8080;"
+run_ezvps "$NGX_BOX_INST" "${N}5\nquiet.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "default site that does not conflict: no question" not_contains "$OUT" "default site"
+new_ngx def5
+ngx_up
+mk_legacy_foreign default quiet.example.com 1
+run_ezvps "$NGX_BOX_INST" "${N}5\nquiet.example.com\n127.0.0.1:3000\nn\n\n0\n\n0\n"
+check "default site listing the domain itself is a conflict" contains "$OUT" "it also serves quiet.example.com"
 
 echo "-- remove site"
 new_ngx rm
 ngx_up
 mk_ezvps_site gone.example.com 127.0.0.1:3000
 mk_ezvps_site keep.example.com 127.0.0.1:3001
-cp "$(AV gone.example.com)" "$SCN/gone-original"
+mk_legacy_foreign default _ 1 "listen 80 default_server;"
+cp "$(CF gone.example.com)" "$SCN/gone-original"
 run_ezvps "$NGX_BOX_INST" "${N}6\nnothere.example.com\n\n0\n\n0\n"
-check "remove: unknown site" contains "$OUT" "No site named nothere.example.com"
+check "remove: unknown site" contains "$OUT" "No site named nothere.example.com in ${EZVPS_NGINX_DIR}/conf.d"
 check "remove: unknown site changes nothing" no_mutation
 run_ezvps "$NGX_BOX_INST" "${N}6\ngone.example.com\nn\n\n0\n\n0\n"
 check "remove: shows the site and asks for confirmation" contains "$OUT" "Site gone.example.com:"
 check "remove: declining is reported" contains "$OUT" "Cancelled. Nothing was changed."
-check "remove: declined, site file kept" test -f "$(AV gone.example.com)"
-check "remove: declined, symlink kept" test -L "$(EN gone.example.com)"
+check "remove: declined, site file kept" test -f "$(CF gone.example.com)"
 check "remove: declined, no backup" equals "$(ngx_backups gone.example.com)" 0
 check "remove: declined, nothing reloaded" no_mutation
 run_ezvps "$NGX_BOX_INST" "${N}6\nGONE.example.com\ny\n\n0\n\n0\n"
-check "remove: site file removed" test ! -e "$(AV gone.example.com)"
-check "remove: symlink removed" test ! -L "$(EN gone.example.com)"
+check "remove: site file deleted" test ! -e "$(CF gone.example.com)"
 check "remove: backup kept and identical to the original" cmp -s "$SCN/gone-original" "$(ngx_backup_file gone.example.com)"
 check "remove: exactly one backup" equals "$(ngx_backups gone.example.com)" 1
 check "remove: config test ran after the removal" equals "$(nlog_count '^nginx -t$')" 1
 check "remove: test before reload" runs_before '^nginx -t$' '^systemctl reload nginx$'
 check "remove: reloaded once" equals "$(nlog_count '^systemctl reload nginx$')" 1
-check "remove: other sites untouched" test -L "$(EN keep.example.com)"
-check "remove: says so" contains "$OUT" "disabled and removed"
+check "remove: other sites untouched" test -f "$(CF keep.example.com)"
+check "remove: files in sites-enabled are never deleted" test -L "$(EN default)"
+check "remove: says so" contains "$OUT" "removed. Config test passes."
 new_ngx rm_fail
 ngx_up
 mk_ezvps_site gone.example.com 127.0.0.1:3000
-SUM="$(file_sum "$(AV gone.example.com)")"
+SUM="$(file_sum "$(CF gone.example.com)")"
 FAKE_NGX_TEST_FAIL=1
 run_ezvps "$NGX_BOX_INST" "${N}6\ngone.example.com\ny\n\n0\n\n0\n"
 check "remove, failing config test: reported" contains "$OUT" "config test FAILED after removing gone.example.com"
 check "remove, failing config test: NOT reloaded" equals "$(nlog_count '^systemctl reload')" 0
-check "remove, failing config test: site restored" equals "$(file_sum "$(AV gone.example.com)")" "$SUM"
-check "remove, failing config test: symlink restored" test "$(readlink "$(EN gone.example.com)")" = "$(AV gone.example.com)"
+check "remove, failing config test: site restored byte for byte" equals "$(file_sum "$(CF gone.example.com)")" "$SUM"
 check "remove, failing config test: backup still exists" equals "$(ngx_backups gone.example.com)" 1
 check "remove, failing config test: menu survives" equals "$RC" 0
 new_ngx rm_foreign
@@ -1224,10 +1398,118 @@ check "remove: warns when the site was not created by ezvps" contains "$OUT" "NO
 new_ngx rm_bad
 ngx_up
 run_ezvps "$NGX_BOX_INST" "${N}6\n../etc/passwd\n\n0\n\n0\n"
+check "remove: path traversal rejected" contains "$OUT" "contains a path separator"
+run_ezvps "$NGX_BOX_INST" "${N}6\nbad_name.com\n\n0\n\n0\n"
 check "remove: invalid domain rejected" contains "$OUT" "is not a valid domain name"
 new_ngx rm_none
 run_ezvps "$NGX_BOX" "${N}6\n\n0\n\n0\n"
 check "remove: nginx not installed" contains "$OUT" "Nginx is not installed."
+
+echo "-- migration from sites-available"
+# new_mig: two enabled ezvps sites, one disabled ezvps site, one hand-written enabled site
+new_mig() {
+    new_ngx "$1"
+    ngx_up
+    mk_legacy_site a.example.com 127.0.0.1:3000 1
+    mk_legacy_site b.example.com 127.0.0.1:3001 1
+    mk_legacy_site c.example.com 127.0.0.1:3002 0
+    mk_legacy_foreign hand.example.com hand.example.com 1
+    cp "$(AV a.example.com)" "$SCN/a-original"
+    cp "$(AV b.example.com)" "$SCN/b-original"
+}
+new_mig mig
+run_ezvps "$NGX_BOX_INST" "${N}4\ny\n\n0\n\n0\n"
+check "migration: the legacy sites are offered" contains "$OUT" "${EZVPS_NGINX_DIR}/sites-available/a.example.com  ->  ${EZVPS_NGINX_DIR}/conf.d/a.example.com.conf"
+check "migration: explains what moving does before asking" contains "$OUT" "Moving backs the files up, copies them to conf.d"
+check "migration: a.example.com is in conf.d, identical" cmp -s "$SCN/a-original" "$(CF a.example.com)"
+check "migration: b.example.com is in conf.d, identical" cmp -s "$SCN/b-original" "$(CF b.example.com)"
+check "migration: sites-available file removed" test ! -e "$(AV a.example.com)" -a ! -e "$(AV b.example.com)"
+check "migration: sites-enabled symlink removed" test ! -L "$(EN a.example.com)" -a ! -L "$(EN b.example.com)"
+check "migration: backup of the sites-available file, identical" cmp -s "$SCN/a-original" "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -type f -name 'nginx-legacy-a.example.com.[0-9]*' | head -n1)"
+check "migration: backup of the sites-enabled symlink" test -L "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'nginx-legacy-a.example.com.enabled.*' | head -n1)"
+check "migration: the files were backed up before they were removed" equals "$(bk_count 'nginx-legacy-*')" 4
+check "migration: config test BEFORE the legacy files are removed (they were still there)" has_line "$(log)" "nginx-t-state enabled=3 confd=2"
+check "migration: config test again AFTER the removal" has_line "$(log)" "nginx-t-state enabled=1 confd=2"
+check "migration: test with both in place came first" runs_before '^nginx-t-state enabled=3 ' '^nginx-t-state enabled=1 '
+check "migration: reload only after the final test" runs_before '^nginx-t-state enabled=1 ' '^systemctl reload nginx$'
+check "migration: exactly one reload" equals "$(nlog_count '^systemctl reload nginx$')" 1
+check "migration: a disabled legacy site is left alone" test -f "$(AV c.example.com)"
+check "migration: ...and not switched on in conf.d" test ! -e "$(CF c.example.com)"
+check "migration: hand-written sites are not touched" test -L "$(EN hand.example.com)" -a -f "$(AV hand.example.com)"
+check "migration: the site that stayed is warned about" contains "$OUT" "c.example.com (not enabled"
+check "migration: list now shows the moved sites" has_row "$OUT" '^  a\.example\.com\.conf +a\.example\.com +127\.0\.0\.1:3000 +ezvps$'
+check "migration: exit 0" equals "$RC" 0
+run_ezvps "$NGX_BOX_INST" "${N}4\n\n0\n\n0\n"
+check "migration: re-run has nothing to move and asks nothing" not_contains "$OUT" "ezvps sites from the old layout were found"
+check "migration: re-run changes nothing (still one reload)" equals "$(nlog_count '^systemctl reload nginx$')" 1
+check "migration: re-run makes no new backups" equals "$(bk_count 'nginx-legacy-*')" 4
+
+new_mig mig_no
+SUMS="$(file_sum "$(AV a.example.com)") $(file_sum "$(AV b.example.com)")"
+run_ezvps "$NGX_BOX_INST" "${N}4\nn\n\n0\n\n0\n"
+check "migration declined: told that files were left alone" contains "$OUT" "Migration declined. Those files were left alone."
+check "migration declined: warned about the legacy layout" contains "$OUT" "still in the legacy layout"
+check "migration declined: the legacy sites are named" contains "$OUT" "b.example.com"
+check "migration declined: files unchanged" equals "$(file_sum "$(AV a.example.com)") $(file_sum "$(AV b.example.com)")" "$SUMS"
+check "migration declined: symlinks unchanged" test -L "$(EN a.example.com)" -a -L "$(EN b.example.com)"
+check "migration declined: nothing in conf.d" dir_empty_or_missing "$EZVPS_NGINX_DIR/conf.d"
+check "migration declined: no backup, no test, no reload" equals "$(bk_count '*')$(nlog_count '^nginx -t$')$(nlog_count '^systemctl')" 000
+run_ezvps "$NGX_BOX_INST" "${N}6\nn\na.example.com\n\n0\n\n0\n"
+check "migration declined: Remove site does not touch the legacy site" contains "$OUT" "No site named a.example.com in ${EZVPS_NGINX_DIR}/conf.d"
+run_ezvps "$NGX_BOX_INST" "${N}5\nn\na.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "migration declined: Add site will not duplicate a legacy site" contains "$OUT" "already served by another nginx site file: sites-enabled/a.example.com"
+check "migration declined: Add site wrote nothing" dir_empty_or_missing "$EZVPS_NGINX_DIR/conf.d"
+
+new_mig mig_t1
+FAKE_NGX_TEST_FAIL=1
+run_ezvps "$NGX_BOX_INST" "${N}4\ny\n\n0\n\n0\n"
+check "migration, failing test after the copy: reported" contains "$OUT" "nothing was removed and nginx was NOT reloaded"
+check "migration, failing test after the copy: legacy files untouched" cmp -s "$SCN/a-original" "$(AV a.example.com)"
+check "migration, failing test after the copy: symlinks untouched" test "$(readlink "$(EN a.example.com)")" = "$(AV a.example.com)"
+check "migration, failing test after the copy: copies removed from conf.d" dir_empty_or_missing "$EZVPS_NGINX_DIR/conf.d"
+check "migration, failing test after the copy: not reloaded" equals "$(nlog_count '^systemctl reload')" 0
+check "migration, failing test after the copy: menu survives" equals "$RC" 0
+new_mig mig_t2
+FAKE_NGX_FAIL_NTH=2
+run_ezvps "$NGX_BOX_INST" "${N}4\ny\n\n0\n\n0\n"
+check "migration, failing final test: reported" contains "$OUT" "FAILED after removing the legacy files"
+check "migration, failing final test: legacy files restored byte for byte" cmp -s "$SCN/b-original" "$(AV b.example.com)"
+check "migration, failing final test: legacy symlinks restored" test "$(readlink "$(EN b.example.com)")" = "$(AV b.example.com)"
+check "migration, failing final test: copies removed from conf.d" dir_empty_or_missing "$EZVPS_NGINX_DIR/conf.d"
+check "migration, failing final test: not reloaded" equals "$(nlog_count '^systemctl reload')" 0
+
+new_mig mig_inc
+mk_nginx_conf 0
+run_ezvps "$NGX_BOX_INST" "${N}4\ny\n\n0\n\n0\n"
+check "migration with a missing include: nginx.conf fixed first (backup taken)" equals "$(bk_count 'nginx.conf.*')" 1
+check "migration with a missing include: include is inside the http block" include_in_http "$EZVPS_NGINX_DIR/nginx.conf"
+check "migration with a missing include: sites moved" test -f "$(CF a.example.com)" -a ! -e "$(AV a.example.com)"
+check "migration with a missing include: include test, copy test, final test" equals "$(nlog_count '^nginx -t$')" 3
+new_mig mig_inc_fail
+mk_nginx_conf 0
+FAKE_NGX_TEST_FAIL=1
+run_ezvps "$NGX_BOX_INST" "${N}4\ny\n\n0\n\n0\n"
+check "migration, include cannot be added: nothing moved" contains "$OUT" "Nothing was moved"
+check "migration, include cannot be added: legacy files untouched" cmp -s "$SCN/a-original" "$(AV a.example.com)"
+check "migration, include cannot be added: nothing in conf.d" dir_empty_or_missing "$EZVPS_NGINX_DIR/conf.d"
+
+new_mig mig_exists
+mk_foreign_site a.example.com a.example.com
+run_ezvps "$NGX_BOX_INST" "${N}4\ny\n\n0\n\n0\n"
+check "migration: an existing conf.d file is never overwritten" contains "$OUT" "a.example.com (conf.d/a.example.com.conf already exists)"
+check "migration: the other site is still offered and moved" test -f "$(CF b.example.com)" -a ! -e "$(AV b.example.com)"
+check "migration: the site with the conflict stays in the legacy layout" test -f "$(AV a.example.com)"
+
+new_mig mig_add
+run_ezvps "$NGX_BOX_INST" "${N}5\ny\nnew.example.com\n127.0.0.1:3005\n\n0\n\n0\n"
+check "migration then add: legacy sites moved" test -f "$(CF a.example.com)" -a ! -e "$(AV a.example.com)"
+check "migration then add: new site added in conf.d" file_has "$(CF new.example.com)" "# ezvps:upstream=127.0.0.1:3005"
+check "migration then add: one reload per change" equals "$(nlog_count '^systemctl reload nginx$')" 2
+new_mig mig_rm
+run_ezvps "$NGX_BOX_INST" "${N}6\ny\na.example.com\ny\n\n0\n\n0\n"
+check "migration then remove: the moved site can be removed" test ! -e "$(CF a.example.com)"
+check "migration then remove: ...with a backup" equals "$(ngx_backups a.example.com)" 1
+check "migration then remove: the other moved site stays" test -f "$(CF b.example.com)"
 
 echo "-- Nginx stays HTTP only"
 no_tls_code() { ! grep -vE '^[[:space:]]*#' "$1" | grep -qiE 'ssl_certificate|certbot|acme\.sh|letsencrypt|listen 443|443 ssl'; }

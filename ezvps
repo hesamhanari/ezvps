@@ -918,10 +918,13 @@ module_3x_ui() {
 # ---------------------------------------------------------------------------
 # Nginx module (PR 3)
 #
-# Installs nginx from apt and manages HTTP reverse-proxy sites in the Debian
-# layout (sites-available + symlink in sites-enabled). HTTP ONLY: certificates
-# and HTTPS belong to the separate Certificates module (later PR); nothing
-# here issues, stores or references a certificate.
+# Installs nginx from apt and manages HTTP reverse-proxy sites, one file per
+# domain: /etc/nginx/conf.d/<domain>.conf. ezvps does not create or manage
+# anything in sites-available/sites-enabled; those directories are only read to
+# migrate sites an older ezvps put there (marked "# Managed by ezvps") and to
+# offer disabling Debian's default site. HTTP ONLY: certificates and HTTPS
+# belong to the separate Certificates module (later PR); nothing here issues,
+# stores or references a certificate.
 #
 # Rule used everywhere: `nginx -t` must pass before nginx is reloaded or
 # restarted. A change whose test fails is rolled back and nginx is left alone.
@@ -929,6 +932,9 @@ module_3x_ui() {
 
 NGX_SERVICE_NAME="nginx"
 NGX_DIR="${EZVPS_NGINX_DIR:-/etc/nginx}"
+NGX_CONFD="${NGX_DIR}/conf.d"
+NGX_CONF="${NGX_DIR}/nginx.conf"
+# Legacy layout: read only for the migration and the Debian default site.
 NGX_AVAIL="${NGX_DIR}/sites-available"
 NGX_ENABLED="${NGX_DIR}/sites-enabled"
 NGX_HTTP_PORT="${EZVPS_NGINX_HTTP_PORT:-80}"
@@ -1306,23 +1312,88 @@ ngx_render_site() { # ngx_render_site <domain> <upstream>
     return 0
 }
 
-# Another enabled file (not named <domain>) that already serves <domain>.
+# Another site file (not <domain>.conf itself) that already serves <domain>:
+# any other conf.d/*.conf, or a file in the legacy sites-enabled (the Debian
+# `default` site is handled separately). Prints "conf.d/<file>" or
+# "sites-enabled/<file>". Read-only.
 ngx_find_conflict() {
-    local f line tok
-    for f in "$NGX_ENABLED"/*; do
-        [[ -e "$f" && "${f##*/}" != "$1" ]] || continue
+    local f line tok code hit=0
+    for f in "$NGX_CONFD"/*.conf "$NGX_ENABLED"/*; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "${NGX_CONFD}/${1}.conf" ]] && continue
+        [[ "$f" == "${NGX_ENABLED}/default" ]] && continue
         while IFS= read -r line; do
-            if [[ "$line" =~ $NGX_SERVER_NAME_RE ]]; then
+            code="${line%%#*}"
+            if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
                 for tok in ${BASH_REMATCH[1]}; do
-                    if [[ "$tok" == "$1" ]]; then
-                        printf '%s' "${f##*/}"
-                        return 0
-                    fi
+                    [[ "$tok" == "$1" ]] && hit=1
                 done
             fi
+            ((hit == 1)) && break
         done <"$f"
+        if ((hit == 1)); then
+            if [[ "$f" == "${NGX_CONFD}/"* ]]; then
+                printf 'conf.d/%s' "${f##*/}"
+            else
+                printf 'sites-enabled/%s' "${f##*/}"
+            fi
+            return 0
+        fi
     done
     return 1
+}
+
+# Debian's default site (sites-enabled/default) conflicts with a new site when
+# it is the default_server for port 80 or lists the domain itself. Sets
+# NGX_DEFAULT_REASON. Read-only.
+NGX_DEFAULT_REASON=""
+NGX_LISTEN80_DEFAULT_RE='^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9.]+:)?80[[:space:]]+[^;]*default_server'
+ngx_default_site_conflicts() {
+    local f="${NGX_ENABLED}/default" line tok code
+    NGX_DEFAULT_REASON=""
+    [[ -f "$f" ]] || return 1
+    while IFS= read -r line; do
+        code="${line%%#*}"
+        if [[ "$code" =~ $NGX_LISTEN80_DEFAULT_RE ]]; then
+            NGX_DEFAULT_REASON="it is the default_server for port 80"
+            return 0
+        fi
+        if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
+            for tok in ${BASH_REMATCH[1]}; do
+                if [[ "$tok" == "$1" ]]; then
+                    NGX_DEFAULT_REASON="it also serves ${1}"
+                    return 0
+                fi
+            done
+        fi
+    done <"$f"
+    return 1
+}
+
+# ngx_clean_domain <text>: trim + lower-case, then accept only a plain hostname
+# that is safe to use as a file name (letters, digits, dot, hyphen; no path
+# separators). Sets REPLY_DOMAIN; prints why on rejection.
+ngx_clean_domain() {
+    local LC_ALL=C d="$1" shown
+    REPLY_DOMAIN=""
+    d="${d#"${d%%[![:space:]]*}"}"
+    d="${d%"${d##*[![:space:]]}"}"
+    d="${d,,}"
+    shown="${d//[[:cntrl:]]/}"
+    if [[ "$d" == */* || "$d" == *\\* ]]; then
+        err "'${shown}' is not a valid domain name: it contains a path separator. Nothing was changed."
+        return 1
+    fi
+    if [[ ! "$d" =~ ^[a-z0-9.-]+$ ]]; then
+        err "'${shown}' is not a valid domain name: only letters, digits, dot and hyphen are allowed. Nothing was changed."
+        return 1
+    fi
+    if ! ngx_valid_domain "$d"; then
+        err "'${shown}' is not a valid domain name (use something like example.com). Nothing was changed."
+        return 1
+    fi
+    REPLY_DOMAIN="$d"
+    return 0
 }
 
 ngx_ask_domain() { # sets REPLY_DOMAIN
@@ -1332,43 +1403,256 @@ ngx_ask_domain() { # sets REPLY_DOMAIN
         info ""
         return 1
     }
-    d="${d#"${d%%[![:space:]]*}"}"
-    d="${d%"${d##*[![:space:]]}"}"
-    d="${d,,}"
-    if [[ -z "$d" ]]; then
+    if [[ -z "${d//[[:space:]]/}" ]]; then
         info "Cancelled. Nothing was changed."
         return 1
     fi
-    if ! ngx_valid_domain "$d"; then
-        err "'${d}' is not a valid domain name (use something like example.com). Nothing was changed."
-        return 1
-    fi
-    REPLY_DOMAIN="$d"
+    ngx_clean_domain "$d"
+}
+
+# --- nginx.conf must include conf.d -----------------------------------------------------
+
+NGX_HAS_HTTP=0 NGX_HAS_INCLUDE=0 NGX_INSERTED=0
+NGX_INCLUDE_RE='^[[:space:]]*include[[:space:]]+[^;]*conf\.d/[^;]*\*[^;]*;'
+NGX_HTTP_OPEN_RE='^[[:space:]]*http[[:space:]]*\{'
+
+# ngx_scan_conf <file> [<out>]: a small brace-depth scan (comments ignored).
+# Sets NGX_HAS_HTTP and NGX_HAS_INCLUDE (an `include .../conf.d/*...;` directly
+# inside the http block). With <out>, writes a copy of <file> that has the
+# include added just before the closing brace of the http block
+# (NGX_INSERTED=1 when that worked).
+ngx_scan_conf() {
+    local line code trimmed depth=0 http_in=0 pre o c
+    NGX_HAS_HTTP=0 NGX_HAS_INCLUDE=0 NGX_INSERTED=0
+    [[ -n "${2:-}" ]] && : >"$2"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        code="${line%%#*}"
+        trimmed="${code#"${code%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        pre=$depth
+        if ((http_in == 0 && depth == 0)) && [[ "$code" =~ $NGX_HTTP_OPEN_RE ]]; then
+            NGX_HAS_HTTP=1
+            http_in=$((depth + 1))
+        fi
+        if ((http_in > 0 && pre == http_in)); then
+            if [[ "$code" =~ $NGX_INCLUDE_RE ]]; then
+                NGX_HAS_INCLUDE=1
+            elif [[ "$trimmed" == "}" && -n "${2:-}" && $NGX_INSERTED -eq 0 ]]; then
+                printf '%s\n' "    # added by ezvps: per-domain sites live in conf.d" \
+                    "    include ${NGX_CONFD}/*.conf;" >>"$2"
+                NGX_INSERTED=1
+            fi
+        fi
+        [[ -n "${2:-}" ]] && printf '%s\n' "$line" >>"$2"
+        o="${code//[^\{]/}"
+        c="${code//[^\}]/}"
+        depth=$((depth + ${#o} - ${#c}))
+        ((depth < http_in)) && http_in=0
+    done <"$1"
     return 0
 }
 
-ngx_layout_ok() {
-    if [[ ! -d "$NGX_AVAIL" || ! -d "$NGX_ENABLED" ]]; then
-        err "Expected the Debian layout (${NGX_AVAIL} and ${NGX_ENABLED}) but it is missing."
+ngx_has_confd_include() {
+    [[ -r "$NGX_CONF" ]] || return 1
+    ngx_scan_conf "$NGX_CONF"
+    ((NGX_HAS_INCLUDE == 1))
+}
+
+# Make sure conf.d exists and nginx.conf includes it. A missing include is
+# added inside the http block after a backup of nginx.conf, then `nginx -t`
+# must pass; otherwise nginx.conf is restored. Non-zero = not safe to go on.
+ngx_ensure_confd_include() {
+    local bk tmp
+    if [[ ! -f "$NGX_CONF" ]]; then
+        err "${NGX_CONF} not found; cannot check that it includes ${NGX_CONFD}."
         return 1
     fi
+    if ! mkdir -p "$NGX_CONFD"; then
+        err "Could not create ${NGX_CONFD}."
+        return 1
+    fi
+    ngx_has_confd_include && return 0
+    info ""
+    warn "${NGX_CONF} does not include ${NGX_CONFD}/*.conf, so sites there would not be loaded."
+    info "ezvps will back up nginx.conf and add 'include ${NGX_CONFD}/*.conf;' inside its http block."
+    backup_file "$NGX_CONF" "nginx.conf" || return 1
+    bk="$BACKUP_FILE_PATH"
+    tmp="${NGX_DIR}/.nginx.conf.ezvps-tmp.$$"
+    ngx_scan_conf "$NGX_CONF" "$tmp"
+    if ((NGX_INSERTED == 0)); then
+        rm -f "$tmp"
+        if ((NGX_HAS_HTTP == 0)); then
+            err "Found no http block in ${NGX_CONF}. Add this line inside http { } yourself:"
+        else
+            err "Could not find the end of the http block in ${NGX_CONF}. Add this line inside http { } yourself:"
+        fi
+        err "    include ${NGX_CONFD}/*.conf;"
+        return 1
+    fi
+    if ! cp "$tmp" "$NGX_CONF"; then
+        rm -f "$tmp"
+        cp -a "$bk" "$NGX_CONF" 2>/dev/null
+        err "Could not write ${NGX_CONF}; the original was kept (backup: ${bk})."
+        return 1
+    fi
+    rm -f "$tmp"
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED after adding the conf.d include; nginx was NOT reloaded."
+        ngx_print_test_output
+        if cp -a "$bk" "$NGX_CONF"; then
+            info "Rolled back: ${NGX_CONF} was restored from ${bk}."
+        else
+            err "ROLLBACK PROBLEM: restore ${NGX_CONF} from ${bk} by hand."
+        fi
+        return 1
+    fi
+    info "Added the conf.d include to ${NGX_CONF}. Config test passes."
     return 0
 }
 
-# ngx_rollback_site <domain> <avail_backup|""> <enabled_kind none|link|file> <link_target> <enabled_backup|"">
-ngx_rollback_site() {
-    local a="${NGX_AVAIL}/${1}" e="${NGX_ENABLED}/${1}" ok=0
-    rm -f "$a" "$e" || ok=1
-    [[ -n "$2" ]] && { cp -a "$2" "$a" || ok=1; }
-    case "$3" in
-        link) ln -s "$4" "$e" || ok=1 ;;
-        file) cp -a "$5" "$e" || ok=1 ;;
-    esac
+# --- legacy layout (sites-available + sites-enabled) --------------------------------------
+# ezvps no longer creates or manages sites there. Only the migration below
+# reads those directories, and only for files carrying the ezvps marker.
+
+NGX_LEG_NAMES=() NGX_LEG_DOMAINS=() NGX_LEG_STAY=()
+NGX_MIG_BK_A=() NGX_MIG_BK_E=() NGX_MIG_COPIED=()
+
+# Fills NGX_LEG_NAMES/NGX_LEG_DOMAINS (movable) and NGX_LEG_STAY (legacy
+# ezvps sites that cannot be moved safely, with the reason).
+ngx_legacy_scan() {
+    local f name d
+    NGX_LEG_NAMES=() NGX_LEG_DOMAINS=() NGX_LEG_STAY=()
+    [[ -d "$NGX_AVAIL" ]] || return 0
+    for f in "$NGX_AVAIL"/*; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        name="${f##*/}"
+        ngx_read_site "$f" || continue
+        ((NGX_SITE_MANAGED == 1)) || continue
+        d="$NGX_SITE_DOMAIN"
+        name="${name//[[:cntrl:]]/}"
+        if ! ngx_valid_domain "$d"; then
+            NGX_LEG_STAY+=("${name} (its ezvps:domain marker is not a valid domain)")
+        elif [[ ! -L "${NGX_ENABLED}/${name}" || "$(readlink "${NGX_ENABLED}/${name}")" != "$f" ]]; then
+            NGX_LEG_STAY+=("${name} (not enabled by a symlink to this file; moving it would switch it on)")
+        elif [[ -e "${NGX_CONFD}/${d}.conf" || -L "${NGX_CONFD}/${d}.conf" ]]; then
+            NGX_LEG_STAY+=("${name} (conf.d/${d}.conf already exists)")
+        else
+            NGX_LEG_NAMES+=("$name")
+            NGX_LEG_DOMAINS+=("$d")
+        fi
+    done
+    return 0
+}
+
+# Put everything the migration touched back as it was.
+ngx_migrate_rollback() {
+    local i a e ok=0
+    for i in "${!NGX_LEG_NAMES[@]}"; do
+        a="${NGX_AVAIL}/${NGX_LEG_NAMES[$i]}"
+        e="${NGX_ENABLED}/${NGX_LEG_NAMES[$i]}"
+        if [[ -n "${NGX_MIG_COPIED[$i]:-}" ]]; then
+            rm -f "${NGX_CONFD}/${NGX_LEG_DOMAINS[$i]}.conf" || ok=1
+        fi
+        if [[ -n "${NGX_MIG_BK_A[$i]:-}" && ! -e "$a" ]]; then
+            cp -a "${NGX_MIG_BK_A[$i]}" "$a" || ok=1
+        fi
+        if [[ -n "${NGX_MIG_BK_E[$i]:-}" && ! -e "$e" && ! -L "$e" ]]; then
+            cp -a "${NGX_MIG_BK_E[$i]}" "$e" || ok=1
+        fi
+    done
     if ((ok != 0)); then
-        err "ROLLBACK PROBLEM: could not fully restore ${1}. Backups: ${2:-none} ${5:-}"
+        err "ROLLBACK PROBLEM: the legacy files could not all be restored; see the backups in ${NGX_BACKUP_BASE}."
         return 1
     fi
-    info "Rolled back: the previous state of ${1} was restored."
+    info "Rolled back: the legacy files are as they were."
+    return 0
+}
+
+# Copy to conf.d, test, and only then remove the legacy symlink and file.
+ngx_migrate_run() {
+    local i name dom a e
+    require_cmds cp mkdir rm date chmod readlink || return 1
+    NGX_MIG_BK_A=() NGX_MIG_BK_E=() NGX_MIG_COPIED=()
+    if ! ngx_ensure_confd_include; then
+        err "Migration not done: nginx.conf must load conf.d first. Nothing was moved."
+        return 1
+    fi
+    for i in "${!NGX_LEG_NAMES[@]}"; do
+        name="${NGX_LEG_NAMES[$i]}"
+        dom="${NGX_LEG_DOMAINS[$i]}"
+        backup_file "${NGX_AVAIL}/${name}" "nginx-legacy-${dom}" || return 1
+        NGX_MIG_BK_A[i]="$BACKUP_FILE_PATH"
+        backup_file "${NGX_ENABLED}/${name}" "nginx-legacy-${dom}.enabled" || return 1
+        NGX_MIG_BK_E[i]="$BACKUP_FILE_PATH"
+    done
+    for i in "${!NGX_LEG_NAMES[@]}"; do
+        if ! cp -a "${NGX_AVAIL}/${NGX_LEG_NAMES[$i]}" "${NGX_CONFD}/${NGX_LEG_DOMAINS[$i]}.conf"; then
+            err "Could not copy ${NGX_LEG_NAMES[$i]} to ${NGX_CONFD}."
+            ngx_migrate_rollback
+            return 1
+        fi
+        NGX_MIG_COPIED[i]=1
+    done
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED with the copies in conf.d; nothing was removed and nginx was NOT reloaded."
+        ngx_print_test_output
+        ngx_migrate_rollback
+        return 1
+    fi
+    info "Copied to ${NGX_CONFD}. Config test passes; removing the legacy symlinks and files..."
+    for i in "${!NGX_LEG_NAMES[@]}"; do
+        a="${NGX_AVAIL}/${NGX_LEG_NAMES[$i]}"
+        e="${NGX_ENABLED}/${NGX_LEG_NAMES[$i]}"
+        if ! rm -f "$e" "$a"; then
+            err "Could not remove the legacy files of ${NGX_LEG_NAMES[$i]}."
+            ngx_migrate_rollback
+            return 1
+        fi
+    done
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED after removing the legacy files; nginx was NOT reloaded."
+        ngx_print_test_output
+        ngx_migrate_rollback
+        return 1
+    fi
+    info "Moved ${#NGX_LEG_NAMES[@]} site(s) to ${NGX_CONFD}. Config test passes."
+    ngx_reload
+    return 0
+}
+
+# Offer to move legacy ezvps sites to conf.d; warn about whatever is left.
+ngx_offer_migration() {
+    local i n
+    ngx_legacy_scan
+    ((${#NGX_LEG_NAMES[@]} + ${#NGX_LEG_STAY[@]} > 0)) || return 0
+    if ((${#NGX_LEG_NAMES[@]} > 0)); then
+        info ""
+        info "ezvps sites from the old layout were found in ${NGX_AVAIL}."
+        info "ezvps now keeps its sites in ${NGX_CONFD}, one <domain>.conf per domain."
+        for i in "${!NGX_LEG_NAMES[@]}"; do
+            info "  ${NGX_AVAIL}/${NGX_LEG_NAMES[$i]}  ->  ${NGX_CONFD}/${NGX_LEG_DOMAINS[$i]}.conf"
+        done
+        info "Moving backs the files up, copies them to conf.d, runs the config test, and only"
+        info "after it passes removes the sites-enabled symlink and the sites-available file."
+        if ask_yes_no "Move these site(s) to ${NGX_CONFD} now?"; then
+            ngx_migrate_run || true
+        else
+            info "Migration declined. Those files were left alone."
+        fi
+    fi
+    ngx_legacy_scan
+    n=$((${#NGX_LEG_NAMES[@]} + ${#NGX_LEG_STAY[@]}))
+    if ((n > 0)); then
+        warn ""
+        warn "${n} ezvps site(s) are still in the legacy layout (sites-available / sites-enabled); ezvps no longer manages them:"
+        for i in "${!NGX_LEG_NAMES[@]}"; do
+            warn "  ${NGX_LEG_NAMES[$i]}"
+        done
+        for i in "${!NGX_LEG_STAY[@]}"; do
+            warn "  ${NGX_LEG_STAY[$i]}"
+        done
+        warn "They keep working and were not changed. Open List sites, Add site or Remove site again to be offered the move."
+    fi
     return 0
 }
 
@@ -1379,48 +1663,63 @@ ngx_list_sites() {
         info "Nginx is not installed. Choose 'Install Nginx' first."
         return 0
     }
-    ngx_layout_ok || return 0
-    local f name shown=0 disabled=()
+    ngx_offer_migration || true
+    local f name shown=0 dom
     info ""
-    info "Enabled sites (${NGX_ENABLED}):"
-    for f in "$NGX_ENABLED"/*; do
+    info "Sites (${NGX_CONFD}/*.conf):"
+    for f in "$NGX_CONFD"/*.conf; do
         [[ -e "$f" || -L "$f" ]] || continue
         name="${f##*/}"
+        name="${name//[[:cntrl:]]/}"
         if ((shown == 0)); then
-            printf '  %-28s %-28s %-24s %s\n' "NAME" "DOMAIN" "UPSTREAM" "CREATED BY"
+            printf '  %-32s %-28s %-24s %s\n' "NAME" "DOMAIN" "UPSTREAM" "CREATED BY"
             shown=1
         fi
-        if [[ ! -e "$f" ]]; then
-            printf '  %-28s %-28s %-24s %s\n' "${name//[[:cntrl:]]/}" "-" "-" "(broken symlink)"
+        if [[ ! -f "$f" ]]; then
+            printf '  %-32s %-28s %-24s %s\n' "$name" "-" "-" "(broken symlink or not a file)"
             continue
         fi
         ngx_read_site "$f" || true
+        dom="${NGX_SITE_DOMAIN:--}"
         if ((NGX_SITE_MANAGED == 1)); then
-            printf '  %-28s %-28s %-24s %s\n' "${name//[[:cntrl:]]/}" "${NGX_SITE_DOMAIN:--}" "${NGX_SITE_UPSTREAM:--}" "ezvps"
+            printf '  %-32s %-28s %-24s %s\n' "$name" "$dom" "${NGX_SITE_UPSTREAM:--}" "ezvps"
         else
-            printf '  %-28s %-28s %-24s %s\n' "${name//[[:cntrl:]]/}" "${NGX_SITE_DOMAIN:--}" "-" "not ezvps"
+            printf '  %-32s %-28s %-24s %s\n' "$name" "$dom" "-" "not ezvps"
         fi
     done
     ((shown == 0)) && info "  (none)"
-    for f in "$NGX_AVAIL"/*; do
-        [[ -e "$f" ]] || continue
-        name="${f##*/}"
-        [[ -e "${NGX_ENABLED}/${name}" ]] || disabled+=("${name//[[:cntrl:]]/}")
-    done
-    if ((${#disabled[@]} > 0)); then
-        info ""
-        info "Available but not enabled: ${disabled[*]}"
+    if [[ -f "$NGX_CONF" ]] && ! ngx_has_confd_include; then
+        warn ""
+        warn "${NGX_CONF} does not include ${NGX_CONFD}/*.conf: sites listed here are not loaded."
+        warn "Add site fixes that (with a backup and a config test)."
     fi
     return 0
 }
 
 # --- add ---------------------------------------------------------------------------
 
+# ngx_rollback_site <file> <backup|""> <default_backup|"">
+ngx_rollback_site() {
+    local ok=0
+    rm -f "$1" || ok=1
+    [[ -n "$2" ]] && { cp -a "$2" "$1" || ok=1; }
+    if [[ -n "$3" ]]; then
+        rm -f "${NGX_ENABLED}/default"
+        cp -a "$3" "${NGX_ENABLED}/default" || ok=1
+    fi
+    if ((ok != 0)); then
+        err "ROLLBACK PROBLEM: could not fully restore ${1}. Backups: ${2:-none} ${3:-}"
+        return 1
+    fi
+    info "Rolled back: the previous state was restored."
+    return 0
+}
+
 ngx_add_site() {
     ngx_need_nginx || return 0
-    require_cmds cp mkdir mv rm date chmod ln readlink systemctl || return 0
-    ngx_layout_ok || return 0
-    local domain upstream_raw a e conflict tmp
+    require_cmds cp mkdir mv rm date chmod systemctl || return 0
+    ngx_offer_migration || true
+    local domain upstream_raw f conflict tmp up old_bk="" default_bk=""
     ngx_ask_domain || return 0
     domain="$REPLY_DOMAIN"
     read -r -p "Upstream address with port (for example 127.0.0.1:3000): " upstream_raw || {
@@ -1431,80 +1730,82 @@ ngx_add_site() {
         info "Nothing was changed."
         return 0
     }
-    local up="$NGX_UP"
-    a="${NGX_AVAIL}/${domain}"
-    e="${NGX_ENABLED}/${domain}"
+    up="$NGX_UP"
+    f="${NGX_CONFD}/${domain}.conf"
 
     if conflict="$(ngx_find_conflict "$domain")"; then
-        err "${domain} is already served by another enabled site file: ${conflict}."
+        err "${domain} is already served by another nginx site file: ${conflict}."
         err "Remove or edit that site first so the domain is not defined twice. Nothing was changed."
         return 0
     fi
 
-    local old_avail_bk="" old_kind=none old_target="" old_enabled_bk=""
-    if [[ -e "$a" || -L "$a" || -e "$e" || -L "$e" ]]; then
-        if [[ -f "$a" ]]; then
-            ngx_read_site "$a" || true
-        else
-            NGX_SITE_MANAGED=0 NGX_SITE_UPSTREAM=""
+    if [[ -e "$f" || -L "$f" ]]; then
+        if [[ ! -f "$f" ]]; then
+            err "${f} exists but is not a regular file. Nothing was changed."
+            return 0
         fi
-        if ((NGX_SITE_MANAGED == 1)) && [[ "$NGX_SITE_DOMAIN" == "$domain" && "$NGX_SITE_UPSTREAM" == "$up" ]] &&
-            [[ -L "$e" && "$(readlink "$e")" == "$a" ]]; then
+        ngx_read_site "$f" || true
+        if ((NGX_SITE_MANAGED == 1)) && [[ "$NGX_SITE_DOMAIN" == "$domain" && "$NGX_SITE_UPSTREAM" == "$up" ]]; then
             info ""
-            info "${domain} already exists with the same upstream (${up}) and is enabled. Nothing to do."
+            info "${domain} already exists with the same upstream (${up}). Nothing to do."
             return 0
         fi
         info ""
         info "A site for ${domain} already exists:"
-        if [[ -f "$a" ]]; then
-            if ((NGX_SITE_MANAGED == 1)); then
-                info "  ${a}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
-            else
-                info "  ${a}  (NOT created by ezvps)"
-            fi
-        fi
-        if [[ -e "$e" || -L "$e" ]]; then
-            info "  ${e}"
+        if ((NGX_SITE_MANAGED == 1)); then
+            info "  ${f}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
         else
-            info "  (not enabled)"
+            info "  ${f}  (NOT created by ezvps)"
         fi
         ask_yes_no "Overwrite it with a reverse proxy to ${up}? The old file is backed up first." || {
             info "Cancelled. Nothing was changed."
             return 0
         }
-        if [[ -e "$a" || -L "$a" ]]; then
-            backup_file "$a" "nginx-site-${domain}" || return 0
-            old_avail_bk="$BACKUP_FILE_PATH"
-        fi
-        if [[ -L "$e" ]]; then
-            old_kind='link'
-            old_target="$(readlink "$e")"
-        elif [[ -f "$e" ]]; then
-            backup_file "$e" "nginx-site-${domain}.enabled" || return 0
-            old_enabled_bk="$BACKUP_FILE_PATH"
-            old_kind='file'
+        backup_file "$f" "nginx-site-${domain}" || return 0
+        old_bk="$BACKUP_FILE_PATH"
+    fi
+
+    # Debian's default site: offer to disable it (remove its symlink only).
+    if ngx_default_site_conflicts "$domain"; then
+        warn ""
+        warn "The Debian default site (${NGX_ENABLED}/default) may conflict with ${domain}: ${NGX_DEFAULT_REASON}."
+        if [[ -L "${NGX_ENABLED}/default" ]]; then
+            if ask_yes_no "Disable the default site? Only its symlink is removed (the file in sites-available stays); a backup is kept."; then
+                backup_file "${NGX_ENABLED}/default" "nginx-default-site" || return 0
+                default_bk="$BACKUP_FILE_PATH"
+            else
+                info "Leaving the default site enabled."
+            fi
+        else
+            warn "It is a regular file, not a symlink, so ezvps will not touch it."
         fi
     fi
 
-    tmp="${NGX_AVAIL}/.${domain}.ezvps-tmp.$$"
-    if ! { ngx_render_site "$domain" "$up" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$a"; }; then
+    ngx_ensure_confd_include || {
+        info "The site was not added."
+        return 0
+    }
+
+    tmp="${NGX_CONFD}/.${domain}.ezvps-tmp.$$"
+    if ! { ngx_render_site "$domain" "$up" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$f"; }; then
         rm -f "$tmp"
-        err "Could not write ${a}. Nothing was changed."
+        err "Could not write ${f}. Nothing was changed."
         return 0
     fi
-    if ! { rm -f "$e" && ln -s "$a" "$e"; }; then
-        err "Could not enable the site (${e})."
-        ngx_rollback_site "$domain" "$old_avail_bk" "$old_kind" "$old_target" "$old_enabled_bk"
+    if [[ -n "$default_bk" ]] && ! rm -f "${NGX_ENABLED}/default"; then
+        err "Could not remove the default site symlink."
+        ngx_rollback_site "$f" "$old_bk" "$default_bk"
         return 0
     fi
 
     if ! ngx_config_test; then
         err "The nginx config test FAILED after adding ${domain}; nginx was NOT reloaded."
         ngx_print_test_output
-        ngx_rollback_site "$domain" "$old_avail_bk" "$old_kind" "$old_target" "$old_enabled_bk"
+        ngx_rollback_site "$f" "$old_bk" "$default_bk"
         return 0
     fi
-    info "Site ${domain} -> ${up} written to ${a} and enabled. Config test passes."
+    info "Site ${domain} -> ${up} written to ${f}. Config test passes."
+    [[ -n "$default_bk" ]] && info "The Debian default site was disabled (backup: ${default_bk})."
     ngx_reload
     if [[ "$up" == 127.0.0.1:* || "$up" == localhost:* ]] && ! port_in_use "${up##*:}"; then
         warn "Nothing is listening on ${up} right now; visitors get a 502 until the backend is up."
@@ -1520,58 +1821,46 @@ ngx_add_site() {
 
 ngx_remove_site() {
     ngx_need_nginx || return 0
-    require_cmds cp mkdir rm date chmod ln readlink systemctl || return 0
-    ngx_layout_ok || return 0
-    local domain a e avail_bk="" kind=none target="" enabled_bk=""
+    require_cmds cp mkdir rm date chmod systemctl || return 0
+    ngx_offer_migration || true
+    local domain f bk=""
     ngx_ask_domain || return 0
     domain="$REPLY_DOMAIN"
-    a="${NGX_AVAIL}/${domain}"
-    e="${NGX_ENABLED}/${domain}"
-    if [[ ! -e "$a" && ! -L "$a" && ! -e "$e" && ! -L "$e" ]]; then
-        info "No site named ${domain} in sites-available or sites-enabled. Nothing was changed."
+    f="${NGX_CONFD}/${domain}.conf"
+    if [[ ! -e "$f" && ! -L "$f" ]]; then
+        info "No site named ${domain} in ${NGX_CONFD}. Nothing was changed."
+        return 0
+    fi
+    if [[ ! -f "$f" ]]; then
+        err "${f} is not a regular file; ezvps will not remove it. Nothing was changed."
         return 0
     fi
     info ""
     info "Site ${domain}:"
-    if [[ -f "$a" ]]; then
-        ngx_read_site "$a" || true
-        if ((NGX_SITE_MANAGED == 1)); then
-            info "  ${a}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
-        else
-            warn "  ${a}  (NOT created by ezvps - it was written by hand or another tool)"
-        fi
+    ngx_read_site "$f" || true
+    if ((NGX_SITE_MANAGED == 1)); then
+        info "  ${f}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
+    else
+        warn "  ${f}  (NOT created by ezvps - it was written by hand or another tool)"
     fi
-    if [[ -e "$e" || -L "$e" ]]; then
-        info "  ${e}  (enabled)"
-    fi
-    ask_yes_no "Disable and remove ${domain}? A backup of the file is kept." || {
+    ask_yes_no "Remove ${domain}? A backup of the file is kept." || {
         info "Cancelled. Nothing was changed."
         return 0
     }
-    if [[ -e "$a" || -L "$a" ]]; then
-        backup_file "$a" "nginx-site-${domain}" || return 0
-        avail_bk="$BACKUP_FILE_PATH"
-    fi
-    if [[ -L "$e" ]]; then
-        kind='link'
-        target="$(readlink "$e")"
-    elif [[ -f "$e" ]]; then
-        backup_file "$e" "nginx-site-${domain}.enabled" || return 0
-        enabled_bk="$BACKUP_FILE_PATH"
-        kind='file'
-    fi
-    if ! rm -f "$e" "$a"; then
-        err "Could not remove the site files."
-        ngx_rollback_site "$domain" "$avail_bk" "$kind" "$target" "$enabled_bk"
+    backup_file "$f" "nginx-site-${domain}" || return 0
+    bk="$BACKUP_FILE_PATH"
+    if ! rm -f "$f"; then
+        err "Could not remove ${f}."
+        ngx_rollback_site "$f" "$bk" ""
         return 0
     fi
     if ! ngx_config_test; then
         err "The nginx config test FAILED after removing ${domain}; nginx was NOT reloaded."
         ngx_print_test_output
-        ngx_rollback_site "$domain" "$avail_bk" "$kind" "$target" "$enabled_bk"
+        ngx_rollback_site "$f" "$bk" ""
         return 0
     fi
-    info "Site ${domain} disabled and removed. Config test passes."
+    info "Site ${domain} removed. Config test passes."
     ngx_reload
     return 0
 }

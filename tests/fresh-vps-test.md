@@ -200,20 +200,27 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 - [ ] `3) Restart`: prints `Config test passes. Restarting nginx...` and
       `Verified`; `systemctl status nginx` shows a fresh start time
 - [ ] break the config on purpose (`echo 'BROKEN_DIRECTIVE on;' >>
-      /etc/nginx/sites-available/default`), then: `2) Status` shows `Config
+      /etc/nginx/conf.d/zz.conf`), then: `2) Status` shows `Config
       test: FAILS` with nginx's error; `3) Restart` says `nginx was NOT
       restarted or reloaded` and the nginx process id / start time is
       unchanged (`systemctl show -p MainPID,ActiveEnterTimestamp nginx`)
-- [ ] remove the broken line again; `3) Restart` works
+- [ ] remove the broken line again (delete `conf.d/zz.conf`); `3) Restart` works
 
-**6d. Add site**
+**6d. Add site** (sites live in `/etc/nginx/conf.d/<domain>.conf`)
 
 - [ ] start the backend: `python3 -m http.server 3000 --bind 127.0.0.1 &`
+- [ ] `grep -n 'conf.d' /etc/nginx/nginx.conf` shows the stock
+      `include /etc/nginx/conf.d/*.conf;` inside `http { }`
 - [ ] `5) Add site` with `Example.COM` and `127.0.0.1:3000`:
-      `/etc/nginx/sites-available/example.com` exists with the `# Managed by
-      ezvps` header and `# ezvps:domain=` / `# ezvps:upstream=` lines;
-      `/etc/nginx/sites-enabled/example.com` is a symlink to it; output says
-      `Config test passes.` and `nginx reloaded.`; no `ssl` or `443` anywhere in the file
+      `/etc/nginx/conf.d/example.com.conf` exists with the `# Managed by
+      ezvps` header and `# ezvps:domain=` / `# ezvps:upstream=` lines; nothing
+      new in `sites-available` or `sites-enabled`; output says `Config test
+      passes.` and `nginx reloaded.`; no `ssl` or `443` anywhere in the file.
+      If the Debian default site is enabled, ezvps first warns that it may
+      conflict (default_server for port 80) and asks: answer `y` once, check
+      only `/etc/nginx/sites-enabled/default` (the symlink) is gone, that
+      `/etc/nginx/sites-available/default` still exists and that
+      `/var/backups/ezvps/nginx-default-site.*` exists
 - [ ] `curl -s -H 'Host: example.com' http://127.0.0.1/` returns the backend's
       directory listing (reverse proxy works); with the backend stopped it returns 502
 - [ ] the message says the site is HTTP only and to use the Certificates
@@ -224,32 +231,58 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       overwriting; `n` changes nothing; `y` backs up the old file to
       `/var/backups/ezvps/nginx-site-example.com.<timestamp>.<pid>` (contains
       the old upstream) and updates the site
-- [ ] invalid input is rejected without changes: domain `localhost`, `bad_name.com`,
-      `a b.com`; upstream `127.0.0.1` (no port), `127.0.0.1:99999`, `https://127.0.0.1:443`
-- [ ] domain already served by a hand-made enabled file (create
-      `/etc/nginx/sites-available/legacy` with `server_name taken.example.com;`
-      and enable it): adding `taken.example.com` is refused
+- [ ] invalid input is rejected without changes: domains `localhost`,
+      `bad_name.com`, `a b.com`, `../etc/passwd`, `a/b.example.com` (the last
+      two say `contains a path separator`; no `*.conf` appears outside
+      `conf.d`); upstreams `127.0.0.1` (no port), `127.0.0.1:99999`, `https://127.0.0.1:443`
+- [ ] domain already served by a hand-made file (create
+      `/etc/nginx/conf.d/legacy.conf` with `server_name taken.example.com;`):
+      adding `taken.example.com` is refused
 - [ ] failing test is rolled back: add a hand-made file with
       `BROKEN_DIRECTIVE on;` to `/etc/nginx/conf.d/zz.conf`, then `Add site`
       `new.example.com`: `config test FAILED`, `Rolled back`, no
-      `sites-available/new.example.com`, nginx not reloaded; remove `zz.conf`
+      `conf.d/new.example.com.conf`, nginx not reloaded (journal shows no
+      reload); remove `zz.conf`
+- [ ] missing include: comment out the `include /etc/nginx/conf.d/*.conf;`
+      line in `/etc/nginx/nginx.conf`, then `Add site` `inc.example.com`:
+      ezvps reports the missing include, backs up `nginx.conf` to
+      `/var/backups/ezvps/nginx.conf.<timestamp>.<pid>`, adds the line inside
+      the `http` block (once), `nginx -t` passes and the site works
 - [ ] `systemctl stop nginx`, `Add site` `idle.example.com`: file written,
       `nginx is not running, so nothing was reloaded`; `systemctl start nginx`
 
 **6e. List and Remove**
 
-- [ ] `4) List sites`: table with `example.com  example.com  127.0.0.1:4000
-      ezvps`, `default ... not ezvps`, `legacy taken.example.com ... not ezvps`;
-      `Available but not enabled:` lists any disabled site files
+- [ ] `4) List sites`: table of `conf.d/*.conf` with `example.com.conf
+      example.com 127.0.0.1:4000 ezvps` and `legacy.conf taken.example.com ...
+      not ezvps`; `sites-enabled` entries (such as `default`) are not listed
 - [ ] `6) Remove site` with an unknown domain: `No site named ...`, nothing changed
-- [ ] `6) Remove site` `example.com`, answer `n`: files remain, no backup
+- [ ] `6) Remove site` `example.com`, answer `n`: file remains, no backup
 - [ ] `6) Remove site` `example.com`, answer `y`: backup
       `nginx-site-example.com.<timestamp>.<pid>` exists and matches the old
-      file, both the file and symlink are gone, `Config test passes.`,
-      `nginx reloaded.`, other sites untouched
-- [ ] `6) Remove site` on the hand-made `legacy`-style domain warns `NOT
-      created by ezvps` before asking
-- [ ] clean up: remove `legacy`, `idle.example.com` and the other test sites, stop the backend
+      file, the file is gone, `Config test passes.`, `nginx reloaded.`, other
+      sites untouched, and nothing in `sites-enabled` was deleted
+- [ ] `6) Remove site` on the hand-made `legacy` domain warns `NOT created by
+      ezvps` before asking
+- [ ] clean up: remove `legacy.conf`, `idle.example.com` and the other test
+      sites, stop the backend
+
+**6f. Migration from the legacy layout**
+
+- [ ] create a legacy ezvps site by hand:
+      `printf '%s\n' '# Managed by ezvps (Nginx module). fixture' '# ezvps:domain=old.example.com' '# ezvps:upstream=127.0.0.1:3000' 'server {' '    listen 80;' '    server_name old.example.com;' '    location / { proxy_pass http://127.0.0.1:3000; }' '}' > /etc/nginx/sites-available/old.example.com`
+      and `ln -s /etc/nginx/sites-available/old.example.com /etc/nginx/sites-enabled/old.example.com`;
+      also a hand-written enabled site `hand.example.com` and a disabled ezvps-style one
+- [ ] `4) List sites`, answer `n`: files unchanged, warning that the site is
+      still in the legacy layout; no backup, no reload
+- [ ] `4) List sites` again, answer `y`: backups
+      `nginx-legacy-old.example.com.*` (file) and `...enabled.*` (symlink) in
+      `/var/backups/ezvps`, `conf.d/old.example.com.conf` identical to the
+      original, the `sites-enabled` symlink and the `sites-available` file are
+      gone, `nginx -t` passes, nginx reloaded; the hand-written site and the
+      disabled one are untouched (the disabled one is named in the warning)
+- [ ] the migrated site now appears in the table and works with `curl -H 'Host: old.example.com' http://127.0.0.1/`
+- [ ] clean up: remove the test sites and backups
 
 ## 7. Non-root
 

@@ -114,16 +114,22 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
 * **Status** shows whether the service runs and whether `nginx -t` passes.
   **Restart** runs the config test first and never restarts or reloads a
   broken config.
-* **List sites** shows the enabled sites of the Debian
-  `sites-available`/`sites-enabled` layout with their domain and, for sites
-  created by ezvps, the upstream.
-* **Add site** asks for a domain and an upstream `host:port`, writes a
-  reverse-proxy file to `sites-available`, enables it with a symlink, and
-  reloads nginx only if `nginx -t` passes (otherwise the change is rolled
-  back). It never duplicates a site and asks before overwriting; the old file
-  is backed up to `/var/backups/ezvps/` first. **Remove site** asks for
-  confirmation, backs the file up, removes it and reloads only after a passing
-  test.
+* **List sites** shows the `*.conf` files in `/etc/nginx/conf.d` with their
+  domain and, for sites created by ezvps, the upstream.
+* **Add site** asks for a domain and an upstream `host:port` and writes
+  `/etc/nginx/conf.d/<domain>.conf` (one file per domain; the domain is
+  sanitised, only letters, digits, dot and hyphen are accepted). It reloads
+  nginx only if `nginx -t` passes (otherwise the change is rolled back), never
+  duplicates a site and asks before overwriting; the old file is backed up to
+  `/var/backups/ezvps/` first. It also checks that `nginx.conf` includes
+  `conf.d` (adding the include after a backup and a config test if not) and,
+  if Debian's default site conflicts, asks before disabling it (its symlink
+  only, with a backup). **Remove site** asks for confirmation, backs the file
+  up, deletes it and reloads only after a passing test.
+* Sites made by an older ezvps in `sites-available`/`sites-enabled` are
+  offered a **migration** to `conf.d` (backup, copy, config test, then the old
+  files are removed). Declining leaves them alone with a warning that they
+  are in the legacy layout.
 
 Sites are **HTTP only** for now. For HTTPS use the Certificates module once it
 exists (a later release); the Nginx module does not touch certificates.
