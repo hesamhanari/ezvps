@@ -166,7 +166,7 @@ check "'ezvps l2tp' without ezl2tp exits 0" equals "$RC" 0
 
 echo "== not-yet-implemented modules"
 for i in "${!KEYS[@]}"; do
-    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" ]] && continue
+    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" || "${KEYS[$i]}" == "backpack" || "${KEYS[$i]}" == "ctunnel" || "${KEYS[$i]}" == "lazyports" ]] && continue
     n=$((i + 1))
     label="${LABELS[$i]}"
     run_ezvps "$STUB_BIN" "${n}\n\n0\n"
@@ -3179,6 +3179,691 @@ echo "-- Nginx stays HTTP only"
 no_dns_validation_code() { ! grep -vE '^[[:space:]]*#' "$1" | grep -qiE -- '--dns|dns_[a-z]+|CF_Token|api_?key|--accountemail|certbot'; }
 check "ezvps contains no DNS-validation, DNS-credential or certbot code" no_dns_validation_code "$EZVPS"
 
+echo "== Backpack, ctunnel and Lazyports lifecycle modules (fake binaries/installers/git/make, no network)"
+
+# Pins as declared in ezvps.
+LC_BP_TAG="$(grep -oE '^LC_BACKPACK_TAG="[^"]+"' "$EZVPS" | cut -d'"' -f2)"
+LC_BP_SHA="$(grep -oE '^LC_BACKPACK_SHA256="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
+LC_CT_COMMIT="$(grep -oE '^LC_CTUNNEL_COMMIT="[0-9a-f]{40}"' "$EZVPS" | cut -d'"' -f2)"
+LC_LZ_COMMIT="$(grep -oE '^LC_LAZYPORTS_COMMIT="[0-9a-f]{40}"' "$EZVPS" | cut -d'"' -f2)"
+LC_LZ_SHA="$(grep -oE '^LC_LAZYPORTS_SHA256="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
+check "Backpack pin is declared (tag vX.Y.Z, sha256)" matches "$LC_BP_TAG-${#LC_BP_SHA}" '^v[0-9]+\.[0-9]+\.[0-9]+-64$'
+check "ctunnel pin is a full 40-hex commit" test "${#LC_CT_COMMIT}" -eq 40
+check "Lazyports pin is a full 40-hex commit and a sha256" test "${#LC_LZ_COMMIT}-${#LC_LZ_SHA}" = "40-64"
+LC_BP_URL="https://raw.githubusercontent.com/AminMGMT/BackPack/${LC_BP_TAG}/install.sh"
+LC_LZ_URL="https://raw.githubusercontent.com/v9mirza/lazyports/${LC_LZ_COMMIT}/install.sh"
+LC_CT_GIT="https://github.com/alienrobotarmy/ctunnel.git"
+
+LC_SAVED_HOME="$HOME"
+LC_SAVED_BACKUP="${EZVPS_BACKUP_DIR-}"
+LCW="$WORK/lc"
+LC_STUBS="$LCW/stubs"
+mkdir -p "$LC_STUBS"
+
+# fake `uname` (architecture comes from FAKE_ARCH)
+mkstub "$LC_STUBS/uname" <<'EOF'
+echo "${FAKE_ARCH:-x86_64}"
+EOF
+# fake sha256sum: prints FAKE_SHA, so a test decides whether the "download" matches the pin
+mkstub "$LC_STUBS/sha256sum" <<'EOF'
+printf '%s  %s\n' "$FAKE_SHA" "$1"
+EOF
+# fake curl: serves the installer for the tool named in FAKE_INSTALLER (a path)
+mkstub "$LC_STUBS/curl" <<'EOF'
+out="" url="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "-o" ]] && out="$a"
+    [[ "$a" == http* ]] && url="$a"
+    prev="$a"
+done
+echo "curl $url" >>"$FAKE_LOG"
+[[ "$*" == *"--proto =https"* && "$*" == *"--tlsv1.2"* ]] || echo "curl INSECURE-FLAGS" >>"$FAKE_LOG"
+[[ "${FAKE_DOWNLOAD_FAIL:-0}" == 1 ]] && exit 22
+case "$url" in
+    */install.sh) cp "$FAKE_INSTALLER" "$out"; exit 0 ;;
+esac
+echo "curl UNEXPECTED $*" >>"$FAKE_LOG"
+exit 1
+EOF
+# fake go
+mkstub "$LC_STUBS/go" <<'EOF'
+[[ "${1:-}" == version ]] && echo "go version go${FAKE_GO_VERSION:-1.24.12} linux/amd64"
+exit 0
+EOF
+mkstub "$LC_STUBS/gcc" <<'EOF'
+exit 0
+EOF
+# fake systemctl: only `list-units`, answered from the FAKE_UNITS file
+mkstub "$LC_STUBS/systemctl" <<'EOF'
+echo "systemctl $*" >>"$FAKE_LOG"
+if [[ "${1:-}" == list-units ]]; then
+    if [[ -f "${FAKE_UNITS:-/nonexistent}" ]]; then
+        while IFS= read -r l; do echo "$l"; done <"$FAKE_UNITS"
+    fi
+    exit 0
+fi
+echo "systemctl UNEXPECTED $*" >>"$FAKE_LOG"
+exit 0
+EOF
+# fake git: records the calls; `fetch` makes the "source", rev-parse reports FAKE_GIT_HEAD
+mkstub "$LC_STUBS/git" <<'EOF'
+echo "git $*" >>"$FAKE_LOG"
+dir="" args=("$@")
+i=0
+while ((i < ${#args[@]})); do
+    case "${args[$i]}" in
+        -c) i=$((i + 1)) ;;
+        -C) dir="${args[$((i + 1))]}"; i=$((i + 1)) ;;
+        init) mkdir -p "${args[$((${#args[@]} - 1))]}"; exit 0 ;;
+        fetch) [[ "${FAKE_GIT_FAIL:-0}" == 1 ]] && { echo "fatal: unable to access" >&2; exit 128; }
+               : >"$dir/FAKE-SOURCE"; exit 0 ;;
+        checkout) exit 0 ;;
+        rev-parse) echo "${FAKE_GIT_HEAD:-$FAKE_PIN_COMMIT}"; exit 0 ;;
+    esac
+    i=$((i + 1))
+done
+exit 0
+EOF
+# fake make: `make -C dir PREFIX=p` builds, `... install` installs the fake ctunnel
+mkstub "$LC_STUBS/make" <<'EOF'
+echo "make $*" >>"$FAKE_LOG"
+dir="" prefix="" verb=""
+while (($#)); do
+    case "$1" in
+        -C) dir="$2"; shift ;;
+        PREFIX=*) prefix="${1#PREFIX=}" ;;
+        install) verb=install ;;
+    esac
+    shift
+done
+[[ -f "$dir/FAKE-SOURCE" ]] || { echo "make: no source" >&2; exit 2; }
+if [[ -z "$verb" ]]; then
+    [[ "${FAKE_MAKE_FAIL:-0}" == 1 ]] && { echo "ctunnel.c: fatal error: openssl/evp.h: No such file or directory"; exit 2; }
+    : >"$dir/FAKE-BUILT"
+    exit 0
+fi
+[[ -f "$dir/FAKE-BUILT" ]] || { echo "make: nothing built" >&2; exit 2; }
+mkdir -p "$prefix/bin" "$prefix/share/man/man1"
+{
+    printf '#!%s\n' "$BASH_BIN_PATH"
+    printf 'echo "ctunnel %s Copyright (C) 2008-2020 Jess Mahan"\n' "${FAKE_CT_VERSION:-0.8}"
+    printf 'case "$*" in -v) ;; *) echo CTUNNEL-WAS-RUN-AS-TUNNEL >>"$FAKE_LOG" ;; esac\n'
+    echo 'echo "usage: ctunnel -c|-s -l ip:port -f ip:port -C cipher"; exit 0'
+} >"$prefix/bin/ctunnel"
+chmod +x "$prefix/bin/ctunnel"
+: >"$prefix/share/man/man1/ctunnel.1"
+echo "make-installed" >>"$FAKE_LOG"
+exit 0
+EOF
+# fake apt-get: logs; installing curl / git / make / gcc adds the stub to the sandbox PATH dir
+mkstub "$LC_STUBS/apt-get" <<'EOF'
+echo "apt-get $*" >>"$FAKE_LOG"
+[[ "${1:-}" == update ]] && exit 0
+for a in "$@"; do
+    case "$a" in
+        curl | git | make | gcc) cp "$LC_STUBS_DIR/$a" "$FAKE_TOOLS_DIR/$a" ;;
+    esac
+done
+exit 0
+EOF
+
+# --- fake tool binaries and installers ---------------------------------------------------------
+# fake backpack: `version` prints the version file; with no argument it is a tiny menu that reads
+# choices from stdin (8 = Update, 9 = Uninstall, 10 = Exit), standing in for Backpack's own CLI.
+mkstub "$LCW/fake-backpack" <<'EOF'
+if [[ "${1:-}" == version ]]; then
+    echo "$(<"$FAKE_BP_VERSION_FILE")"
+    echo "https://github.com/AminMGMT/BackPack"
+    exit 0
+fi
+echo "BACKPACK-MENU-OPENED" >>"$FAKE_LOG"
+while IFS= read -r choice; do
+    case "$choice" in
+        8) echo "$FAKE_BP_NEWVER" >"$FAKE_BP_VERSION_FILE"; echo "FAKE-BACKPACK: updated to $FAKE_BP_NEWVER" ;;
+        9) echo "FAKE-BACKPACK: uninstalling" ; rm -f "$0"; rm -rf "$EZVPS_BACKPACK_CONF_DIR"; exit 0 ;;
+        10) exit 0 ;;
+        *) echo "FAKE-BACKPACK: ? $choice" ;;
+    esac
+done
+exit 0
+EOF
+# fake official Backpack installer: records whether it got terminal input, installs the fake binary.
+mkstub "$LCW/fake-installer-backpack.sh" <<'EOF'
+n=0
+while IFS= read -r -t 0.3 _; do n=$((n + 1)); done
+echo "INSTALLER backpack args=$* stdin-lines=$n BP_HELPERS=${BP_HELPERS:-} BP_BUILD=${BP_BUILD_FROM_SOURCE:-}" >>"$FAKE_LOG"
+[[ "${FAKE_INSTALLER_FAIL:-0}" == 1 ]] && { echo "[fake] installer failed" >&2; exit 1; }
+mkdir -p "$EZVPS_TOOL_PREFIX/bin" "$EZVPS_BACKPACK_CONF_DIR"
+if [[ "${FAKE_INSTALLER_NOBIN:-0}" != 1 ]]; then
+    cp "$FAKE_BP_TEMPLATE" "$EZVPS_TOOL_PREFIX/bin/backpack"
+    chmod +x "$EZVPS_TOOL_PREFIX/bin/backpack"
+    echo "${FAKE_BP_INSTALLVER:-v1.9.0}" >"$FAKE_BP_VERSION_FILE"
+fi
+echo "[fake] Installed. Open the menu with: sudo backpack"
+exit 0
+EOF
+# fake official Lazyports installer: needs `go`, puts the binary in the prefix, appends a PATH line to ~/.bashrc
+mkstub "$LCW/fake-installer-lazyports.sh" <<'EOF'
+echo "INSTALLER lazyports args=$* go=$(command -v go || echo none)" >>"$FAKE_LOG"
+[[ "${FAKE_INSTALLER_FAIL:-0}" == 1 ]] && { echo "[fake] go install failed" >&2; exit 1; }
+mkdir -p "$EZVPS_TOOL_PREFIX/bin"
+printf '#!%s\necho LAZYPORTS-TUI\n' "$BASH_BIN_PATH" >"$EZVPS_TOOL_PREFIX/bin/lazyports"
+chmod +x "$EZVPS_TOOL_PREFIX/bin/lazyports"
+[[ "${FAKE_APPEND_RC:-1}" == 1 ]] && printf '\n# Added by Lazyports installer\nexport PATH=$PATH:/fake/go/bin\n' >>"$HOME/.bashrc"
+echo "[fake] Lazyports installed"
+exit 0
+EOF
+
+# --- sandboxes and scenarios -------------------------------------------------------------------
+LC_CORE=(bash cp mkdir mv rm rmdir mktemp date chmod ln readlink)
+# lc_box <dir> [omitted stub names...]: a PATH dir with coreutils + all stubs except the omitted ones
+lc_box() {
+    local d="$1" c s skip o
+    shift
+    rm -rf "$d"
+    mkdir -p "$d"
+    for c in "${LC_CORE[@]}"; do ln -s "$(command -v "$c")" "$d/$c"; done
+    for s in "$LC_STUBS"/*; do
+        skip=0
+        for o in "$@"; do [[ "${s##*/}" == "$o" ]] && skip=1; done
+        ((skip == 0)) && cp "$s" "$d/${s##*/}"
+    done
+}
+LC_BOX="$LCW/box"
+lc_box "$LC_BOX"
+
+# lc_scene <name>: a fresh temp tree + environment for one scenario (exported; the log starts empty)
+lc_scene() {
+    LC_DIR="$LCW/scene-$1"
+    rm -rf "$LC_DIR"
+    mkdir -p "$LC_DIR/prefix" "$LC_DIR/home" "$LC_DIR/backups" "$LC_DIR/etc"
+    export EZVPS_TOOL_PREFIX="$LC_DIR/prefix" EZVPS_BACKPACK_CONF_DIR="$LC_DIR/etc/backpack"
+    export EZVPS_BACKUP_DIR="$LC_DIR/backups" HOME="$LC_DIR/home"
+    export FAKE_LOG="$LC_DIR/log" FAKE_BP_VERSION_FILE="$LC_DIR/bp-version"
+    export FAKE_BP_TEMPLATE="$LCW/fake-backpack" BASH_BIN_PATH="$BASH_BIN" LC_STUBS_DIR="$LC_STUBS"
+    export FAKE_PIN_COMMIT="$LC_CT_COMMIT" FAKE_TOOLS_DIR="$LC_BOX"
+    export FAKE_SHA="$LC_BP_SHA" FAKE_INSTALLER="$LCW/fake-installer-backpack.sh" FAKE_ARCH=x86_64
+    export FAKE_BP_NEWVER="v1.9.1" FAKE_UNITS="$LC_DIR/units"
+    unset FAKE_DOWNLOAD_FAIL FAKE_INSTALLER_FAIL FAKE_INSTALLER_NOBIN FAKE_GIT_FAIL FAKE_GIT_HEAD FAKE_MAKE_FAIL \
+        FAKE_CT_VERSION FAKE_GO_VERSION FAKE_APPEND_RC FAKE_BP_INSTALLVER
+    : >"$FAKE_LOG"
+    lc_box "$LC_BOX"
+}
+log_has() { grep -qF -- "$1" "$FAKE_LOG"; }
+log_lacks() { ! grep -qF -- "$1" "$FAKE_LOG"; }
+log_count() { grep -cF -- "$1" "$FAKE_LOG"; }
+backup_count() { # backup_count <name prefix>
+    local n=0 f
+    for f in "$LC_DIR/backups/$1"*; do [[ -e "$f" ]] && n=$((n + 1)); done
+    echo "$n"
+}
+first_backup() { local f; for f in "$LC_DIR/backups/$1"*; do [[ -e "$f" ]] && { echo "$f"; return; }; done; }
+# put an "installed" fake Backpack in place (binary, version file, a config with a fake secret marker)
+lc_seed_backpack() {
+    mkdir -p "$LC_DIR/prefix/bin" "$EZVPS_BACKPACK_CONF_DIR"
+    cp "$LCW/fake-backpack" "$LC_DIR/prefix/bin/backpack"
+    echo "${1:-v1.9.0}" >"$FAKE_BP_VERSION_FILE"
+    printf 'name = "t1"\ntoken = "FAKE-TOKEN-DO-NOT-PRINT"\n' >"$EZVPS_BACKPACK_CONF_DIR/t1.toml"
+}
+lc_seed_ctunnel() {
+    mkdir -p "$LC_DIR/prefix/bin" "$LC_DIR/prefix/share/man/man1"
+    printf '#!%s\necho "ctunnel %s Copyright (C) 2008-2020 Jess Mahan"\n' "$BASH_BIN" "${1:-0.7}" >"$LC_DIR/prefix/bin/ctunnel"
+    chmod +x "$LC_DIR/prefix/bin/ctunnel"
+    : >"$LC_DIR/prefix/share/man/man1/ctunnel.1"
+    printf 'FAKE-PASSKEY-DO-NOT-PRINT\n' >"$HOME/.passkey"
+    chmod 600 "$HOME/.passkey"
+}
+lc_seed_lazyports() { # lc_seed_lazyports [system|home|both]
+    local where="${1:-system}"
+    printf '#!%s\necho LAZYPORTS-TUI\n' "$BASH_BIN" >"$LC_DIR/lp-template"
+    if [[ "$where" != home ]]; then
+        mkdir -p "$LC_DIR/prefix/bin"
+        cp "$LC_DIR/lp-template" "$LC_DIR/prefix/bin/lazyports"
+        chmod +x "$LC_DIR/prefix/bin/lazyports"
+    fi
+    if [[ "$where" != system ]]; then
+        mkdir -p "$HOME/go/bin"
+        cp "$LC_DIR/lp-template" "$HOME/go/bin/lazyports"
+        chmod +x "$HOME/go/bin/lazyports"
+    fi
+    printf '# my bashrc\nalias ll="ls -l"\n' >"$HOME/.bashrc"
+}
+# run on the sandbox PATH: lc_run <input> <module-or-args...> -> OUT / RC
+lc_run() {
+    local input="$1"
+    shift
+    run_ezvps "$LC_BOX" "$input" "$@"
+}
+secrets_hidden() { [[ "$OUT" != *FAKE-TOKEN-DO-NOT-PRINT* && "$OUT" != *FAKE-PASSKEY-DO-NOT-PRINT* ]]; }
+
+echo "-- submenus (shared by the three tools)"
+lc_scene menus
+for t in "backpack:Backpack:3" "ctunnel:ctunnel:4" "lazyports:Lazyports:7"; do
+    IFS=: read -r key label num <<<"$t"
+    lc_run "0\n" "$key"
+    check "${label}: cli submenu exits 0" equals "$RC" 0
+    check "${label}: submenu title" has_line "$OUT" "$label"
+    check "${label}: ' 1) Install' is exact" has_line "$OUT" " 1) Install"
+    check "${label}: ' 2) Status' is exact" has_line "$OUT" " 2) Status"
+    check "${label}: ' 3) Update' is exact" has_line "$OUT" " 3) Update"
+    check "${label}: ' 4) Uninstall' is exact" has_line "$OUT" " 4) Uninstall"
+    check "${label}: ' 0) Back' is exact" has_line "$OUT" " 0) Back"
+    check "${label}: exactly 5 numbered entries (clean labels)" equals "$(printf '%s\n' "$OUT" | grep -cE '^ *[0-9]+\) ')" 5
+    check "${label}: not reported as unimplemented" not_contains "$OUT" "not implemented yet"
+    lc_run "${num}\n0\n\n0\n"
+    check "${label}: reachable from main menu item ${num}, back returns to the menu" at_least_menus "$OUT" 2
+    lc_run "9\n\n0\n" "$key"
+    check "${label}: invalid choice is reported" contains "$OUT" "Invalid choice: 9"
+    lc_run "" "$key"
+    check "${label}: EOF returns cleanly" equals "$RC" 0
+done
+
+echo "-- Backpack: status when not installed / installed"
+lc_scene bp-status
+lc_run "2\n\n0\n" backpack
+check "Backpack status: not installed" contains "$OUT" "Installed:  no"
+check "Backpack status: says to install" contains "$OUT" "Backpack is not installed."
+lc_seed_backpack v1.9.0
+printf '%s\n' "backpack-t1.service loaded active running Backpack tunnel t1" "backpack-monitor.service loaded inactive dead Backpack monitor" >"$FAKE_UNITS"
+lc_run "2\n\n0\n" backpack
+check "Backpack status: installed" contains "$OUT" "Installed:  yes"
+check "Backpack status: binary path" contains "$OUT" "Binary:     $LC_DIR/prefix/bin/backpack"
+check "Backpack status: version from 'backpack version'" contains "$OUT" "Version:    v1.9.0"
+check "Backpack status: documented tunnel service, running" contains "$OUT" "backpack-t1.service: active (running)"
+check "Backpack status: documented monitor service, stopped" contains "$OUT" "backpack-monitor.service: inactive (dead)"
+check "Backpack status: queries only backpack-*.service units" log_has "systemctl list-units --type=service --all --no-legend --plain backpack-*.service"
+check "Backpack status: does not open Backpack" log_lacks "BACKPACK-MENU-OPENED"
+check "Backpack status: makes no backup" equals "$(backup_count '')" 0
+check "Backpack status: never prints the config's token" secrets_hidden
+: >"$FAKE_UNITS"
+lc_run "2\n\n0\n" backpack
+check "Backpack status: installed but no tunnel services yet" contains "$OUT" "no backpack-*.service units found"
+lc_box "$LC_BOX" systemctl
+lc_run "2\n\n0\n" backpack
+check "Backpack status without systemctl degrades with a message" contains "$OUT" "systemctl not found"
+
+echo "-- Backpack: install"
+lc_scene bp-install
+lc_run "1\nn\n\n0\n" backpack
+check "Backpack install declined: nothing downloaded" log_lacks "curl "
+check "Backpack install declined: says nothing was changed" contains "$OUT" "Cancelled. Nothing was changed."
+check "Backpack install declined: no binary" test ! -e "$LC_DIR/prefix/bin/backpack"
+check "Backpack install plan shows the project" contains "$OUT" "https://github.com/AminMGMT/BackPack"
+check "Backpack install plan shows the pinned installer URL" contains "$OUT" "installer: ${LC_BP_URL}"
+check "Backpack install plan shows the pin and expected sha256" contains "$OUT" "sha256:    ${LC_BP_SHA} (expected)"
+check "Backpack install plan says the tool is not started and nothing is asked" contains "$OUT" "asks for no tunnel settings, tokens or ports"
+check "Backpack install plan promises a backup first" contains "$OUT" "backed up to $LC_DIR/backups/ first"
+check "Backpack install plan names the supported system as accepted" contains "$OUT" "ezvps will install Backpack (this system and architecture are supported):"
+lc_run "1\ny\n\n2\n\n0\n" backpack
+check "Backpack install: exit 0" equals "$RC" 0
+check "Backpack install: pinned URL downloaded once" equals "$(log_count "curl ${LC_BP_URL}")" 1
+check "Backpack install: nothing else downloaded" equals "$(log_count 'curl ')" 1
+check "Backpack install: download uses --proto =https --tlsv1.2" log_lacks "INSECURE-FLAGS"
+check "Backpack install: hash check reported" contains "$OUT" "Downloaded installer matches the pinned sha256."
+check "Backpack install: installer ran exactly once" equals "$(log_count 'INSTALLER backpack')" 1
+check "Backpack install: installer got no arguments and no environment switches" log_has "INSTALLER backpack args= stdin-lines=0 BP_HELPERS= BP_BUILD="
+check "Backpack install: installer saw /dev/null as input, so the menu input survived (status ran next)" contains "$OUT" "Installed:  yes"
+check "Backpack install: installed binary is verified" contains "$OUT" "Installed: $LC_DIR/prefix/bin/backpack"
+check "Backpack install: version reported" contains "$OUT" "Version:   v1.9.0"
+check "Backpack install: only tells how to open it" contains "$OUT" "To open Backpack: run: backpack"
+check "Backpack install: does not launch Backpack" log_lacks "BACKPACK-MENU-OPENED"
+check "Backpack install: nothing to back up on a fresh system" contains "$OUT" "Nothing to back up yet."
+check "Backpack install: no backups created" equals "$(backup_count '')" 0
+check "Backpack install: asks for no token/link/password" not_contains "$OUT" "Token:"
+
+echo "-- Backpack: already installed"
+lc_scene bp-again
+lc_seed_backpack v1.9.0
+lc_run "1\nn\n\n0\n" backpack
+check "already installed: says so with the version" contains "$OUT" "Backpack is already installed ($LC_DIR/prefix/bin/backpack, version v1.9.0)."
+check "already installed: does not reinstall unless asked" contains "$OUT" "It will not be reinstalled unless you say so."
+check "already installed, declined: nothing downloaded" log_lacks "curl "
+check "already installed, declined: installer not run" log_lacks "INSTALLER"
+check "already installed, declined: no backup" equals "$(backup_count '')" 0
+lc_run "1\ny\nn\n\n0\n" backpack
+check "reinstall: second question (the plan) can still stop it" log_lacks "INSTALLER"
+check "reinstall declined at the plan: no backup" equals "$(backup_count '')" 0
+lc_run "1\ny\ny\n\n0\n" backpack
+check "reinstall: config backed up before the installer ran" test -f "$(first_backup backpack-1-backpack)/t1.toml"
+check "reinstall: config backup is byte for byte" equals "$(cksum <"$(first_backup backpack-1-backpack)/t1.toml")" "$(cksum <"$EZVPS_BACKPACK_CONF_DIR/t1.toml")"
+check "reinstall: binary backed up too" test -x "$(first_backup backpack-2-backpack)"
+check "reinstall: backup dir is root-only (700)" equals "$(stat -c %a "$LC_DIR/backups")" 700
+check "reinstall: installer ran once" equals "$(log_count 'INSTALLER backpack')" 1
+check "reinstall: config left in place" test -f "$EZVPS_BACKPACK_CONF_DIR/t1.toml"
+check "reinstall: still one binary" test -x "$LC_DIR/prefix/bin/backpack"
+check "reinstall: secrets never printed" secrets_hidden
+lc_run "1\ny\ny\n\n0\n" backpack
+check "reinstall twice: no duplicate state, installer ran again once" equals "$(log_count 'INSTALLER backpack')" 2
+
+echo "-- Backpack: failure paths"
+lc_scene bp-fail
+export FAKE_SHA="0000000000000000000000000000000000000000000000000000000000000000"
+lc_run "1\ny\n\n0\n" backpack
+check "hash mismatch: refused" contains "$OUT" "SHA-256 mismatch for the downloaded installer; refusing to run it."
+check "hash mismatch: installer not run" log_lacks "INSTALLER"
+check "hash mismatch: nothing installed" test ! -e "$LC_DIR/prefix/bin/backpack"
+check "hash mismatch: menu continues, exit 0" equals "$RC" 0
+export FAKE_SHA="$LC_BP_SHA"
+export FAKE_DOWNLOAD_FAIL=1
+lc_run "1\ny\n\n0\n" backpack
+check "download failure: reported with the URL" contains "$OUT" "Download failed: ${LC_BP_URL}"
+check "download failure: installer not run" log_lacks "INSTALLER"
+check "download failure: exit 0" equals "$RC" 0
+unset FAKE_DOWNLOAD_FAIL
+export FAKE_INSTALLER_FAIL=1
+lc_run "1\ny\n\n0\n" backpack
+check "installer failure: status reported" contains "$OUT" "The Backpack installer exited with status 1."
+check "installer failure: no success message" not_contains "$OUT" "Installed: "
+unset FAKE_INSTALLER_FAIL
+export FAKE_INSTALLER_NOBIN=1
+lc_run "1\ny\n\n0\n" backpack
+check "installer without a binary: reported as NOT installed" contains "$OUT" "Backpack is NOT installed."
+unset FAKE_INSTALLER_NOBIN
+lc_box "$LC_BOX" curl
+lc_run "1\nn\n\n0\n" backpack
+check "missing curl: explained before anything is installed" contains "$OUT" "curl is not installed; it is needed to download the Backpack installer."
+check "missing curl, declined: nothing changed" log_lacks "apt-get"
+check "missing curl, declined: said so" contains "$OUT" "Cancelled. Nothing was changed."
+lc_box "$LC_BOX" curl
+lc_run "1\ny\ny\n\n0\n" backpack
+check "missing curl, accepted: apt-get installs curl" log_has "apt-get install -y -q curl"
+check "missing curl, accepted: install then proceeds" log_has "INSTALLER backpack"
+
+echo "-- Backpack: update through its own menu"
+lc_scene bp-update
+lc_run "3\n\n0\n" backpack
+check "update when not installed: says so" contains "$OUT" "Backpack is not installed; there is nothing to update."
+lc_seed_backpack v1.9.0
+lc_run "3\nn\n\n0\n" backpack
+check "update declined: Backpack not opened" log_lacks "BACKPACK-MENU-OPENED"
+check "update declined: no backup" equals "$(backup_count '')" 0
+check "update explains the documented method" contains "$OUT" "updates itself through its own Update menu"
+lc_run "3\ny\n8\n10\n\n0\n" backpack
+check "update: config backed up first" test -f "$(first_backup backpack-1-backpack)/t1.toml"
+check "update: config backup is byte for byte" equals "$(cksum <"$(first_backup backpack-1-backpack)/t1.toml")" "$(cksum <"$EZVPS_BACKPACK_CONF_DIR/t1.toml")"
+check "update: Backpack's own menu was opened" log_has "BACKPACK-MENU-OPENED"
+check "update: the hint names the documented menu item" contains "$OUT" "choose 8 (Update)"
+check "update: the update ran inside Backpack, not in ezvps" contains "$OUT" "FAKE-BACKPACK: updated to v1.9.1"
+check "update: old and new version reported" contains "$OUT" "Updated: v1.9.0  ->  v1.9.1"
+check "update: returns to ezvps" contains "$OUT" "Returned to ezvps."
+check "update: secrets never printed" secrets_hidden
+echo "v1.9.0" >"$FAKE_BP_VERSION_FILE"
+lc_run "3\ny\n10\n\n0\n" backpack
+check "update with no update applied: version unchanged reported" contains "$OUT" "Version is unchanged (v1.9.0)"
+
+echo "-- Backpack: uninstall through its own menu"
+lc_scene bp-uninstall
+lc_run "4\n\n0\n" backpack
+check "uninstall when not installed: says so" contains "$OUT" "Backpack is not installed; there is nothing to uninstall."
+lc_seed_backpack v1.9.0
+lc_run "4\nn\n\n0\n" backpack
+check "uninstall declined: says nothing was changed" contains "$OUT" "Nothing was changed."
+check "uninstall declined: Backpack not opened" log_lacks "BACKPACK-MENU-OPENED"
+check "uninstall declined: binary still there" test -x "$LC_DIR/prefix/bin/backpack"
+check "uninstall declined: no backup" equals "$(backup_count '')" 0
+check "uninstall warns what upstream deletes" contains "$OUT" "deletes its tunnels, services"
+lc_run "4\ny\n10\n\n0\n" backpack
+check "uninstall without choosing Uninstall in Backpack: reported as still present" contains "$OUT" "Backpack is still present at"
+check "uninstall without choosing Uninstall: not claimed as verified gone" not_contains "$OUT" "Verified: the backpack binary is gone."
+rm -rf "$LC_DIR/backups"
+mkdir -p "$LC_DIR/backups"
+lc_run "4\ny\n9\n\n0\n" backpack
+check "uninstall: config backed up before Backpack removed it" test -f "$(first_backup backpack-1-backpack)/t1.toml"
+check "uninstall: config backup is byte for byte (token kept for the user, never printed)" equals "$(<"$(first_backup backpack-1-backpack)/t1.toml")" $'name = "t1"\ntoken = "FAKE-TOKEN-DO-NOT-PRINT"'
+check "uninstall: Backpack's own uninstall ran" contains "$OUT" "FAKE-BACKPACK: uninstalling"
+check "uninstall: binary is gone and ezvps verifies it" contains "$OUT" "Verified: the backpack binary is gone."
+check "uninstall: binary really gone" test ! -e "$LC_DIR/prefix/bin/backpack"
+check "uninstall: backups are kept" contains "$OUT" "The backups under $LC_DIR/backups/ are kept."
+check "uninstall: backup still on disk after the tool removed its config" test -f "$(first_backup backpack-1-backpack)/t1.toml"
+check "uninstall: secrets never printed" secrets_hidden
+lc_run "2\n\n0\n" backpack
+check "status after uninstall: not installed" contains "$OUT" "Installed:  no"
+
+echo "-- Backpack: unsupported systems and architectures change nothing"
+lc_scene bp-unsupported
+for osf in ubuntu2510 ubuntu2504 ubuntu2310 ubuntu2610 debian11 debian-testing unknown ubuntu2404-jammy ubuntu2204-noble debian13-bookworm debian12-noble ubuntu2204-nocodename; do
+    run_os "$OSD/$osf" "$LC_BOX" "1\ny\n\n0\n" backpack
+    check "Backpack install refused on ${osf}" contains "$OUT" "Backpack install needs a supported system: ${OS_LIST_TEXT}; found '"
+    check "Backpack install on ${osf}: nothing downloaded, nothing installed" equals "$(log_count 'curl ')$(test -e "$LC_DIR/prefix/bin/backpack" && echo present)" 0
+done
+run_os "$OSD/missing-file" "$LC_BOX" "1\ny\n\n0\n" backpack
+check "Backpack install refused when os-release is missing" contains "$OUT" "found 'unknown unknown unknown'"
+for osf in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    run_os "$OSD/$osf" "$LC_BOX" "1\nn\n\n0\n" backpack
+    check "Backpack install accepted on ${osf} (reaches the plan)" contains "$OUT" "ezvps will install Backpack (this system and architecture are supported):"
+done
+for a in armv7l armv6l i686 i386 s390x ppc64le riscv64 mips; do
+    export FAKE_ARCH="$a"
+    lc_run "1\ny\n\n0\n" backpack
+    check "Backpack install refused on architecture ${a}" contains "$OUT" "Backpack install does not support architecture '${a}' (supported: x86_64, aarch64). Nothing was changed."
+    check "Backpack install on ${a}: nothing downloaded" log_lacks "curl "
+done
+export FAKE_ARCH=aarch64
+lc_run "1\nn\n\n0\n" backpack
+check "Backpack install accepted on aarch64" contains "$OUT" "ezvps will install Backpack (this system and architecture are supported):"
+export FAKE_ARCH=x86_64
+
+echo "-- ctunnel: install from the pinned source commit"
+lc_scene ct-install
+lc_run "2\n\n0\n" ctunnel
+check "ctunnel status: not installed" contains "$OUT" "Installed:  no"
+lc_run "1\nn\n\n0\n" ctunnel
+check "ctunnel plan: shows the project, git URL and the pinned commit" contains "$OUT" "source:    ${LC_CT_GIT}"
+check "ctunnel plan: pinned commit" contains "$OUT" "pinned to: commit ${LC_CT_COMMIT}"
+check "ctunnel plan: says there is no installer script or release" contains "$OUT" "ctunnel has no installer script or release"
+check "ctunnel plan: names upstream's documented 'make; make install'" contains "$OUT" "'make; make install'"
+check "ctunnel declined: nothing fetched or built" equals "$(log_count git)$(log_count make)" 00
+lc_run "1\ny\n\n2\n\n0\n" ctunnel
+check "ctunnel install: fetched exactly the pinned commit over https only" log_has "git -c protocol.allow=never -c protocol.https.allow=always -C "
+check "ctunnel install: git fetch of the pinned commit, depth 1" log_has "fetch -q --depth 1 ${LC_CT_GIT} ${LC_CT_COMMIT}"
+check "ctunnel install: commit verified with rev-parse" log_has "rev-parse HEAD"
+check "ctunnel install: no curl and no installer script" equals "$(log_count 'curl ')$(log_count 'INSTALLER')" 00
+check "ctunnel install: built with make" log_has "make -C "
+check "ctunnel install: make install with the prefix" log_has " install PREFIX=$LC_DIR/prefix"
+check "ctunnel install: binary installed" test -x "$LC_DIR/prefix/bin/ctunnel"
+check "ctunnel install: man page installed" test -f "$LC_DIR/prefix/share/man/man1/ctunnel.1"
+check "ctunnel install: version reported from 'ctunnel -v'" contains "$OUT" "Version:   ctunnel 0.8 Copyright (C) 2008-2020 Jess Mahan"
+check "ctunnel install: only says how to open it" contains "$OUT" "To open ctunnel: run: ctunnel -h"
+check "ctunnel install: never runs ctunnel as a tunnel" log_lacks "CTUNNEL-WAS-RUN-AS-TUNNEL"
+check "ctunnel install: no panel, no unit" log_lacks "systemctl"
+check "ctunnel install: status afterwards: installed" contains "$OUT" "Installed:  yes"
+check "ctunnel status: no service is invented" contains "$OUT" "none documented upstream (ctunnel is a command-line program started by hand)"
+check "ctunnel status: no running/stopped claim" not_contains "$OUT" "Service:    ctunnel: "
+lc_scene ct-fail
+export FAKE_GIT_HEAD="0000000000000000000000000000000000000000"
+lc_run "1\ny\n\n0\n" ctunnel
+check "ctunnel: a commit that does not verify is refused" contains "$OUT" "Could not fetch commit ${LC_CT_COMMIT}"
+check "ctunnel: refused commit is not built" log_lacks "make -C"
+unset FAKE_GIT_HEAD
+export FAKE_GIT_FAIL=1
+lc_run "1\ny\n\n0\n" ctunnel
+check "ctunnel: git failure reported, nothing built" contains "$OUT" "Could not fetch commit"
+unset FAKE_GIT_FAIL
+export FAKE_MAKE_FAIL=1
+lc_run "1\ny\n\n0\n" ctunnel
+check "ctunnel: build failure reported with the log tail" contains "$OUT" "openssl/evp.h: No such file or directory"
+check "ctunnel: build failure hints at the dev packages" contains "$OUT" "libssl-dev zlib1g-dev"
+check "ctunnel: build failure installs nothing" test ! -e "$LC_DIR/prefix/bin/ctunnel"
+check "ctunnel: build failure does not run make install" log_lacks "make-installed"
+unset FAKE_MAKE_FAIL
+lc_box "$LC_BOX" git make gcc
+lc_run "1\nn\n\n0\n" ctunnel
+check "ctunnel missing build tools: named and offered via apt-get" contains "$OUT" "Missing build tools: git make gcc"
+check "ctunnel missing build tools, declined: nothing changed" log_lacks "apt-get"
+lc_box "$LC_BOX" git make gcc
+lc_run "1\ny\ny\n\n0\n" ctunnel
+check "ctunnel missing build tools, accepted: one apt-get install of the build packages" log_has "apt-get install -y -q git make gcc libssl-dev zlib1g-dev"
+check "ctunnel missing build tools, accepted: install then proceeds" test -x "$LC_DIR/prefix/bin/ctunnel"
+
+echo "-- ctunnel: already installed, update (no documented method), uninstall"
+lc_scene ct-life
+lc_seed_ctunnel 0.7
+lc_run "1\nn\n\n0\n" ctunnel
+check "ctunnel already installed: says so with the version" contains "$OUT" "ctunnel is already installed ($LC_DIR/prefix/bin/ctunnel, version ctunnel 0.7 Copyright (C) 2008-2020 Jess Mahan)."
+check "ctunnel already installed, declined: nothing fetched, nothing backed up" equals "$(log_count git)$(backup_count '')" 00
+lc_run "3\nn\n\n0\n" ctunnel
+check "ctunnel update: says clearly there is no documented update command" contains "$OUT" "ctunnel has no documented update command upstream, and ezvps does not guess one."
+check "ctunnel update: points at the documented reinstall" contains "$OUT" "The documented way to get a newer ctunnel is to install it again from its source."
+check "ctunnel update declined: nothing changed" equals "$(log_count git)$(backup_count '')" 00
+export FAKE_CT_VERSION=0.9
+lc_run "3\ny\ny\n\n0\n" ctunnel
+check "ctunnel update: no update command is run" log_lacks "ctunnel update"
+check "ctunnel update: binary backed up before the reinstall" test -x "$(first_backup ctunnel-2-ctunnel)"
+check "ctunnel update: ~/.passkey backed up byte for byte" equals "$(<"$(first_backup ctunnel-1-passkey)")" "FAKE-PASSKEY-DO-NOT-PRINT"
+check "ctunnel update: backup of the old binary is the OLD version" contains "$("$(first_backup ctunnel-2-ctunnel)")" "ctunnel 0.7"
+check "ctunnel update: reinstalled from the pinned commit" log_has "${LC_CT_COMMIT}"
+check "ctunnel update: old and new version reported" contains "$OUT" "Version:   ctunnel 0.7 Copyright (C) 2008-2020 Jess Mahan  ->  ctunnel 0.9 Copyright (C) 2008-2020 Jess Mahan"
+check "ctunnel update: ~/.passkey left in place and never printed" secrets_hidden
+check "ctunnel update: ~/.passkey still there" test -f "$HOME/.passkey"
+unset FAKE_CT_VERSION
+lc_scene ct-uninstall
+lc_run "4\n\n0\n" ctunnel
+check "ctunnel uninstall when not installed: says so" contains "$OUT" "ctunnel is not installed; there is nothing to uninstall."
+lc_seed_ctunnel 0.8
+lc_run "4\nn\n\n0\n" ctunnel
+check "ctunnel uninstall: lists exactly what 'make uninstall' removes" contains "$OUT" "$LC_DIR/prefix/share/man/man1/ctunnel.1"
+check "ctunnel uninstall declined: binary still there, no backup" equals "$(test -x "$LC_DIR/prefix/bin/ctunnel" && echo there)$(backup_count '')" there0
+lc_run "4\ny\n\n0\n" ctunnel
+check "ctunnel uninstall: binary backed up" test -x "$(first_backup ctunnel-2-ctunnel)"
+check "ctunnel uninstall: ~/.passkey backed up byte for byte" equals "$(<"$(first_backup ctunnel-1-passkey)")" "FAKE-PASSKEY-DO-NOT-PRINT"
+check "ctunnel uninstall: binary removed" test ! -e "$LC_DIR/prefix/bin/ctunnel"
+check "ctunnel uninstall: man page removed" test ! -e "$LC_DIR/prefix/share/man/man1/ctunnel.1"
+check "ctunnel uninstall: ezvps verifies the binary is gone" contains "$OUT" "Verified: the ctunnel binary is gone."
+check "ctunnel uninstall: ~/.passkey is not deleted" test -f "$HOME/.passkey"
+check "ctunnel uninstall: backups kept" test -x "$(first_backup ctunnel-2-ctunnel)"
+check "ctunnel uninstall: secret never printed" secrets_hidden
+lc_scene ct-elsewhere
+mkdir -p "$LC_DIR/elsewhere"
+printf '#!%s\necho "ctunnel 0.6 distro build"\n' "$BASH_BIN" >"$LC_DIR/elsewhere/ctunnel"
+chmod +x "$LC_DIR/elsewhere/ctunnel"
+cp "$LC_DIR/elsewhere/ctunnel" "$LC_BOX/ctunnel"
+lc_run "2\n\n4\n\n0\n" ctunnel
+check "ctunnel found on PATH outside the documented prefix counts as installed" contains "$OUT" "Binary:     $LC_BOX/ctunnel"
+check "ctunnel uninstall of a PATH-only copy: refuses to guess, nothing removed" contains "$OUT" "not an upstream-documented location"
+check "ctunnel uninstall of a PATH-only copy: binary untouched" test -x "$LC_BOX/ctunnel"
+lc_scene ct-unsupported
+run_os "$OSD/ubuntu2510" "$LC_BOX" "1\ny\n\n0\n" ctunnel
+check "ctunnel install refused on Ubuntu 25.10" contains "$OUT" "ctunnel install needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'. Nothing was changed."
+check "ctunnel install refused on Ubuntu 25.10: nothing fetched" equals "$(log_count git)$(log_count make)" 00
+export FAKE_ARCH=armv7l
+lc_run "1\ny\n\n0\n" ctunnel
+check "ctunnel install refused on armv7l" contains "$OUT" "ctunnel install does not support architecture 'armv7l' (supported: x86_64, aarch64). Nothing was changed."
+check "ctunnel install on armv7l: nothing fetched" equals "$(log_count git)$(log_count make)" 00
+export FAKE_ARCH=x86_64
+for osf in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    run_os "$OSD/$osf" "$LC_BOX" "1\nn\n\n0\n" ctunnel
+    check "ctunnel install accepted on ${osf}" contains "$OUT" "ezvps will install ctunnel (this system and architecture are supported):"
+done
+
+echo "-- Lazyports: install (Go build via the pinned official installer)"
+lc_scene lz-install
+export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
+printf '# my bashrc\nalias ll="ls -l"\n' >"$HOME/.bashrc"
+lc_run "2\n\n0\n" lazyports
+check "Lazyports status: not installed" contains "$OUT" "Installed:  no"
+lc_run "1\nn\n\n0\n" lazyports
+check "Lazyports plan: pinned installer URL" contains "$OUT" "installer: ${LC_LZ_URL}"
+check "Lazyports plan: pinned to a commit, says upstream has no tags" contains "$OUT" "pinned to: commit ${LC_LZ_COMMIT} (upstream publishes no tags or releases)"
+check "Lazyports plan: expected sha256" contains "$OUT" "sha256:    ${LC_LZ_SHA} (expected)"
+check "Lazyports plan: says the built code (main) is not pinned" contains "$OUT" "the code it builds is upstream's current"
+check "Lazyports plan: names go install ...@main" contains "$OUT" "go install github.com/v9mirza/lazyports@main"
+check "Lazyports plan: warns about the shell startup file" contains "$OUT" "may append a PATH line to"
+check "Lazyports declined: nothing downloaded" log_lacks "curl "
+lc_run "1\ny\n\n2\n\n0\n" lazyports
+check "Lazyports install: pinned URL downloaded once" equals "$(log_count "curl ${LC_LZ_URL}")" 1
+check "Lazyports install: downloaded with --proto =https --tlsv1.2" log_lacks "INSECURE-FLAGS"
+check "Lazyports install: installer ran once, no arguments" log_has "INSTALLER lazyports args= go="
+check "Lazyports install: binary installed" test -x "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports install: shell startup file backed up BEFORE the installer appended to it" equals "$(<"$(first_backup lazyports-1-bashrc)")" $'# my bashrc\nalias ll="ls -l"'
+check "Lazyports install: the installer's PATH line is in the real .bashrc, not the backup" contains "$(<"$HOME/.bashrc")" "Added by Lazyports installer"
+check "Lazyports install: version honestly not reported" contains "$OUT" "Version:   not reported (Lazyports documents no version command)"
+check "Lazyports install: only says how to open it" contains "$OUT" "To open Lazyports: run: lazyports"
+check "Lazyports install: status afterwards: installed" contains "$OUT" "Installed:  yes"
+check "Lazyports status: no service is invented" contains "$OUT" "Lazyports is an interactive terminal program"
+check "Lazyports status: no systemctl call at all" log_lacks "systemctl"
+lc_run "1\ny\ny\n\n0\n" lazyports
+check "Lazyports reinstall: asks first, backs up the existing binary" test -x "$(first_backup lazyports-2-lazyports)"
+lc_scene lz-go
+export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
+lc_box "$LC_BOX" go
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports without Go: refused with how to get Go" contains "$OUT" "needs Go 1.24 or newer, and 'go' was not found."
+check "Lazyports without Go: nothing downloaded or changed" equals "$(log_count 'curl ')$(backup_count '')" 00
+export FAKE_GO_VERSION=1.19.8
+lc_box "$LC_BOX"
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports with Go 1.19: refused (cannot fetch the newer toolchain)" contains "$OUT" "older than 1.21"
+check "Lazyports with Go 1.19: nothing downloaded" log_lacks "curl "
+export FAKE_GO_VERSION=1.22.2
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports with Go 1.22: warns, then installs" contains "$OUT" "Go 1.22 will try to download the newer toolchain"
+check "Lazyports with Go 1.22: installed" test -x "$LC_DIR/prefix/bin/lazyports"
+export FAKE_GO_VERSION=1.24.12
+lc_scene lz-hash
+export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="1111111111111111111111111111111111111111111111111111111111111111"
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports: hash mismatch refused, installer not run" equals "$(log_count INSTALLER)$(contains "$OUT" 'SHA-256 mismatch' && echo mismatch)" 0mismatch
+lc_scene lz-unsupported
+export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
+run_os "$OSD/debian11" "$LC_BOX" "1\ny\n\n0\n" lazyports
+check "Lazyports install refused on Debian 11" contains "$OUT" "Lazyports install needs a supported system: ${OS_LIST_TEXT}; found 'debian 11 bullseye'. Nothing was changed."
+check "Lazyports install refused on Debian 11: nothing downloaded" log_lacks "curl "
+export FAKE_ARCH=i686
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports install refused on i686" contains "$OUT" "Lazyports install does not support architecture 'i686' (supported: x86_64, aarch64). Nothing was changed."
+check "Lazyports install on i686: nothing downloaded" log_lacks "curl "
+export FAKE_ARCH=x86_64
+for osf in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    run_os "$OSD/$osf" "$LC_BOX" "1\nn\n\n0\n" lazyports
+    check "Lazyports install accepted on ${osf}" contains "$OUT" "ezvps will install Lazyports (this system and architecture are supported):"
+done
+
+echo "-- Lazyports: update (no documented method) and uninstall (remove the binary)"
+lc_scene lz-life
+export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
+lc_seed_lazyports system
+lc_run "3\nn\n\n0\n" lazyports
+check "Lazyports update: says clearly there is no documented update command" contains "$OUT" "Lazyports has no documented update command upstream, and ezvps does not guess one."
+check "Lazyports update: points at the documented reinstall" contains "$OUT" "The documented way to get a newer Lazyports is to install it again from its source."
+check "Lazyports update declined: nothing changed" equals "$(log_count 'curl ')$(backup_count '')" 00
+lc_run "3\ny\ny\n\n0\n" lazyports
+check "Lazyports update: reinstalled through the documented installer" log_has "INSTALLER lazyports"
+check "Lazyports update: binary and shell file backed up first" equals "$(backup_count lazyports-1-bashrc)$(backup_count lazyports-2-lazyports)" 11
+check "Lazyports update: no update command was invented" log_lacks "lazyports update"
+lc_scene lz-uninstall
+lc_run "4\n\n0\n" lazyports
+check "Lazyports uninstall when not installed: says so" contains "$OUT" "Lazyports is not installed; there is nothing to uninstall."
+lc_seed_lazyports both
+lc_run "4\nn\n\n0\n" lazyports
+check "Lazyports uninstall: lists both documented locations" contains "$OUT" "$HOME/go/bin/lazyports"
+check "Lazyports uninstall declined: both binaries remain" equals "$(test -x "$LC_DIR/prefix/bin/lazyports" && test -x "$HOME/go/bin/lazyports" && echo both)$(backup_count '')" both0
+lc_run "4\ny\n\n0\n" lazyports
+check "Lazyports uninstall: system-wide binary removed" test ! -e "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports uninstall: user-local binary removed" test ! -e "$HOME/go/bin/lazyports"
+check "Lazyports uninstall: backed up first" test -x "$(first_backup lazyports-2-lazyports)"
+check "Lazyports uninstall: shell startup file backed up and untouched" equals "$(<"$HOME/.bashrc")" "$(<"$(first_backup lazyports-1-bashrc)")"
+check "Lazyports uninstall: ezvps verifies the binary is gone" contains "$OUT" "Verified: the lazyports binary is gone."
+check "Lazyports uninstall: says the config files are left alone" contains "$OUT" "your config and shell startup files stay as they are"
+lc_scene lz-uninstall-home
+lc_seed_lazyports home
+lc_run "2\n\n4\ny\n\n0\n" lazyports
+check "Lazyports installed only in ~/go/bin counts as installed" contains "$OUT" "Binary:     $HOME/go/bin/lazyports"
+check "Lazyports user-local install is removed on uninstall" test ! -e "$HOME/go/bin/lazyports"
+
+echo "-- lifecycle: modules never fail the menu"
+lc_scene never-fail
+for key in backpack ctunnel lazyports; do
+    lc_run "1\n" "$key"
+    check "${key}: EOF in the middle of an action still exits 0" equals "$RC" 0
+done
+lc_run "3\n\n4\n\n2\n\n0\n" backpack
+check "Backpack: update/uninstall/status on a machine without it all return to the submenu" equals "$RC" 0
+
+# leave the environment as the later sections expect it
+export HOME="$LC_SAVED_HOME"
+if [[ -n "$LC_SAVED_BACKUP" ]]; then export EZVPS_BACKUP_DIR="$LC_SAVED_BACKUP"; else unset EZVPS_BACKUP_DIR; fi
+unset EZVPS_TOOL_PREFIX EZVPS_BACKPACK_CONF_DIR FAKE_LOG FAKE_ARCH FAKE_SHA FAKE_INSTALLER FAKE_GO_VERSION
+
 echo "== source rules"
 # curl may appear only in the 3x-ui functions that need it; never in the L2TP
 # path, the menu or the main script body.
@@ -3203,6 +3888,10 @@ only_pinned_urls() {
             'https://nginx.org/packages/debian' | 'https://nginx.org/packages/ubuntu' | 'https://nginx.org/keys/nginx_signing.key') ;;
             # Certificates module: the pinned acme.sh script at a release tag, and its project page
             'https://github.com/${ACME_UPSTREAM}'* | 'https://raw.githubusercontent.com/${ACME_UPSTREAM}/${ACME_PINNED_TAG}/acme.sh') ;;
+            # Backpack / ctunnel / Lazyports: the projects, their pinned installers and the pinned ctunnel commit, and Go's install page (text only)
+            'https://github.com/${LC_BACKPACK_REPO}' | 'https://github.com/${LC_CTUNNEL_REPO}' | 'https://github.com/${LC_CTUNNEL_REPO}.git' | 'https://github.com/${LC_LAZYPORTS_REPO}') ;;
+            'https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh' | 'https://raw.githubusercontent.com/${LC_LAZYPORTS_REPO}/${LC_LAZYPORTS_COMMIT}/install.sh') ;;
+            'https://go.dev/doc/install') ;;
             # Certificates module: nginx syntax in the site template and text for the user, not network access
             'https://$host$request_uri;'* | 'https://\$host\$request_uri'* | 'https://${domain}/'* | 'http://${1};') ;;
             # Nginx module: upstream parsing/rendering, not network access
@@ -3212,13 +3901,28 @@ only_pinned_urls() {
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
     ((bad == 0))
 }
-check "curl is invoked only by the 3x-ui download/probe functions, the nginx.org key download and the pinned acme.sh download" equals "$(curl_functions "$EZVPS")" "acme_fetch_script() ngx_fetch_key() xui_fetch_installer() xui_probe() "
+check "curl is invoked only by the 3x-ui download/probe functions, the nginx.org key download, the pinned acme.sh download and the pinned Backpack/Lazyports installer download" equals "$(curl_functions "$EZVPS")" "acme_fetch_script() lc_fetch_installer() ngx_fetch_key() xui_fetch_installer() xui_probe() "
 check "ezvps never pipes a download into a shell" no_pipe_to_shell "$EZVPS"
 check "ezvps only knows the pinned upstream URL" only_pinned_urls "$EZVPS"
 check "ezvps has no URL for the private easyl2tp repo" not_contains "$(<"$EZVPS")" "raw.githubusercontent.com/<owner>"
 check "install.sh has no curl/wget" no_downloads "$INSTALL"
 check "install.sh never writes to an ezl2tp path" no_ezl2tp_writes "$INSTALL"
 check "ezvps never writes to an ezl2tp path" no_ezl2tp_writes "$EZVPS"
+lc_body() { awk '/^(lc_[a-z_]+|module_(backpack|ctunnel|lazyports))\(\)/ {on=1} on {print} /^}/ {on=0}' "$EZVPS"; }
+git_network_functions() {
+    awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""} !/^[[:space:]]*#/ && /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && /"\$\{g\[@\]\}"|git[[:space:]]+-/ {print (fn==""?"<top-level>":fn)}' "$1" | sort -u | tr '\n' ' '
+}
+reads_outside_menu() { # `read` in lc_* other than the submenu choice and the parsers of a tool's own output
+    awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""} !/^[[:space:]]*#/ && /(^|[[:space:];])read[[:space:]]+-/ && fn ~ /^lc_/ && fn != "lc_module()" && fn != "lc_version()" && fn != "lc_print_services()" {print fn": "$0}' "$EZVPS"
+}
+check "git fetches only inside lc_fetch_source (the pinned ctunnel commit)" equals "$(git_network_functions "$EZVPS")" "lc_fetch_source() "
+check "the ctunnel fetch allows https only" contains "$(<"$EZVPS")" "-c protocol.allow=never -c protocol.https.allow=always"
+check "the upstream installer runs with /dev/null as input (it must not open the tool)" contains "$(<"$EZVPS")" 'bash "${tmp}/install.sh" </dev/null'
+check "the lifecycle code asks for no token, link, password or key (no read outside the submenu and the yes/no helper)" equals "$(reads_outside_menu)" ""
+check "the lifecycle code never launches a tool with tunnel arguments" not_contains "$(lc_body | grep -E '"\$LC_BIN_FOUND"|\$1" "\$LC_VERSION_ARG"')" "-s "
+check "one shared submenu: the four labels are declared once" equals "$(grep -c '"Install" "Status" "Update" "Uninstall"' "$EZVPS")" 1
+check "the three module functions are one-line wrappers around the shared flow" equals "$(grep -cE '^module_(backpack|ctunnel|lazyports)\(\) \{ lc_module (backpack|ctunnel|lazyports); \}$' "$EZVPS")" 3
+check "Backpack and Lazyports installers are pinned (no main/master/HEAD in their URLs)" not_contains "$(grep -E '^[[:space:]]*LC_URL=' "$EZVPS")" "/main/"
 module_l2tp_body="$(awk '/^module_l2tp\(\)/,/^}/' "$EZVPS")"
 check "the L2TP module still has no download code" no_downloads <(printf '%s\n' "$module_l2tp_body")
 

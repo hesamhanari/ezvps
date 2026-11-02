@@ -29,6 +29,7 @@ rejected.
 | 3x-ui | yes | yes | yes | yes | yes |
 | Nginx (nginx.org stable 1.30+) | yes (`packages/debian`, `bookworm`) | yes (`packages/debian`, `trixie`) | yes (`packages/ubuntu`, `jammy`) | yes (`packages/ubuntu`, `noble`) | yes (`packages/ubuntu`, `resolute`) |
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
+| Backpack, ctunnel, Lazyports (x86_64 and aarch64 only) | yes | yes | yes | yes | yes |
 | L2TP | see below | yes | see below | see below | see below |
 
 **L2TP is gated separately.** The L2TP menu item launches the separate ezl2tp
@@ -37,9 +38,9 @@ currently **Debian 13 only**. ezvps does not port ezl2tp. On every other
 system in the table the L2TP item prints a clear message, installs and
 launches nothing, and returns to the menu.
 
-> **Status: v0.0.1 in development.** **L2TP**, **3x-ui**, **Nginx** and
-> **Certificates** work so far. The other menu items (Backpack, ctunnel, Lazyports,
-> SSH and Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
+> **Status: v0.0.1 in development.** **L2TP**, **3x-ui**, **Backpack**,
+> **ctunnel**, **Nginx**, **Certificates** and **Lazyports** work so far. The other
+> menu items (SSH and Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
 > they print "not implemented yet" and return to the menu. They arrive in
 > later releases, one module per PR. See [SPEC.md](SPEC.md).
 
@@ -130,6 +131,53 @@ Menu:
 > `3x-ui -> Change password` immediately.
 
 The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
+
+### Backpack, ctunnel and Lazyports
+
+`ezvps` -> `3`, `4` and `7` open the same submenu for each tool:
+
+```
+ 1) Install
+ 2) Status
+ 3) Update
+ 4) Uninstall
+ 0) Back
+```
+
+These three tools have **their own interface** (Backpack: an interactive CLI,
+ctunnel: a command-line tunnel program, Lazyports: a terminal UI). ezvps manages
+only their **lifecycle**. Tunnel setup, ports, tokens, setup links and every other
+setting stay in the tool's own interface: ezvps never rebuilds them, never asks for
+a tunnel token, setup link, password or key, and never prints, stores or logs one.
+After an install it only tells you how to open the tool; it does not launch it.
+
+The same rules apply to all three:
+
+* **Install** is refused, with nothing changed, outside the five supported systems
+  and outside `x86_64` / `aarch64`. If the tool is already installed it says so and
+  does not reinstall unless you say yes. It shows the official source and the pin,
+  asks, backs up any existing config and binary under `/var/backups/ezvps/`, and only
+  then runs upstream's documented install. Installer scripts are downloaded to a
+  temporary file, checked against a pinned SHA-256 and run with no terminal input
+  (never piped into a shell).
+* **Status** shows installed or not, the binary path, the version when the tool has a
+  documented version command, and whether its services run when upstream documents
+  any. Where there is no service it says so instead of inventing one.
+* **Update** uses only the tool's documented update method, after a config backup, and
+  reports the old and new version when the tool reports them. Where upstream documents
+  no update command it says so and offers a reinstall from the documented source.
+* **Uninstall** asks for confirmation, backs up the config, removes the tool through
+  its documented method and then verifies the binary is gone. Backups are never deleted.
+
+| Tool | Binary | Config backed up | Install (pinned) | Version | Services | Update | Uninstall |
+|------|--------|------------------|------------------|---------|----------|--------|-----------|
+| [Backpack](https://github.com/AminMGMT/BackPack) | `/usr/local/bin/backpack` | `/etc/backpack` | official `install.sh` at tag `v1.9.0` (SHA-256 checked); it downloads the latest release and verifies it against the release's `SHA256SUMS` | `backpack version` | `backpack-*.service` units (one per tunnel, plus monitor) | Backpack's own **Update** menu item (8): ezvps opens its menu for you to pick it | Backpack's own **Uninstall** menu item (9), same way |
+| [ctunnel](https://github.com/alienrobotarmy/ctunnel) | `/usr/local/bin/ctunnel` (+ man page) | `~/.passkey` | upstream has no installer or releases: its documented `make; make install` on one pinned commit (fetched with git) | `ctunnel -v` | none documented | none documented: ezvps says so and offers a reinstall | what `make uninstall` removes: the binary and the man page |
+| [Lazyports](https://github.com/v9mirza/lazyports) | `/usr/local/bin/lazyports` or `~/go/bin/lazyports` | none (`~/.bashrc` / `~/.zshrc`, which the installer may extend, are backed up) | official `install.sh` at one pinned commit (SHA-256 checked); needs Go 1.24+ and builds upstream's `main` with `go install` | none documented | none documented | none documented: ezvps says so and offers a reinstall | remove the binary, as upstream documents |
+
+Config backups are byte-for-byte copies that ezvps never reads or prints; they can
+contain a tunnel token or key, which is why `/var/backups/ezvps` is root-only. Details,
+pins and limits are in [SPEC.md](SPEC.md) sections 6.5 to 6.7.
 
 ### Nginx
 
@@ -257,7 +305,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx and Certificates against fakes, pending modules, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports against fakes, pending modules, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway VPS on each

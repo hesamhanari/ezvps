@@ -56,16 +56,25 @@ done
 # 3. Download rules.
 #    - ezvps may call curl only from the 3x-ui download/probe functions
 #      (xui_fetch_installer, xui_probe), the Nginx signing-key download
-#      (ngx_fetch_key) and the pinned acme.sh download (acme_fetch_script);
-#      never from L2TP or anywhere else.
+#      (ngx_fetch_key), the pinned acme.sh download (acme_fetch_script) and the
+#      pinned Backpack/Lazyports installer download (lc_fetch_installer); never
+#      from L2TP or anywhere else.
+#    - git may touch the network only in lc_fetch_source (the pinned ctunnel commit).
 #    - Nothing is ever piped or process-substituted from the network into a shell.
 #    - install.sh downloads nothing.
 bad_curl="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
     !/^[[:space:]]*#/ && /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/ {
-        if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()" && fn != "acme_fetch_script()") print NR": "$0 }' ezvps)"
+        if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()" && fn != "acme_fetch_script()" && fn != "lc_fetch_installer()") print NR": "$0 }' ezvps)"
 if [[ -n "$bad_curl" ]]; then
-    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe/ngx_fetch_key/acme_fetch_script:"
+    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe/ngx_fetch_key/acme_fetch_script/lc_fetch_installer:"
     printf '%s\n' "$bad_curl" >&2
+fi
+bad_git="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
+    !/^[[:space:]]*#/ && /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && /"\$\{g\[@\]\}"|git[[:space:]]+-/ {
+        if (fn != "lc_fetch_source()") print NR": "$0 }' ezvps)"
+if [[ -n "$bad_git" ]]; then
+    bad "ezvps: git network access outside lc_fetch_source:"
+    printf '%s\n' "$bad_git" >&2
 fi
 for f in ezvps install.sh; do
     if grep -vE '^[[:space:]]*#' "$f" | grep -qE '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|da)?sh|(ba)?sh[[:space:]]+<\(|(source|\.)[[:space:]]+<\('; then
@@ -98,6 +107,30 @@ fi
 # provider credentials, no certbot.
 if grep -vE '^[[:space:]]*#' ezvps | grep -qiE -- '--dns|dns_[a-z]+|CF_Token|api_?key|certbot'; then
     bad "ezvps: DNS validation, DNS provider credentials and certbot are out of scope for the Certificates module"
+fi
+# Backpack, ctunnel and Lazyports: every upstream is pinned (a release tag or a full
+# commit, plus a SHA-256 for the installer scripts), and the installer URLs are built
+# from the pin, never a branch.
+if ! grep -qE '^LC_BACKPACK_REPO="AminMGMT/BackPack"$' ezvps ||
+    ! grep -qE '^LC_BACKPACK_TAG="v[0-9]+\.[0-9]+\.[0-9]+"$' ezvps ||
+    ! grep -qE '^LC_BACKPACK_SHA256="[0-9a-f]{64}"$' ezvps ||
+    ! grep -qE '^LC_CTUNNEL_REPO="alienrobotarmy/ctunnel"$' ezvps ||
+    ! grep -qE '^LC_CTUNNEL_COMMIT="[0-9a-f]{40}"$' ezvps ||
+    ! grep -qE '^LC_LAZYPORTS_REPO="v9mirza/lazyports"$' ezvps ||
+    ! grep -qE '^LC_LAZYPORTS_COMMIT="[0-9a-f]{40}"$' ezvps ||
+    ! grep -qE '^LC_LAZYPORTS_SHA256="[0-9a-f]{64}"$' ezvps; then
+    bad "ezvps: the Backpack/ctunnel/Lazyports pins (repo, tag or commit, sha256) are missing or malformed"
+fi
+# shellcheck disable=SC2016 # the literal ${...} text of the URL lines in ezvps
+if ! grep -qF 'LC_URL="https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh"' ezvps ||
+    ! grep -qF 'LC_URL="https://raw.githubusercontent.com/${LC_LAZYPORTS_REPO}/${LC_LAZYPORTS_COMMIT}/install.sh"' ezvps ||
+    ! grep -qF 'LC_GIT_COMMIT="$LC_CTUNNEL_COMMIT"' ezvps; then
+    bad "ezvps: the Backpack/Lazyports installer URLs must be built from the pinned tag/commit, and ctunnel from its pinned commit"
+fi
+# The upstream installers run with no terminal input (Backpack's would open its menu).
+# shellcheck disable=SC2016 # the literal ${tmp} text in ezvps
+if ! grep -qF 'bash "${tmp}/install.sh" </dev/null' ezvps; then
+    bad "ezvps: the upstream installer must run with </dev/null so it can not open the tool"
 fi
 # Nginx must come from the nginx.org STABLE repository: the repo URL has no
 # "mainline", the key URL is https, the pin is priority 900, and the key
