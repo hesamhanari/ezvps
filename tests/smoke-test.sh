@@ -5,6 +5,8 @@
 
 # Helpers are invoked indirectly through `check`.
 # shellcheck disable=SC2329,SC2317
+# nginx variables ($host, $connection_upgrade, ...) appear as literal text in single quotes throughout.
+# shellcheck disable=SC2016
 
 set -uo pipefail
 
@@ -164,7 +166,7 @@ check "'ezvps l2tp' without ezl2tp exits 0" equals "$RC" 0
 
 echo "== not-yet-implemented modules"
 for i in "${!KEYS[@]}"; do
-    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" ]] && continue
+    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" ]] && continue
     n=$((i + 1))
     label="${LABELS[$i]}"
     run_ezvps "$STUB_BIN" "${n}\n\n0\n"
@@ -459,6 +461,12 @@ case "$url" in
         echo "curl DOWNLOAD $url" >>"$FAKE_LOG"
         [[ "${FAKE_DOWNLOAD_FAIL:-0}" == "1" ]] && exit 22
         cp "$WORK_FAKE_INSTALLER" "$out"
+        exit 0 ;;
+    */acme.sh)
+        echo "curl ACME $url" >>"$FAKE_LOG"
+        [[ "$*" == *"--proto =https"* && "$*" == *"--tlsv1.2"* ]] || echo "curl ACME-INSECURE" >>"$FAKE_LOG"
+        [[ "${FAKE_DOWNLOAD_FAIL:-0}" == "1" ]] && exit 22
+        cp "$FAKE_ACME_SCRIPT" "$out"
         exit 0 ;;
     https://nginx.org/keys/nginx_signing.key)
         echo "curl KEY $url" >>"$FAKE_LOG"
@@ -1029,11 +1037,17 @@ new_ngx() {
     export FAKE_NGX_VERSION="1.30.2" FAKE_TOOLS_DIR="$NGX_BOX" NGX_BOX_DIR="$NGX_BOX"
     rm -f "$NGX_BOX/nginx" "$NGX_BOX_NOTOOLS/nginx" "$NGX_BOX_NOTOOLS/curl" "$NGX_BOX_NOTOOLS/gpg"
 }
-# nginx.conf fixture shaped like Debian's: mk_nginx_conf [1|0] (0 = the conf.d
-# include is missing; only a commented-out one remains)
+# nginx.conf fixture shaped like Debian's: mk_nginx_conf [1|0] [1|0]
+#   1st: 0 = the conf.d include is missing; only a commented-out one remains
+#   2nd: 0 = no `map $http_upgrade $connection_upgrade` (default 1 = present, so
+#        the older Nginx tests see exactly one config test per change; the
+#        "connection map" section uses 0 to test the insertion)
 mk_nginx_conf() {
     {
         printf '%s\n' "user www-data;" "events {" "    worker_connections 768;" "}" "http {" "    sendfile on;" "    include $EZVPS_NGINX_DIR/mime.types;"
+        if [[ "${2:-1}" == "1" ]]; then
+            printf '%s\n' '    map $http_upgrade $connection_upgrade {' "        default upgrade;" "        ''      close;" "    }"
+        fi
         if [[ "${1:-1}" == "1" ]]; then
             printf '%s\n' "    include $EZVPS_NGINX_DIR/conf.d/*.conf;"
         else
@@ -1571,7 +1585,7 @@ check "add: config test ran" equals "$(nlog_count '^nginx -t$')" 1
 check "add: config test ran BEFORE the reload" runs_before '^nginx -t$' '^systemctl reload nginx$'
 check "add: nginx reloaded once" equals "$(nlog_count '^systemctl reload nginx$')" 1
 check "add: no restart" equals "$(nlog_count '^systemctl restart')" 0
-check "add: tells the user to use Certificates for HTTPS" contains "$OUT" "use the Certificates module once it"
+check "add: tells the user to use Certificates for HTTPS" contains "$OUT" "use Certificates -> Issue certificate"
 check "add: says HTTP only" contains "$OUT" "HTTP only"
 check "add: warns that nothing listens on the upstream yet" contains "$OUT" "Nothing is listening on 127.0.0.1:3000"
 check "add: nothing existed, so no site backup" equals "$(ngx_backups example.com)" 0
@@ -1963,6 +1977,907 @@ check "migration then remove: the moved site can be removed" test ! -e "$(CF a.e
 check "migration then remove: ...with a backup" equals "$(ngx_backups a.example.com)" 1
 check "migration then remove: the other moved site stays" test -f "$(CF b.example.com)"
 
+echo "== Nginx site template and connection map (fake nginx, no network)"
+
+# new_ngx's default nginx.conf already carries the map; these scenarios use one without it.
+cnt() { grep -cF -- "$2" "$1"; }
+tree_sum() { (cd "$1" && find . -type f -print0 | sort -z | xargs -0 cksum | cksum); }
+map_line() { grep -n 'map \$http_upgrade \$connection_upgrade' "$1" | head -n1 | cut -d: -f1; }
+inc_line() { grep -nE "$INC_RE" "$1" | head -n1 | cut -d: -f1; }
+map_before_include() { local m i; m="$(map_line "$1")"; i="$(inc_line "$1")"; [[ -n "$m" && -n "$i" ]] && ((m < i)); }
+nginx_conf_backups() { find "$EZVPS_BACKUP_DIR" -maxdepth 1 -type f -name "nginx.conf-map.*" 2>/dev/null | wc -l; }
+first_t_state() { grep -m1 '^nginx-t-state' "$FAKE_LOG"; }
+
+echo "-- the site template"
+new_ngx tpl
+ngx_up
+mk_nginx_conf 1 0
+cp "$EZVPS_NGINX_DIR/nginx.conf" "$SCN/nginx-conf-original"
+run_ezvps "$NGX_BOX_INST" "${N}5\ntpl.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+F="$(CF tpl.example.com)"
+check "template: one file per domain in conf.d" test -f "$F"
+check "template: markers kept (managed, domain, upstream)" file_has "$F" "# ezvps:upstream=127.0.0.1:3000"
+check "template: listens on 80" file_has "$F" "    listen 80;"
+check "template: server_name" file_has "$F" "    server_name tpl.example.com;"
+check "template: client_max_body_size 64M" file_has "$F" "    client_max_body_size 64M;"
+check "template: location / with proxy_pass to the upstream" file_has "$F" "        proxy_pass http://127.0.0.1:3000;"
+check "template: location / block" file_has "$F" "    location / {"
+check "template: proxy_http_version 1.1" file_has "$F" "        proxy_http_version 1.1;"
+{
+    check "template: Host" file_has "$F" '        proxy_set_header Host $host;'
+    check "template: X-Real-IP" file_has "$F" '        proxy_set_header X-Real-IP $remote_addr;'
+    check "template: X-Forwarded-For" file_has "$F" '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
+    check "template: X-Forwarded-Proto" file_has "$F" '        proxy_set_header X-Forwarded-Proto $scheme;'
+    check "template: X-Forwarded-Port" file_has "$F" '        proxy_set_header X-Forwarded-Port $server_port;'
+    check "template: Upgrade" file_has "$F" '        proxy_set_header Upgrade $http_upgrade;'
+    check "template: Connection comes from the map variable" file_has "$F" '        proxy_set_header Connection $connection_upgrade;'
+}
+check "template: Connection is NOT hardcoded to upgrade" file_lacks "$F" 'Connection "upgrade"'
+check "template: proxy_connect_timeout 60s" file_has "$F" "        proxy_connect_timeout 60s;"
+check "template: proxy_read_timeout 120s" file_has "$F" "        proxy_read_timeout 120s;"
+check "template: proxy_send_timeout 120s" file_has "$F" "        proxy_send_timeout 120s;"
+check "template: plain HTTP form has no TLS and no 443" equals "$(grep -cE 'ssl|443|http2|return 301' "$F")" 0
+
+echo "-- the connection map in nginx.conf"
+check "map: added to nginx.conf" contains "$(<"$EZVPS_NGINX_DIR/nginx.conf")" 'map $http_upgrade $connection_upgrade {'
+check "map: default upgrade" contains "$(<"$EZVPS_NGINX_DIR/nginx.conf")" "        default upgrade;"
+check "map: empty string maps to close" contains "$(<"$EZVPS_NGINX_DIR/nginx.conf")" "        ''      close;"
+check "map: exactly once" equals "$(cnt "$EZVPS_NGINX_DIR/nginx.conf" 'map $http_upgrade $connection_upgrade')" 1
+check "map: inside the http block, before the conf.d include" map_before_include "$EZVPS_NGINX_DIR/nginx.conf"
+check "map: nginx.conf backed up first, byte for byte" cmp -s "$SCN/nginx-conf-original" "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -type f -name 'nginx.conf-map.*' | head -n1)"
+check "map: exactly one backup" equals "$(nginx_conf_backups)" 1
+check "map: the rest of nginx.conf is unchanged" equals "$(grep -vcE 'upgrade|close;|added by ezvps|^    \}$' "$EZVPS_NGINX_DIR/nginx.conf")" "$(grep -vcE 'upgrade|close;|added by ezvps|^    \}$' "$SCN/nginx-conf-original")"
+check "map: config test ran after adding it, before the site existed" contains "$(first_t_state)" "confd=0"
+check "map: second config test ran for the site" equals "$(nlog_count '^nginx -t$')" 2
+check "map: reload only after both tests" runs_before '^nginx-t-state enabled=0 confd=1' '^systemctl reload nginx$'
+check "map: reloaded once" equals "$(nlog_count '^systemctl reload nginx$')" 1
+check "map: says it added the map" contains "$OUT" "Added the connection map to"
+run_ezvps "$NGX_BOX_INST" "${N}5\ntpl2.example.com\n127.0.0.1:3001\n\n0\n\n0\n"
+check "map: a second site does not duplicate the map" equals "$(cnt "$EZVPS_NGINX_DIR/nginx.conf" 'map $http_upgrade $connection_upgrade')" 1
+check "map: a second site makes no further nginx.conf backup" equals "$(nginx_conf_backups)" 1
+check "map: a second site only needs its own config test" equals "$(nlog_count '^nginx -t$')" 3
+
+new_ngx map_other
+ngx_up
+mk_nginx_conf 1 0
+printf '%s\n' 'map $http_upgrade $connection_upgrade {' "    default upgrade;" "    ''      close;" "}" >"$(CF websocket-map)"
+cp "$EZVPS_NGINX_DIR/nginx.conf" "$SCN/nginx-conf-original"
+run_ezvps "$NGX_BOX_INST" "${N}5\nm.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "map defined in another conf.d file: not added to nginx.conf" cmp -s "$SCN/nginx-conf-original" "$EZVPS_NGINX_DIR/nginx.conf"
+check "map defined in another conf.d file: no nginx.conf backup" equals "$(nginx_conf_backups)" 0
+check "map defined in another conf.d file: site still added" test -f "$(CF m.example.com)"
+new_ngx map_legacy
+ngx_up
+mk_nginx_conf 1 0
+printf '%s\n' 'map $http_upgrade $connection_upgrade { default upgrade; "" close; }' >"$(AV wsmap)"
+ln -s "$(AV wsmap)" "$(EN wsmap)"
+run_ezvps "$NGX_BOX_INST" "${N}5\nm.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "map defined in a (legacy) sites-enabled file: not duplicated" equals "$(nginx_conf_backups)" 0
+new_ngx map_comment
+ngx_up
+mk_nginx_conf 1 0
+sed -i 's|^    sendfile on;|    #map $http_upgrade $connection_upgrade { default upgrade; }\n    sendfile on;|' "$EZVPS_NGINX_DIR/nginx.conf"
+run_ezvps "$NGX_BOX_INST" "${N}5\nm.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "a commented-out map is not mistaken for a real one" equals "$(grep -cE '^[[:space:]]+map ' "$EZVPS_NGINX_DIR/nginx.conf")" 1
+new_ngx map_noinc
+ngx_up
+mk_nginx_conf 0 0
+run_ezvps "$NGX_BOX_INST" "${N}5\nm.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "missing include and map: both added, once each" equals "$(cnt "$EZVPS_NGINX_DIR/nginx.conf" 'map $http_upgrade $connection_upgrade')" 1
+check "missing include and map: include still added" has_include "$EZVPS_NGINX_DIR/nginx.conf"
+check "missing include and map: three config tests (include, map, site)" equals "$(nlog_count '^nginx -t$')" 3
+check "missing include and map: two different nginx.conf backups" equals "$(bk_count 'nginx.conf*')" 2
+new_ngx map_fail
+ngx_up
+mk_nginx_conf 1 0
+cp "$EZVPS_NGINX_DIR/nginx.conf" "$SCN/nginx-conf-original"
+FAKE_NGX_FAIL_NTH=1
+run_ezvps "$NGX_BOX_INST" "${N}5\nm.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "failing config test after adding the map: reported" contains "$OUT" "config test FAILED after adding the connection map"
+check "failing config test after adding the map: nginx.conf restored byte for byte" cmp -s "$SCN/nginx-conf-original" "$EZVPS_NGINX_DIR/nginx.conf"
+check "failing config test after adding the map: no site written" test ! -e "$(CF m.example.com)"
+check "failing config test after adding the map: nginx NOT reloaded" no_mutation
+check "failing config test after adding the map: menu survives" equals "$RC" 0
+new_ngx map_nohttp
+ngx_up
+printf '%s\n' "events {" "}" >"$EZVPS_NGINX_DIR/nginx.conf"
+run_ezvps "$NGX_BOX_INST" "${N}5\nh.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "map without an http block: explained, nothing guessed" contains "$OUT" "Found no http block"
+
+echo "-- List sites shows the proxy_pass upstream of every file"
+new_ngx lsp
+ngx_up
+mk_ezvps_site mine.example.com 127.0.0.1:3000
+mk_foreign_proxy() { # mk_foreign_proxy <file> <server_name> <proxy_pass target>
+    printf '%s\n' "server {" "    listen 80;" "    server_name $2;" "    location / {" "        proxy_pass $3;" "    }" "}" >"$(CF "$1")"
+}
+mk_foreign_proxy hand 'hand.example.com' 'http://127.0.0.1:8080'
+mk_foreign_proxy api 'api.example.com' 'http://backend.internal:9000/api/;  # trailing comment'
+mk_foreign_proxy secure 'secure.example.com' 'https://192.0.2.9:8443'
+printf '%s\n' "server {" "    server_name multi.example.com;" "    location /a { proxy_pass http://127.0.0.1:1111; }" "    location /b { proxy_pass http://127.0.0.1:2222; }" "    location /c { proxy_pass http://127.0.0.1:1111; }" "}" >"$(CF multi)"
+printf '%s\n' "server {" "    server_name oneline.example.com;" "    location / { proxy_pass http://127.0.0.1:7000; }" "}" >"$(CF oneline)"
+printf '%s\n' "server {" "    server_name static.example.com;" "    return 200 'hello';" "}" >"$(CF static)"
+printf '%s\n' "server {" "    server_name commented.example.com;" "    # proxy_pass http://127.0.0.1:9999;" "    return 200 'x';" "}" >"$(CF commented)"
+printf '%s\n' "# Managed by ezvps (Nginx module). fixture" "# ezvps:domain=nolocation.example.com" "# ezvps:upstream=127.0.0.1:5555" "server {" "    server_name nolocation.example.com;" "    return 200 'x';" "}" >"$(CF nolocation)"
+printf '%s\n' "# Managed by ezvps (Nginx module). fixture" "# ezvps:domain=edited.example.com" "# ezvps:upstream=127.0.0.1:5555" "server {" "    server_name edited.example.com;" "    location / { proxy_pass http://127.0.0.1:6666; }" "}" >"$(CF edited)"
+SUM_TREE="$(tree_sum "$EZVPS_NGINX_DIR")"
+run_ezvps "$NGX_BOX_INST" "${N}4\n\n0\n\n0\n"
+check "list: ezvps site shows its upstream" has_row "$OUT" 'mine\.example\.com\.conf +mine\.example\.com +127\.0\.0\.1:3000 +ezvps$'
+check "list: a hand-written site shows its proxy_pass" has_row "$OUT" 'hand\.conf +hand\.example\.com +127\.0\.0\.1:8080 +not ezvps$'
+check "list: path and trailing comment: upstream without http://" has_row "$OUT" 'api\.conf +api\.example\.com +backend\.internal:9000/api/ +not ezvps$'
+check "list: an https upstream keeps its scheme" has_row "$OUT" 'secure\.conf +secure\.example\.com +https://192\.0\.2\.9:8443 +not ezvps$'
+check "list: several upstreams: the first plus a count of the other distinct ones" has_row "$OUT" 'multi\.conf +multi\.example\.com +127\.0\.0\.1:1111 \(\+1 more\) +not ezvps$'
+check "list: proxy_pass on a one-line location is found" has_row "$OUT" 'oneline\.conf +oneline\.example\.com +127\.0\.0\.1:7000 +not ezvps$'
+check "list: no proxy_pass: dash" has_row "$OUT" 'static\.conf +static\.example\.com +- +not ezvps$'
+check "list: a commented-out proxy_pass is ignored" has_row "$OUT" 'commented\.conf +commented\.example\.com +- +not ezvps$'
+check "list: an ezvps file without proxy_pass falls back to its marker" has_row "$OUT" 'nolocation\.conf +nolocation\.example\.com +127\.0\.0\.1:5555 +ezvps$'
+check "list: the real proxy_pass wins over a stale marker" has_row "$OUT" 'edited\.conf +edited\.example\.com +127\.0\.0\.1:6666 +ezvps$'
+check "list: CREATED BY is only ezvps or not ezvps" equals "$(printf '%s\n' "$OUT" | grep -E '\.conf ' | grep -cvE ' (ezvps|not ezvps)$')" 0
+check "list: read-only (no file in nginx dir changed)" equals "$(tree_sum "$EZVPS_NGINX_DIR")" "$SUM_TREE"
+check "list: read-only (no backup, no reload, no config test)" equals "$(bk_count '*')$(nlog_count '^systemctl')$(nlog_count '^nginx -t$')" "000"
+check "list: exit 0" equals "$RC" 0
+new_ngx lsp_new
+ngx_up
+run_ezvps "$NGX_BOX_INST" "${N}5\nnew.example.com\n127.0.0.1:3000\n\n4\n\n0\n\n0\n"
+check "list: a site made with the new template shows its upstream" has_row "$OUT" 'new\.example\.com\.conf +new\.example\.com +127\.0\.0\.1:3000 +ezvps$'
+
+echo "== Certificates module (fake acme.sh/openssl/crontab/nginx, no network, no real certificates)"
+
+ACME_TAG="$(grep -oE '^ACME_PINNED_TAG="[^"]+"' "$EZVPS" | cut -d'"' -f2)"
+ACME_SHA="$(grep -oE '^ACME_SCRIPT_SHA256="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
+matches() { [[ "$1" =~ $2 ]]; }
+check "pinned acme.sh tag is declared (X.Y.Z)" matches "$ACME_TAG" '^[0-9]+\.[0-9]+\.[0-9]+$'
+check "pinned acme.sh sha256 is declared" test "${#ACME_SHA}" -eq 64
+ACME_URL="https://raw.githubusercontent.com/acmesh-official/acme.sh/${ACME_TAG}/acme.sh"
+
+# fake acme.sh: also the "downloaded" script. `--install` copies itself to --home. A "certificate" is a
+# text file with a notAfter= line, so the fake openssl can read it; the "private key" is a marker that
+# must never appear in ezvps' output. Like the real acme.sh, --install-cert writes with the default umask.
+mkstub "$WORK/fake-acme.sh" <<'EOF'
+home="" cmd="" dom="" fullchain="" keyfile="" reload="" server="" nginxmode=0 nocron=0
+args=("$@")
+while (($# > 0)); do
+    case "$1" in
+        --install) cmd=install ;;
+        --issue) cmd=issue ;;
+        --install-cert) cmd=install-cert ;;
+        --renew-all) cmd=renew-all ;;
+        --remove) cmd=remove ;;
+        --list) cmd=list ;;
+        --version) cmd=version ;;
+        --home) home="$2"; shift ;;
+        -d) dom="$2"; shift ;;
+        --nginx) nginxmode=1 ;;
+        --server) server="$2"; shift ;;
+        --fullchain-file) fullchain="$2"; shift ;;
+        --key-file) keyfile="$2"; shift ;;
+        --reloadcmd) reload="$2"; shift ;;
+        --nocron) nocron=1 ;;
+    esac
+    shift
+done
+echo "acme.sh ${args[*]}" >>"$FAKE_LOG"
+[[ -n "$home" ]] || home="$HOME/.acme.sh"
+serial() { local n=0; [[ -f "$home/serial" ]] && n="$(<"$home/serial")"; n=$((n + 1)); echo "$n" >"$home/serial"; echo "$n"; }
+write_cert() { # write_cert <dir> <domain> <label>
+    printf 'FAKE-CERTIFICATE %s serial=%s\nnotAfter=%s\n' "$2" "$3" "${FAKE_ACME_NOTAFTER:-Jan  1 00:00:00 2099 GMT}" >"$1/fullchain.cer"
+    printf 'FAKE-KEY-DO-NOT-PRINT %s serial=%s\n' "$2" "$3" >"$1/$2.key"
+}
+case "$cmd" in
+    install)
+        [[ "${FAKE_ACME_INSTALL_FAIL:-0}" == 1 ]] && { echo "[fake] cannot install" >&2; exit 1; }
+        mkdir -p "$home"
+        cp "$0" "$home/acme.sh"
+        chmod +x "$home/acme.sh"
+        echo "[fake] Installed to $home/acme.sh"
+        ((nocron == 0)) && echo "13 5 * * * \"$home\"/acme.sh --cron --home \"$home\" > /dev/null" >>"$FAKE_CRONTAB"
+        exit 0 ;;
+    version)
+        [[ "${FAKE_ACME_VERSION_FAIL:-0}" == 1 ]] && { echo "[fake] broken" >&2; exit 1; }
+        echo "https://github.com/acmesh-official/acme.sh"
+        echo "v${FAKE_ACME_VERSION:-3.1.6}"
+        exit 0 ;;
+    issue)
+        ((nginxmode == 1)) || { echo "[fake] only --nginx mode is supported" >&2; exit 1; }
+        [[ "$server" == letsencrypt ]] || { echo "[fake] unexpected CA '$server'" >&2; exit 1; }
+        [[ "${FAKE_ACME_ISSUE_FAIL:-0}" == 1 ]] && { echo "[fake] Verify error: DNS problem for $dom"; exit 1; }
+        if [[ -f "$home/$dom/fullchain.cer" && "${FAKE_ACME_FORCE:-0}" != 1 ]]; then
+            echo "[fake] Domain $dom is not due for renewal, skipping. Add --force to force renewal."
+            exit 2
+        fi
+        mkdir -p "$home/$dom"
+        write_cert "$home/$dom" "$dom" "$(serial)"
+        if [[ "${FAKE_ACME_LEAK_KEY:-0}" == 1 ]]; then
+            printf '%s%s\n' '-----BEGIN ' 'PRIVATE KEY-----'
+            echo "FAKE-KEY-DO-NOT-PRINT-LEAKED"
+            printf '%s%s\n' '-----END ' 'PRIVATE KEY-----'
+        fi
+        echo "[fake] Cert success for $dom."
+        exit 0 ;;
+    install-cert)
+        [[ "${FAKE_ACME_INSTALLCERT_FAIL:-0}" == 1 ]] && { echo "[fake] install-cert failed" >&2; exit 1; }
+        [[ -f "$home/$dom/fullchain.cer" ]] || { echo "[fake] $dom is not an issued domain" >&2; exit 1; }
+        printf '%s\n' "$(<"$home/$dom/fullchain.cer")" >"$fullchain"
+        printf '%s\n' "$(<"$home/$dom/$dom.key")" >"$keyfile"
+        printf '%s|%s|%s\n' "$dom" "$fullchain" "$keyfile" >>"$home/installed.db"
+        echo "[fake] Installing cert to $fullchain (reload: ${reload:+set})"
+        exit 0 ;;
+    list)
+        printf 'Main_Domain\tKeyLength\tSAN_Domains\tProfile\tCA\tCreated\tRenew\n'
+        exit 0 ;;
+    renew-all)
+        [[ "${FAKE_ACME_RENEW_FAIL:-0}" == 1 ]] && { echo "[fake] renew error" >&2; exit 1; }
+        for d in ${FAKE_ACME_RENEW:-}; do
+            [[ -f "$home/$d/fullchain.cer" ]] || continue
+            write_cert "$home/$d" "$d" "renewed-$(serial)"
+            if [[ -f "$home/installed.db" ]]; then
+                while IFS='|' read -r idom ifull ikey; do
+                    [[ "$idom" == "$d" && -d "${ifull%/*}" ]] || continue
+                    printf '%s\n' "$(<"$home/$d/fullchain.cer")" >"$ifull"
+                    printf '%s\n' "$(<"$home/$d/$d.key")" >"$ikey"
+                done <"$home/installed.db"
+            fi
+            echo "[fake] Renewed: $d"
+        done
+        echo "[fake] renew-all finished"
+        exit 0 ;;
+    remove)
+        [[ "${FAKE_ACME_REMOVE_FAIL:-0}" == 1 ]] && { echo "[fake] remove failed" >&2; exit 1; }
+        [[ -d "$home/$dom" ]] || { echo "[fake] $dom is not an issued domain, skipping."; exit 1; }
+        echo "$dom" >>"$home/removed.db"
+        echo "[fake] $dom removed from the renewal list."
+        exit 0 ;;
+    *) echo "acme.sh UNEXPECTED ${args[*]}" >>"$FAKE_LOG"; exit 1 ;;
+esac
+EOF
+
+# fake openssl: only `x509 -enddate -noout -in <file>`, reading the fake certificate's notAfter= line
+mkstub "$STUBS/openssl" <<'EOF'
+file="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "-in" ]] && file="$a"
+    prev="$a"
+done
+[[ "${1:-}" == x509 && -f "$file" ]] || exit 1
+while IFS= read -r l; do
+    [[ "$l" == notAfter=* ]] && { echo "$l"; exit 0; }
+done <"$file"
+exit 1
+EOF
+# fake crontab: only `-l`; the "crontab" is the file $FAKE_CRONTAB
+mkstub "$STUBS/crontab" <<'EOF'
+if [[ "${1:-}" == "-l" ]]; then
+    [[ -s "$FAKE_CRONTAB" ]] || { echo "no crontab for root" >&2; exit 1; }
+    while IFS= read -r l; do printf '%s\n' "$l"; done <"$FAKE_CRONTAB"
+    exit 0
+fi
+echo "crontab UNEXPECTED $*" >>"$FAKE_LOG"
+exit 1
+EOF
+
+# Sandboxes: coreutils plus the named stubs only
+mkbox() { # mkbox <dir> <stub names...>
+    local dir="$1" c
+    shift
+    mkdir -p "$dir"
+    for c in "$CORE_BIN"/*; do ln -s "$c" "$dir/${c##*/}"; done
+    for c in "$@"; do ln -s "$STUBS/$c" "$dir/$c"; done
+}
+CB="$WORK/cert-box"
+CB_NOCRON="$WORK/cert-box-nocron"
+CB_NOSSL="$WORK/cert-box-nossl"
+CB_NOCURL="$WORK/cert-box-nocurl"
+CB_NONGINX="$WORK/cert-box-nonginx"
+mkbox "$CB" systemctl ss apt-get apt-cache dpkg-query curl gpg nginx sha256sum openssl crontab
+mkbox "$CB_NOCRON" systemctl ss apt-get apt-cache dpkg-query curl gpg nginx sha256sum openssl
+mkbox "$CB_NOSSL" systemctl ss apt-get apt-cache dpkg-query curl gpg nginx sha256sum crontab
+mkbox "$CB_NOCURL" systemctl ss apt-get apt-cache dpkg-query gpg nginx sha256sum openssl crontab
+mkbox "$CB_NONGINX" systemctl ss apt-get apt-cache dpkg-query curl gpg sha256sum openssl crontab
+
+# new_cert <name>: nginx installed and running, acme.sh NOT installed, no certificates
+new_cert() {
+    new_ngx "cert-$1"
+    ngx_up
+    export EZVPS_ACME_HOME="$SCN/acme-home" EZVPS_CERT_DIR="$SCN/ssl-ezvps"
+    export FAKE_CRONTAB="$SCN/crontab" FAKE_ACME_SCRIPT="$WORK/fake-acme.sh" FAKE_SHA="$ACME_SHA"
+    export FAKE_LISTEN="$PORT_UP" SBOX_NOCURL_DIR="$CB_NOCURL"
+    export FAKE_ACME_INSTALL_FAIL=0 FAKE_ACME_VERSION_FAIL=0 FAKE_ACME_ISSUE_FAIL=0 FAKE_ACME_INSTALLCERT_FAIL=0
+    export FAKE_ACME_RENEW="" FAKE_ACME_RENEW_FAIL=0 FAKE_ACME_REMOVE_FAIL=0 FAKE_ACME_FORCE=0 FAKE_ACME_LEAK_KEY=0
+    export FAKE_ACME_NOTAFTER="Jan  1 00:00:00 2099 GMT"
+    : >"$FAKE_CRONTAB"
+}
+# acme_present: acme.sh is installed and has its cron entry, as after a normal install
+acme_present() {
+    mkdir -p "$EZVPS_ACME_HOME"
+    cp "$FAKE_ACME_SCRIPT" "$EZVPS_ACME_HOME/acme.sh"
+    chmod +x "$EZVPS_ACME_HOME/acme.sh"
+    echo "13 5 * * * \"$EZVPS_ACME_HOME\"/acme.sh --cron --home \"$EZVPS_ACME_HOME\" > /dev/null" >"$FAKE_CRONTAB"
+    return 0
+}
+C6="6\n"
+# cert_run <choices after 'Certificates'> [path-dir]: Certificates, the choices, then back and exit
+cert_run() { run_ezvps "${2:-$CB}" "${C6}$1\n\n0\n\n0\n"; }
+CD() { printf '%s' "$EZVPS_CERT_DIR/$1"; }
+KEYF() { printf '%s' "$EZVPS_CERT_DIR/$1/privkey.pem"; }
+CRTF() { printf '%s' "$EZVPS_CERT_DIR/$1/fullchain.pem"; }
+mode_of() { stat -c %a "$1"; }
+acme_calls() { nlog_count "^acme.sh $1"; }
+cert_backups() { find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name "cert-$1.*" 2>/dev/null | wc -l; }
+cert_backup() { find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name "cert-$1.*" | head -n1; }
+no_acme_run() { [[ "$(nlog_count '^acme.sh ')" -eq 0 ]]; }
+no_cert_store() { [[ ! -e "$EZVPS_CERT_DIR" ]] || dir_empty_or_missing "$EZVPS_CERT_DIR"; }
+not_installed_acme() { [[ ! -e "$EZVPS_ACME_HOME/acme.sh" ]]; }
+never_leaks() { # never_leaks <output>: no key marker, no key file contents
+    [[ "$1" != *"FAKE-KEY-DO-NOT-PRINT"* && "$1" != *"PRIVATE KEY-----"* ]]
+}
+
+echo "-- submenu"
+new_cert menu
+run_ezvps "$CB" "${C6}0\n\n0\n"
+for line in " 1) Install acme.sh" " 2) Issue certificate" " 3) List certificates" " 4) Renew certificates" " 5) Remove certificate" " 0) Back"; do
+    check "certificates submenu line '${line}' is exact (clean label)" has_line "$OUT" "$line"
+done
+check "Back returns to the main menu" at_least_menus "$OUT" 2
+check "submenu exits 0" equals "$RC" 0
+run_ezvps "$CB" "${C6}abc\n\n0\n\n0\n"
+check "invalid submenu input is reported" contains "$OUT" "Invalid choice: abc"
+check "invalid submenu input keeps the menu alive" equals "$RC" 0
+run_ezvps "$CB" "$C6"
+check "EOF inside the submenu exits 0" equals "$RC" 0
+run_ezvps "$CB" "" certs
+check "'ezvps certs' opens the submenu" contains "$OUT" " 5) Remove certificate"
+check "Certificates is no longer reported as not implemented" not_contains "$OUT" "Certificates is not implemented yet"
+
+echo "-- install acme.sh"
+new_cert inst
+cert_run "1\ny"
+check "plan: names the official project" contains "$OUT" "https://github.com/acmesh-official/acme.sh"
+check "plan: shows the pinned tag" contains "$OUT" "version:  ${ACME_TAG} (pinned release tag)"
+check "plan: shows the exact source URL" contains "$OUT" "from:     ${ACME_URL}"
+check "plan: the URL is a tag, never a branch" not_contains "$OUT" "/master/acme.sh"
+check "plan: shows the expected sha256" contains "$OUT" "$ACME_SHA"
+check "plan: never piped into a shell" contains "$OUT" "never piped into a shell"
+check "plan: only the script, no DNS API plugins" contains "$OUT" "no DNS API"
+check "script downloaded exactly once from the pinned URL" has_line "$(log)" "curl ACME ${ACME_URL}"
+check "download uses --proto =https --tlsv1.2" equals "$(nlog_count 'ACME-INSECURE')" 0
+check "installed with its own --install, our home, no shell-profile change" has_line "$(log)" "acme.sh --install --home ${EZVPS_ACME_HOME} --no-profile"
+check "cron is allowed when crontab exists (no --nocron)" equals "$(nlog_count '--nocron')" 0
+check "acme.sh is installed at the home" test -x "$EZVPS_ACME_HOME/acme.sh"
+check "the command is verified to work afterwards" contains "$OUT" "Verified: the acme.sh command works (v3.1.6, ${EZVPS_ACME_HOME}/acme.sh)"
+check "the cron entry was added by acme.sh" contains "$(<"$FAKE_CRONTAB")" "acme.sh --cron"
+check "an empty crontab needs no backup" equals "$(bk_count 'crontab-root.*')" 0
+check "nothing else is touched (no nginx call, no reload, no certificate store)" no_mutation
+check "no certificate store is created by the install" no_cert_store
+check "install exits 0" equals "$RC" 0
+cert_run "1\ny"
+check "re-run: already installed, not reinstalled" contains "$OUT" "acme.sh is already installed (${EZVPS_ACME_HOME}/acme.sh). Not reinstalling."
+check "re-run: no second download" equals "$(nlog_count '^curl ACME')" 1
+check "re-run: no second install" equals "$(acme_calls '.*--install ')" 1
+check "re-run: the command is verified again" contains "$OUT" "Verified: the acme.sh command works"
+new_cert inst_broken
+acme_present
+FAKE_ACME_VERSION_FAIL=1
+cert_run "1"
+check "an existing acme.sh that does not work is reported" contains "$OUT" "--version' did not work"
+check "...and still not reinstalled over" equals "$(nlog_count '^curl ACME')" 0
+new_cert inst_other
+mkdir -p "$SCN/path-bin"
+cp "$FAKE_ACME_SCRIPT" "$SCN/path-bin/acme.sh"
+chmod +x "$SCN/path-bin/acme.sh"
+ln -s "$SCN/path-bin/acme.sh" "$CB/acme.sh"
+cert_run "1"
+rm -f "$CB/acme.sh"
+check "an acme.sh found on PATH counts as installed" contains "$OUT" "acme.sh is already installed"
+check "an acme.sh on PATH: nothing downloaded" equals "$(nlog_count '^curl ACME')" 0
+new_cert inst_no
+cert_run "1\nn"
+check "declined: cancelled" contains "$OUT" "Cancelled. Nothing was changed."
+check "declined: nothing downloaded" equals "$(nlog_count '^curl ACME')" 0
+check "declined: acme.sh not installed" not_installed_acme
+new_cert inst_sha
+FAKE_SHA="0000000000000000000000000000000000000000000000000000000000000000"
+cert_run "1\ny"
+check "sha256 mismatch is refused" contains "$OUT" "SHA-256 mismatch for the downloaded acme.sh"
+check "sha256 mismatch: the script never ran" equals "$(acme_calls '')" 0
+check "sha256 mismatch: not installed" not_installed_acme
+check "sha256 mismatch: menu survives" equals "$RC" 0
+new_cert inst_dl
+FAKE_DOWNLOAD_FAIL=1
+cert_run "1\ny"
+check "download failure is reported" contains "$OUT" "Download failed: ${ACME_URL}"
+check "download failure: not installed, menu survives" equals "$(not_installed_acme && echo "$RC")" 0
+new_cert inst_fail
+FAKE_ACME_INSTALL_FAIL=1
+cert_run "1\ny"
+check "an acme.sh installer failure is reported" contains "$OUT" "The acme.sh installer failed"
+check "installer failure: no 'ready' message" not_contains "$OUT" "acme.sh is ready"
+check "installer failure: menu survives" equals "$RC" 0
+new_cert inst_nocron
+cert_run "1\ny" "$CB_NOCRON"
+check "no crontab: installed with --nocron" has_line "$(log)" "acme.sh --install --home ${EZVPS_ACME_HOME} --no-profile --nocron"
+check "no crontab: the plan warns there is no renewal job" contains "$OUT" "WITHOUT its daily renewal job"
+new_cert inst_cronbak
+printf '%s\n' "0 3 * * * /usr/local/bin/example-job" >"$FAKE_CRONTAB"
+cert_run "1\ny"
+check "an existing crontab is backed up first" file_has "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'crontab-root.*' | head -n1)" "0 3 * * * /usr/local/bin/example-job"
+check "the crontab backup is mode 600" equals "$(mode_of "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'crontab-root.*' | head -n1)")" 600
+new_cert inst_nocurl
+cert_run "1\nn" "$CB_NOCURL"
+check "missing curl is detected" contains "$OUT" "curl is not installed; it is needed to download acme.sh"
+check "declining the curl install changes nothing" contains "$OUT" "Cancelled. Nothing was changed."
+check "no apt-get call without consent" no_apt
+cert_run "1\ny\ny" "$CB_NOCURL"
+check "curl is installed only after a yes" contains "$(log)" "apt-get install -y -q curl"
+check "the install continues once curl is there" has_line "$(log)" "curl ACME ${ACME_URL}"
+new_cert inst_os
+OUT="$(printf '%b' "${C6}1\ny\n\n0\n\n0\n" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$CB" "$BASH_BIN" "$EZVPS" 2>&1)"
+RC=$?
+check "unsupported system is refused" contains "$OUT" "acme.sh install needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'"
+check "unsupported system: nothing downloaded or installed" equals "$(nlog_count '^curl ACME')$(acme_calls '')" "00"
+
+echo "-- issue certificate: preconditions (nothing may change)"
+new_cert iss_noacme
+mk_foreign_site example.com example.com
+cert_run "2"
+check "acme.sh missing: told to install it first" contains "$OUT" "acme.sh is not installed. Choose 'Install acme.sh' first."
+check "acme.sh missing: nothing stored" no_cert_store
+new_cert iss_nonginx
+acme_present
+rm -f "$FAKE_DPKG"
+cert_run "2" "$CB_NONGINX"
+check "nginx missing: told so" contains "$OUT" "Nginx is not installed."
+check "nginx missing: acme.sh never ran" no_acme_run
+new_cert iss_down
+acme_present
+ngx_down
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\ny"
+check "nginx not running: refused" contains "$OUT" "nginx is not running"
+check "nginx not running: acme.sh never ran" no_acme_run
+new_cert iss_port
+acme_present
+FAKE_LISTEN=""
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\ny"
+check "port 80 not reachable: refused" contains "$OUT" "Nothing is listening on port ${PORT_UP}"
+check "port 80 not reachable: acme.sh never ran" no_acme_run
+new_cert iss_inp
+acme_present
+mk_foreign_site example.com example.com
+for bad in "*.example.com" "a.example.com b.example.com" "a.example.com,b.example.com" "not a domain" "../etc" "localhost"; do
+    cert_run "2\n${bad}\ny"
+    check "input '${bad}' is rejected" equals "$([[ "$OUT" == *"Wildcard certificates need DNS validation"* || "$OUT" == *"Enter exactly one domain"* || "$OUT" == *"is not a valid domain name"* ]] && echo yes)" yes
+done
+check "rejected input: acme.sh never ran" no_acme_run
+cert_run "2\n\ny"
+check "empty input cancels" contains "$OUT" "Cancelled. Nothing was changed."
+new_cert iss_noserver
+acme_present
+cert_run "2\nnowhere.example.com\ny"
+check "a domain no nginx server block serves is refused" contains "$OUT" "No nginx server block serves nowhere.example.com"
+check "...with the next step" contains "$OUT" "Nginx -> Add site"
+check "...and acme.sh never ran, nothing stored" equals "$(no_acme_run && no_cert_store && echo ok)" ok
+new_cert iss_no
+acme_present
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\nn"
+check "the DNS requirement is printed before asking" contains "$OUT" "The DNS record of example.com must point to THIS server before issuing"
+check "port 80 reachability is mentioned" contains "$OUT" "port 80 must be"
+check "no DNS provider credentials are requested" contains "$OUT" "No DNS provider credentials are asked for or stored"
+check "declined: cancelled" contains "$OUT" "Cancelled. Nothing was changed."
+check "declined: acme.sh never ran" no_acme_run
+check "declined: nothing stored" no_cert_store
+check "nothing mentions a token, API key or secret to enter" equals "$([[ "$OUT" == *[Tt]oken* || "$OUT" == *"API key"* || "$OUT" == *secret* ]] && echo yes)" ""
+
+echo "-- issue certificate: certificate only (no ezvps site)"
+new_cert iss_only
+acme_present
+mk_foreign_site example.com example.com
+cp "$(CF example.com)" "$SCN/foreign-original"
+cert_run "2\nexample.com\ny"
+D="$(CD example.com)"
+check "issue: asked acme.sh for one domain, HTTP-01 through nginx, Let's Encrypt" has_line "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --issue -d example.com --nginx --server letsencrypt"
+check "issue: no DNS mode, no wildcard, no extra domain" equals "$(nlog_count '--dns|-d \*|-d [^ ]+ .*-d ')" 0
+check "issue: nginx config tested after acme.sh edited it" contains "$(log)" "nginx -t"
+check "issue: installed into the store with the documented file names" contains "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --install-cert -d example.com --fullchain-file ${D}/fullchain.pem --key-file ${D}/privkey.pem --reloadcmd nginx -t && systemctl reload nginx"
+check "store: certificate chain exists" test -s "$(CRTF example.com)"
+check "store: private key exists" test -s "$(KEYF example.com)"
+check "store: private key is mode 600 (root only)" equals "$(mode_of "$(KEYF example.com)")" 600
+check "store: certificate is mode 644" equals "$(mode_of "$(CRTF example.com)")" 644
+check "store: the domain directory is mode 700" equals "$(mode_of "$D")" 700
+check "store: the ezvps store directory is mode 700" equals "$(mode_of "$EZVPS_CERT_DIR")" 700
+check "store: keeps the certificate acme.sh issued" file_has "$(CRTF example.com)" "FAKE-CERTIFICATE example.com serial=1"
+check "output: the private key is never printed" never_leaks "$OUT"
+check "output: says where the key is, without showing it" contains "$OUT" "private key (mode 600, readable only by root; never shown)"
+check "output: shows the expiry" contains "$OUT" "expires: 2099-01-01"
+check "output: mentions the renewal job" contains "$OUT" "renews it automatically"
+check "no ezvps site: stored only, and says so" contains "$OUT" "There is no ezvps nginx site for example.com"
+check "no ezvps site: no site was created" equals "$(find "$EZVPS_NGINX_DIR/conf.d" -type f | wc -l)" 1
+check "no ezvps site: the hand-written file is untouched" cmp -s "$SCN/foreign-original" "$(CF example.com)"
+check "no ezvps site: nothing was asked about HTTPS" not_contains "$OUT" "Enable HTTPS"
+check "no ezvps site: nginx.conf untouched (no backup)" equals "$(bk_count 'nginx*')" 0
+check "first issue of a domain makes no certificate backup" equals "$(cert_backups example.com)" 0
+check "issue exits 0" equals "$RC" 0
+echo "-- issue certificate: again (backup of the existing certificate)"
+cp "$(CRTF example.com)" "$SCN/chain-1"
+cp "$(KEYF example.com)" "$SCN/key-1"
+FAKE_ACME_FORCE=1
+cert_run "2\nexample.com\ny"
+check "re-issue: told the existing certificate is backed up" contains "$OUT" "is already stored in ${D}; it is backed up before it is replaced"
+check "re-issue: backup exists" equals "$(cert_backups example.com)" 1
+check "re-issue: backup holds the OLD certificate byte for byte" cmp -s "$SCN/chain-1" "$(cert_backup example.com)/fullchain.pem"
+check "re-issue: backup holds the OLD key byte for byte" cmp -s "$SCN/key-1" "$(cert_backup example.com)/privkey.pem"
+check "re-issue: the backup key is still mode 600" equals "$(mode_of "$(cert_backup example.com)/privkey.pem")" 600
+check "re-issue: the store has the NEW certificate" file_has "$(CRTF example.com)" "FAKE-CERTIFICATE example.com serial=2"
+check "re-issue: the new key is mode 600" equals "$(mode_of "$(KEYF example.com)")" 600
+check "re-issue: backups are in the mode-700 backup dir" equals "$(mode_of "$EZVPS_BACKUP_DIR")" 700
+check "re-issue: key never printed" never_leaks "$OUT"
+FAKE_ACME_FORCE=0
+cert_run "2\nexample.com\ny"
+check "not due: acme.sh skips, ezvps says so and still syncs the store" contains "$OUT" "the existing one for example.com is still valid"
+check "not due: still exactly one certificate dir" equals "$(find "$EZVPS_CERT_DIR" -mindepth 1 -maxdepth 1 | wc -l)" 1
+check "not due: the existing certificate was backed up again (before replacement)" equals "$(cert_backups example.com)" 2
+
+echo "-- issue certificate: failures"
+new_cert iss_fail
+acme_present
+mk_foreign_site example.com example.com
+FAKE_ACME_ISSUE_FAIL=1
+cert_run "2\nexample.com\ny"
+check "acme.sh failure is reported" contains "$OUT" "acme.sh could not issue the certificate for example.com (exit 1)"
+check "acme.sh failure: its message is shown" contains "$OUT" "Verify error: DNS problem"
+check "acme.sh failure: hints about DNS and port 80" contains "$OUT" "the DNS record points here"
+check "acme.sh failure: nothing stored" no_cert_store
+check "acme.sh failure: menu survives" equals "$RC" 0
+new_cert iss_leak
+acme_present
+mk_foreign_site example.com example.com
+FAKE_ACME_LEAK_KEY=1
+cert_run "2\nexample.com\ny"
+check "a key block in acme.sh output is hidden" contains "$OUT" "(private key material hidden)"
+check "a key block in acme.sh output: nothing leaks" never_leaks "$OUT"
+new_cert iss_nginxbad
+acme_present
+mk_foreign_site example.com example.com
+FAKE_NGX_TEST_FAIL=1
+cert_run "2\nexample.com\ny"
+check "a failing nginx config test after acme.sh is reported" contains "$OUT" "config test FAILS after acme.sh ran"
+check "...nothing stored" no_cert_store
+check "...nginx not reloaded by ezvps" no_mutation
+new_cert iss_instfail
+acme_present
+mk_foreign_site example.com example.com
+FAKE_ACME_INSTALLCERT_FAIL=1
+cert_run "2\nexample.com\ny"
+check "install-cert failure is reported" contains "$OUT" "could not install the certificate into $(CD example.com)"
+check "install-cert failure: the new directory is removed again" no_cert_store
+new_cert iss_instfail2
+acme_present
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\ny"
+cp "$(CRTF example.com)" "$SCN/chain-1"
+FAKE_ACME_FORCE=1 FAKE_ACME_INSTALLCERT_FAIL=1
+cert_run "2\nexample.com\ny"
+check "install-cert failure with an existing certificate: it is restored byte for byte" cmp -s "$SCN/chain-1" "$(CRTF example.com)"
+check "install-cert failure with an existing certificate: says it rolled back" contains "$OUT" "Rolled back: the certificate directory is as it was"
+check "install-cert failure with an existing certificate: the restored key is mode 600" equals "$(mode_of "$(KEYF example.com)")" 600
+
+echo "-- issue certificate: enable HTTPS for an ezvps site"
+new_cert https
+acme_present
+run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
+F="$(CF example.com)"
+cp "$F" "$SCN/site-http"
+cert_run "2\nexample.com\ny\ny"
+D="$(CD example.com)"
+check "https: the offer names the site and what will change" contains "$OUT" "An ezvps nginx site exists for example.com"
+check "https: the offer says it edits that file only, with backup and test" contains "$OUT" "backed up first, nginx -t must pass"
+check "https: site backed up first, byte for byte" cmp -s "$SCN/site-http" "$(ngx_backup_file example.com)"
+check "https: exactly one site backup" equals "$(ngx_backups example.com)" 1
+check "https: marker says https is on" file_has "$F" "# ezvps:https=on"
+check "https: the markers are kept" file_has "$F" "# ezvps:upstream=127.0.0.1:3000"
+check "https: a 443 ssl server block" file_has "$F" "    listen 443 ssl;"
+check "https: http2 on" file_has "$F" "    http2 on;"
+check "https: ssl_certificate points into the ezvps store" file_has "$F" "    ssl_certificate ${D}/fullchain.pem;"
+check "https: ssl_certificate_key points into the ezvps store" file_has "$F" "    ssl_certificate_key ${D}/privkey.pem;"
+check "https: 443, not 4443" equals "$(cnt "$F" 4443)" 0
+check "https: no stream block" equals "$(grep -cE '^[[:space:]]*stream[[:space:]]*\{' "$F")" 0
+check "https: the old (deprecated) 'listen 443 ssl http2' form is not used" equals "$(cnt "$F" 'ssl http2')" 0
+check "https: the HTTP block is a 301 redirect to https://\$host\$request_uri" file_has "$F" '        return 301 https://$host$request_uri;'
+check "https: the redirect is inside location / (acme.sh renewal can still answer)" equals "$(grep -B1 'return 301' "$F" | head -n1 | tr -d ' ')" "location/{"
+check "https: still listens on 80 for the redirect" file_has "$F" "    listen 80;"
+check "https: two server blocks, both for the domain" equals "$(cnt "$F" '    server_name example.com;')" 2
+check "https: the proxy happens only in the 443 block" equals "$(cnt "$F" '        proxy_pass http://127.0.0.1:3000;')" 1
+check "https: proxy_pass sits after the 443 listen" equals "$(awk '/listen 443 ssl/ {a=NR} /proxy_pass/ {b=NR} END {print (b>a)}' "$F")" 1
+check "https: same body size as the HTTP template" file_has "$F" "    client_max_body_size 64M;"
+check "https: same proxy block as part 1 (headers, timeouts)" equals "$(for l in 'proxy_http_version 1.1;' 'proxy_set_header Host $host;' 'proxy_set_header X-Real-IP $remote_addr;' 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' 'proxy_set_header X-Forwarded-Proto $scheme;' 'proxy_set_header X-Forwarded-Port $server_port;' 'proxy_set_header Upgrade $http_upgrade;' 'proxy_set_header Connection $connection_upgrade;' 'proxy_connect_timeout 60s;' 'proxy_read_timeout 120s;' 'proxy_send_timeout 120s;'; do grep -cF -- "        $l" "$F"; done | tr -d '\n')" "11111111111"
+check "https: config test ran before the reload" runs_before '^nginx -t$' '^systemctl reload nginx$'
+check "https: nginx reloaded after the site test" contains "$OUT" "HTTPS enabled for example.com. Config test passes."
+check "https: tells about port 443 and the firewall" contains "$OUT" "port 443 is open (the firewall is not changed here): https://example.com/"
+check "https: private key never printed" never_leaks "$OUT"
+check "https: only that one site file exists" equals "$(find "$EZVPS_NGINX_DIR/conf.d" -type f | wc -l)" 1
+check "https: the listing now knows the site uses the certificate" contains "$(cert_run "3" >/dev/null; printf '%s' "$OUT")" "yes (example.com.conf)"
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+cp "$F" "$SCN/site-https"
+cert_run "2\nexample.com\ny"
+check "again with HTTPS already on: recognised" contains "$OUT" "HTTPS is already enabled for example.com"
+check "again with HTTPS already on: site file untouched" cmp -s "$SCN/site-https" "$F"
+check "again with HTTPS already on: no extra site backup" equals "$(ngx_backups example.com)" 1
+check "again with HTTPS already on: nginx reloaded (new certificate) after a config test" equals "$(nlog_count '^systemctl reload nginx$')" "$((RELOADS + 1))"
+# Add site / Remove site on an HTTPS site must say what they do to the HTTPS setup
+run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:4000\nn\n\n0\n\n0\n"
+check "Add site over an HTTPS site: warns that the 443 block would be dropped" contains "$OUT" "HTTPS is enabled on it. Overwriting writes a plain HTTP site"
+check "Add site over an HTTPS site, declined: the HTTPS site is untouched" cmp -s "$SCN/site-https" "$F"
+run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "Add site with the same upstream on an HTTPS site: nothing to do, HTTPS kept" equals "$(contains "$OUT" "Nothing to do" && cmp -s "$SCN/site-https" "$F" && echo yes)" yes
+run_ezvps "$NGX_BOX_INST" "${N}6\nexample.com\nn\n\n0\n\n0\n"
+check "Remove site on an HTTPS site: says the certificate stays and how to remove it" contains "$OUT" "its certificate stays in $(CD example.com)"
+check "Remove site declined: the HTTPS site is untouched" cmp -s "$SCN/site-https" "$F"
+
+new_cert https_no
+acme_present
+run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
+cp "$(CF example.com)" "$SCN/site-http"
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+cert_run "2\nexample.com\ny\nn"
+check "https declined: certificate is stored" test -s "$(CRTF example.com)"
+check "https declined: site file untouched" cmp -s "$SCN/site-http" "$(CF example.com)"
+check "https declined: no site backup" equals "$(ngx_backups example.com)" 0
+check "https declined: says how to be asked again" contains "$OUT" "Run Issue certificate again"
+check "https declined: nginx not reloaded for the site" equals "$(nlog_count '^systemctl reload nginx$')" "$RELOADS"
+
+new_cert https_foreign
+acme_present
+mk_foreign_site example.com example.com
+cp "$(CF example.com)" "$SCN/foreign-original"
+cert_run "2\nexample.com\ny"
+check "a site not made by ezvps is never edited" cmp -s "$SCN/foreign-original" "$(CF example.com)"
+check "...and no HTTPS offer is made for it" not_contains "$OUT" "Enable HTTPS"
+new_cert https_legacy_named
+acme_present
+mk_foreign_site other example.com
+cert_run "2\nexample.com\ny"
+check "a domain served by a differently named file: certificate stored, no ezvps site assumed" contains "$OUT" "There is no ezvps nginx site for example.com"
+
+new_cert https_fail
+acme_present
+run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
+cp "$(CF example.com)" "$SCN/site-http"
+SUM_CONF="$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")"
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+FAKE_NGX_FAIL_NTH=$(($(<"$FAKE_LOG.tcount") + 2))
+cert_run "2\nexample.com\ny\ny"
+check "https with a failing config test: reported" contains "$OUT" "config test FAILED after rewriting"
+check "https with a failing config test: the site is restored byte for byte" cmp -s "$SCN/site-http" "$(CF example.com)"
+check "https with a failing config test: says it rolled back" contains "$OUT" "Rolled back"
+check "https with a failing config test: nginx is NOT reloaded" equals "$(nlog_count '^systemctl reload nginx$')" "$RELOADS"
+check "https with a failing config test: no restart either" equals "$(nlog_count '^systemctl restart')" 0
+check "https with a failing config test: backup of the site exists" equals "$(ngx_backups example.com)" 1
+check "https with a failing config test: nginx.conf untouched" equals "$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")" "$SUM_CONF"
+check "https with a failing config test: the certificate stays stored" test -s "$(CRTF example.com)"
+check "https with a failing config test: tells the user HTTPS was not enabled" contains "$OUT" "HTTPS was not enabled; the site is as it was"
+check "https with a failing config test: menu survives" equals "$RC" 0
+
+new_cert https_map
+acme_present
+run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
+mk_nginx_conf 1 0
+cp "$EZVPS_NGINX_DIR/nginx.conf" "$SCN/nginx-conf-original"
+cert_run "2\nexample.com\ny\ny"
+check "https: the connection map is ensured too (added when missing)" equals "$(cnt "$EZVPS_NGINX_DIR/nginx.conf" 'map $http_upgrade $connection_upgrade')" 1
+check "https: ...with a backup of nginx.conf first" cmp -s "$SCN/nginx-conf-original" "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -type f -name 'nginx.conf-map.*' | head -n1)"
+
+echo "-- list certificates"
+new_cert list0
+acme_present
+cert_run "3"
+check "list: none yet" contains "$OUT" "(none) Use Issue certificate to get one."
+check "list: exit 0" equals "$RC" 0
+new_cert list1
+acme_present
+run_ezvps "$NGX_BOX_INST" "${N}5\nsite.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+mk_foreign_site bare.example.com bare.example.com
+mk_foreign_site hand.example.com hand.example.com
+FAKE_ACME_NOTAFTER="Mar 15 12:00:00 2099 GMT"
+cert_run "2\nsite.example.com\ny\ny"
+FAKE_ACME_NOTAFTER="Jun  2 08:30:00 2099 GMT"
+cert_run "2\nbare.example.com\ny"
+FAKE_ACME_NOTAFTER="Jan  1 00:00:00 2001 GMT"
+cert_run "2\nhand.example.com\ny"
+# hand-written HTTPS site using the ezvps store certificate
+printf '%s\n' "server {" "    listen 443 ssl;" "    server_name hand.example.com;" "    ssl_certificate $(CRTF hand.example.com);" "    ssl_certificate_key $(KEYF hand.example.com);" "    return 200 'x';" "}" >"$(CF hand.example.com)"
+SUM_TREE="$(tree_sum "$EZVPS_CERT_DIR")$(tree_sum "$EZVPS_NGINX_DIR")"
+CALLS_BEFORE="$(wc -l <"$FAKE_LOG")"
+cert_run "3"
+check "list: header" has_row "$OUT" 'DOMAIN +EXPIRES +NGINX SITE'
+check "list: each domain with its expiry date and the site that uses it (enabled by ezvps)" has_row "$OUT" 'site\.example\.com +2099-03-15 \([0-9]+ days left\) +yes \(site\.example\.com\.conf\)$'
+check "list: a certificate not installed for any site" has_row "$OUT" 'bare\.example\.com +2099-06-02 \([0-9]+ days left\) +no$'
+check "list: an expired certificate is flagged" has_row "$OUT" 'hand\.example\.com +2001-01-01 \(EXPIRED\) +yes \(hand\.example\.com\.conf\)$'
+check "list: sorted by domain" equals "$(printf '%s\n' "$OUT" | grep -oE '^  (bare|hand|site)\.example\.com' | tr -d ' ' | tr '\n' ' ')" "bare.example.com hand.example.com site.example.com "
+check "list: never prints a key" never_leaks "$OUT"
+check "list: read-only (store and nginx dir unchanged)" equals "$(tree_sum "$EZVPS_CERT_DIR")$(tree_sum "$EZVPS_NGINX_DIR")" "$SUM_TREE"
+check "list: runs no acme.sh, no nginx test, no reload" equals "$(($(wc -l <"$FAKE_LOG") - CALLS_BEFORE))" 0
+cert_run "3" "$CB_NOSSL"
+check "list without openssl: expiry unknown, still listed" has_row "$OUT" 'bare\.example\.com +unknown \(openssl not installed\) +no$'
+mkdir -p "$(CD broken.example.com)"
+cert_run "3"
+check "list: a directory without a certificate file is flagged" has_row "$OUT" 'broken\.example\.com +no certificate file +no$'
+printf 'not a certificate\n' >"$(CRTF broken.example.com)"
+cert_run "3"
+check "list: an unreadable certificate is flagged" has_row "$OUT" 'broken\.example\.com +unreadable certificate +no$'
+
+echo "-- renew certificates"
+new_cert ren0
+cert_run "4"
+check "renew without acme.sh: told to install it" contains "$OUT" "acme.sh is not installed. Choose 'Install acme.sh' first."
+new_cert ren1
+acme_present
+run_ezvps "$NGX_BOX_INST" "${N}5\nsite.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+cert_run "2\nsite.example.com\ny\ny"
+mk_foreign_site other.example.com other.example.com
+cert_run "2\nother.example.com\ny"
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+TESTS="$(nlog_count '^nginx -t$')"
+cp "$(CRTF site.example.com)" "$SCN/site-chain-1"
+cert_run "4"
+check "renew: runs acme.sh --renew-all" has_line "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --renew-all"
+check "renew: nothing due: says so" contains "$OUT" "No certificate was renewed (none is due yet). nginx was not reloaded."
+check "renew: nothing due: nginx NOT reloaded" equals "$(nlog_count '^systemctl reload nginx$')" "$RELOADS"
+check "renew: nothing due: no config test either" equals "$(nlog_count '^nginx -t$')" "$TESTS"
+check "renew: nothing due: store unchanged" cmp -s "$SCN/site-chain-1" "$(CRTF site.example.com)"
+FAKE_ACME_RENEW="site.example.com"
+cert_run "4"
+check "renew: acme.sh's own output is shown" contains "$OUT" "Renewed: site.example.com"
+check "renew: a changed certificate is detected" contains "$OUT" "At least one certificate was renewed."
+check "renew: the stored certificate is the new one" file_has "$(CRTF site.example.com)" "FAKE-CERTIFICATE site.example.com serial=renewed-3"
+check "renew: config test ran, then nginx was reloaded once" equals "$(nlog_count '^nginx -t$')$(nlog_count '^systemctl reload nginx$')" "$((TESTS + 1))$((RELOADS + 1))"
+check "renew: config test before the reload" runs_before '^nginx -t$' '^systemctl reload nginx$'
+check "renew: private key never printed" never_leaks "$OUT"
+check "renew: exit 0" equals "$RC" 0
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+FAKE_ACME_RENEW="other.example.com" FAKE_NGX_TEST_FAIL=1
+cert_run "4"
+check "renew with a failing config test: reported" contains "$OUT" "The nginx config test FAILED; nginx was NOT reloaded."
+check "renew with a failing config test: nginx not reloaded" equals "$(nlog_count '^systemctl reload nginx$')" "$RELOADS"
+check "renew with a failing config test: no restart" equals "$(nlog_count '^systemctl restart')" 0
+check "renew with a failing config test: menu survives" equals "$RC" 0
+FAKE_NGX_TEST_FAIL=0
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+FAKE_ACME_RENEW="" FAKE_ACME_RENEW_FAIL=1
+cert_run "4"
+check "renew: an acme.sh failure is reported" contains "$OUT" "acme.sh reported errors (exit 1)"
+check "renew: a failure that changed nothing does not reload" equals "$(nlog_count '^systemctl reload nginx$')" "$RELOADS"
+new_cert ren_only_acme
+acme_present
+mkdir -p "$EZVPS_ACME_HOME/lonely.example.com"
+printf 'FAKE-CERTIFICATE lonely serial=1\nnotAfter=Jan  1 00:00:00 2099 GMT\n' >"$EZVPS_ACME_HOME/lonely.example.com/fullchain.cer"
+printf 'FAKE-KEY-DO-NOT-PRINT lonely\n' >"$EZVPS_ACME_HOME/lonely.example.com/lonely.example.com.key"
+FAKE_ACME_RENEW="lonely.example.com"
+cert_run "4"
+check "renew: an acme.sh certificate outside the ezvps store is detected too" equals "$(nlog_count '^systemctl reload nginx$')" 1
+new_cert ren_nonginx
+acme_present
+mkdir -p "$EZVPS_ACME_HOME/lonely.example.com"
+printf 'FAKE-CERTIFICATE lonely serial=1\nnotAfter=Jan  1 00:00:00 2099 GMT\n' >"$EZVPS_ACME_HOME/lonely.example.com/fullchain.cer"
+printf 'FAKE-KEY-DO-NOT-PRINT lonely\n' >"$EZVPS_ACME_HOME/lonely.example.com/lonely.example.com.key"
+FAKE_ACME_RENEW="lonely.example.com"
+rm -f "$FAKE_DPKG"
+cert_run "4" "$CB_NONGINX"
+check "renew without nginx: renewed, nothing to reload, no failure" contains "$OUT" "nginx is not installed here, so there is nothing to reload."
+
+echo "-- remove certificate"
+new_cert rm0
+acme_present
+cert_run "5\nexample.com"
+check "remove: unknown domain changes nothing" contains "$OUT" "No certificate for example.com in ${EZVPS_CERT_DIR}."
+check "remove: unknown domain: acme.sh never ran" no_acme_run
+cert_run "5\n*.example.com"
+check "remove: wildcard input is rejected" contains "$OUT" "Wildcard certificates need DNS validation"
+cert_run "5\n../x"
+check "remove: path traversal is rejected" contains "$OUT" "contains a path separator"
+
+# rm_setup <name>: an ezvps site with HTTPS enabled from a real issue, plus a second one left alone
+rm_setup() {
+    new_cert "$1"
+    acme_present
+    run_ezvps "$NGX_BOX_INST" "${N}5\nexample.com\n127.0.0.1:3000\n\n0\n\n0\n"
+    run_ezvps "$NGX_BOX_INST" "${N}5\nkeep.example.com\n127.0.0.1:4000\n\n0\n\n0\n"
+    cp "$(CF example.com)" "$SCN/site-http"
+    cp "$(CF keep.example.com)" "$SCN/keep-site"
+    cert_run "2\nexample.com\ny\ny"
+    cp "$(CF example.com)" "$SCN/site-https"
+    cp "$(CRTF example.com)" "$SCN/chain-orig"
+    cp "$(KEYF example.com)" "$SCN/key-orig"
+}
+rm_setup rm1
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+cert_run "5\nexample.com\nn"
+check "remove: shows what will happen" contains "$OUT" "rewrite $(CF example.com) back to its plain HTTP proxy to 127.0.0.1:3000"
+check "remove declined: cancelled" contains "$OUT" "Cancelled. Nothing was changed."
+check "remove declined: certificate still stored" test -s "$(CRTF example.com)"
+check "remove declined: site still HTTPS" cmp -s "$SCN/site-https" "$(CF example.com)"
+check "remove declined: no certificate backup" equals "$(cert_backups example.com)" 0
+check "remove declined: acme.sh --remove not run" equals "$(acme_calls '--home .* --remove')" 0
+BK_SITES="$(ngx_backups example.com)"
+cert_run "5\nexample.com\ny"
+check "remove: the certificate is backed up first" equals "$(cert_backups example.com)" 1
+check "remove: the backup holds the certificate byte for byte" cmp -s "$SCN/chain-orig" "$(cert_backup example.com)/fullchain.pem"
+check "remove: the backup holds the private key byte for byte" cmp -s "$SCN/key-orig" "$(cert_backup example.com)/privkey.pem"
+check "remove: the backup key is mode 600" equals "$(mode_of "$(cert_backup example.com)/privkey.pem")" 600
+check "remove: removed from the ezvps store" test ! -e "$(CD example.com)"
+check "remove: the store directory itself stays" test -d "$EZVPS_CERT_DIR"
+check "remove: the HTTPS site was backed up (with HTTPS in it) first" equals "$(ngx_backups example.com)" "$((BK_SITES + 1))"
+check "remove: one of the site backups is the HTTPS file" equals "$(grep -lF 'ssl_certificate ' "$EZVPS_BACKUP_DIR"/nginx-site-example.com.* | wc -l)" 1
+check "remove: the plain HTTP proxy block is restored" cmp -s "$SCN/site-http" "$(CF example.com)"
+check "remove: no TLS left in the site" equals "$(grep -cE 'ssl|443|http2|return 301|https=on' "$(CF example.com)")" 0
+check "remove: the other site is untouched" cmp -s "$SCN/keep-site" "$(CF keep.example.com)"
+check "remove: config test ran before the reload" runs_before '^nginx -t$' '^systemctl reload nginx$'
+check "remove: tells that the site is plain HTTP again" contains "$OUT" "is a plain HTTP proxy to 127.0.0.1:3000 again. Config test passes."
+check "remove: nginx reloaded once, after the test" equals "$(nlog_count '^systemctl reload nginx$')" "$((RELOADS + 1))"
+check "remove: acme.sh told to stop renewing" has_line "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --remove -d example.com"
+check "remove: says acme.sh keeps its own copy" contains "$OUT" "acme.sh keeps its own copy of the files in ${EZVPS_ACME_HOME}/example.com"
+check "remove: key never printed" never_leaks "$OUT"
+check "remove: exit 0" equals "$RC" 0
+cert_run "3"
+check "list after remove: the certificate is gone" contains "$OUT" "(none)"
+rm_setup rm2
+SUM_CONF="$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")"
+RELOADS="$(nlog_count '^systemctl reload nginx$')"
+CALLS="$(nlog_count '^acme.sh .*--remove')"
+FAKE_NGX_FAIL_NTH=$(($(<"$FAKE_LOG.tcount") + 1))
+cert_run "5\nexample.com\ny"
+check "remove with a failing config test: reported" contains "$OUT" "config test FAILED after rewriting"
+check "remove with a failing config test: the HTTPS site is restored byte for byte" cmp -s "$SCN/site-https" "$(CF example.com)"
+check "remove with a failing config test: the certificate is NOT removed" cmp -s "$SCN/chain-orig" "$(CRTF example.com)"
+check "remove with a failing config test: the key is NOT removed" cmp -s "$SCN/key-orig" "$(KEYF example.com)"
+check "remove with a failing config test: nginx NOT reloaded" equals "$(nlog_count '^systemctl reload nginx$')" "$RELOADS"
+check "remove with a failing config test: acme.sh --remove not run" equals "$(nlog_count '^acme.sh .*--remove')" "$CALLS"
+check "remove with a failing config test: says the certificate was kept" contains "$OUT" "The certificate was kept"
+check "remove with a failing config test: menu survives" equals "$RC" 0
+rm_setup rm3
+printf '%s\n' "server {" "    listen 443 ssl;" "    server_name second.example.com;" "    ssl_certificate $(CRTF example.com);" "    ssl_certificate_key $(KEYF example.com);" "}" >"$(CF second)"
+cp "$(CF second)" "$SCN/second-original"
+cert_run "5\nexample.com\ny"
+check "remove while another file uses the certificate: refused" contains "$OUT" "conf.d/second.conf uses this certificate but is not an ezvps-made HTTPS site for example.com"
+check "...nothing changed: certificate still stored" cmp -s "$SCN/chain-orig" "$(CRTF example.com)"
+check "...nothing changed: both sites as they were" equals "$(cmp -s "$SCN/second-original" "$(CF second)" && cmp -s "$SCN/site-https" "$(CF example.com)" && echo same)" same
+check "...no backup, acme.sh not run" equals "$(cert_backups example.com)$(acme_calls '--home .* --remove')" "00"
+rm_setup rm4
+printf '%s\n' "# hand written" "server {" "    listen 443 ssl;" "    server_name example.com;" "    ssl_certificate $(CRTF example.com);" "    ssl_certificate_key $(KEYF example.com);" "}" >"$(CF example.com)"
+cp "$(CF example.com)" "$SCN/hand-original"
+cert_run "5\nexample.com\ny"
+check "remove with a non-ezvps site using it: never edited" cmp -s "$SCN/hand-original" "$(CF example.com)"
+check "remove with a non-ezvps site using it: certificate kept" test -s "$(CRTF example.com)"
+new_cert rm5
+acme_present
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\ny"
+cp "$(CRTF example.com)" "$SCN/chain-orig"
+cert_run "5\nexample.com\ny"
+check "remove with no ezvps site: certificate removed" test ! -e "$(CD example.com)"
+check "remove with no ezvps site: the hand-written site is untouched" equals "$(file_has "$(CF example.com)" "    server_name example.com;" && echo same)" same
+check "remove with no ezvps site: no nginx change, no reload for it" equals "$(nlog_count '^systemctl reload nginx$')" 0
+check "remove with no ezvps site: backup of the certificate" cmp -s "$SCN/chain-orig" "$(cert_backup example.com)/fullchain.pem"
+new_cert rm6
+acme_present
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\ny"
+FAKE_ACME_REMOVE_FAIL=1
+cert_run "5\nexample.com\ny"
+check "remove: an acme.sh --remove failure is only a warning, the store entry is gone" equals "$(test ! -e "$(CD example.com)" && echo gone)" gone
+check "remove: ...and it says so" contains "$OUT" "acme.sh did not remove example.com from its renewal list"
+new_cert rm7
+acme_present
+mk_foreign_site example.com example.com
+cert_run "2\nexample.com\ny"
+cert_run "5\nexample.com\ny" "$CB_NONGINX"
+check "remove without nginx installed: the store entry is removed" equals "$(test ! -e "$(CD example.com)" && echo gone)" gone
+check "remove without nginx installed: no nginx command was needed" not_contains "$OUT" "FAILED"
+
+echo "-- certificates: nothing leaks and nothing else changes"
+check "no certificate test ever prints key material" never_leaks "$(cat "$WORK"/scn-ngx-cert-*/calls.log 2>/dev/null)"
+check "the backup dir of a certificate run is never world-readable" equals "$(stat -c %a "$EZVPS_BACKUP_DIR")" 700
+
 echo "== operating systems (fake os-release files, EZVPS_SKIP_OS_CHECK off)"
 # run_os <os-release file> <path-dir> <stdin-text> [args...]  -> OUT and RC, with the OS check ON
 run_os() {
@@ -2259,8 +3174,10 @@ for c in "${SUPPORTED_OS[@]}"; do
 done
 
 echo "-- Nginx stays HTTP only"
-no_tls_code() { ! grep -vE '^[[:space:]]*#' "$1" | grep -qiE 'ssl_certificate|certbot|acme\.sh|letsencrypt|listen 443|443 ssl'; }
-check "ezvps contains no certificate/TLS configuration code" no_tls_code "$EZVPS"
+# The Certificates module validates with HTTP-01 through nginx only: no DNS API,
+# no wildcard issuance and nothing that asks for provider credentials. certbot is not used.
+no_dns_validation_code() { ! grep -vE '^[[:space:]]*#' "$1" | grep -qiE -- '--dns|dns_[a-z]+|CF_Token|api_?key|--accountemail|certbot'; }
+check "ezvps contains no DNS-validation, DNS-credential or certbot code" no_dns_validation_code "$EZVPS"
 
 echo "== source rules"
 # curl may appear only in the 3x-ui functions that need it; never in the L2TP
@@ -2284,6 +3201,10 @@ only_pinned_urls() {
             https://github.com/\$\{XUI_UPSTREAM\}* | https://raw.githubusercontent.com/\$\{XUI_UPSTREAM\}/\$\{XUI_PINNED_TAG\}/install.sh | 'http://127.0.0.1'* | 'http://<server-ip>'* | 'https://github.com/<owner>/'* | 'https://www.shellcheck.net'*) ;;
             # Nginx module: the nginx.org stable repositories (Debian, Ubuntu) and the signing key
             'https://nginx.org/packages/debian' | 'https://nginx.org/packages/ubuntu' | 'https://nginx.org/keys/nginx_signing.key') ;;
+            # Certificates module: the pinned acme.sh script at a release tag, and its project page
+            'https://github.com/${ACME_UPSTREAM}'* | 'https://raw.githubusercontent.com/${ACME_UPSTREAM}/${ACME_PINNED_TAG}/acme.sh') ;;
+            # Certificates module: nginx syntax in the site template and text for the user, not network access
+            'https://$host$request_uri;'* | 'https://\$host\$request_uri'* | 'https://${domain}/'* | 'http://${1};') ;;
             # Nginx module: upstream parsing/rendering, not network access
             'https://*' | 'http://}' | 'http://${2};') ;;
             *) echo "unexpected URL: $u" >&2; bad=1 ;;
@@ -2291,7 +3212,7 @@ only_pinned_urls() {
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
     ((bad == 0))
 }
-check "curl is invoked only by the 3x-ui download/probe functions and the nginx.org key download" equals "$(curl_functions "$EZVPS")" "ngx_fetch_key() xui_fetch_installer() xui_probe() "
+check "curl is invoked only by the 3x-ui download/probe functions, the nginx.org key download and the pinned acme.sh download" equals "$(curl_functions "$EZVPS")" "acme_fetch_script() ngx_fetch_key() xui_fetch_installer() xui_probe() "
 check "ezvps never pipes a download into a shell" no_pipe_to_shell "$EZVPS"
 check "ezvps only knows the pinned upstream URL" only_pinned_urls "$EZVPS"
 check "ezvps has no URL for the private easyl2tp repo" not_contains "$(<"$EZVPS")" "raw.githubusercontent.com/<owner>"

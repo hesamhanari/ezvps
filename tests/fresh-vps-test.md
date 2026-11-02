@@ -83,9 +83,10 @@ script it from ezvps)
 - [ ] menu lines match exactly (no description text):
       `L2TP, 3x-ui, Backpack, ctunnel, Nginx, Certificates, Lazyports,
       SSH and Users, Firewall, Backup, Check For Updates, Uninstall`, then `0) Exit`
-- [ ] each of `3`, `4` and `6` to `12` prints `<Label> is not implemented yet.`
+- [ ] each of `3`, `4` and `7` to `12` prints `<Label> is not implemented yet.`
       and returns to the menu after Enter (`2` opens the 3x-ui submenu, section 5;
-      `5` opens the Nginx submenu, section 6)
+      `5` opens the Nginx submenu, section 6; `6` opens the Certificates
+      submenu, section 7)
 - [ ] `abc`, `13`, empty input -> `Invalid choice`, menu continues
 - [ ] `ezvps backpack` (and the other pending keys) print the same message, exit 0
 - [ ] `ezvps bogus` prints usage, exit 2
@@ -299,8 +300,22 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       `/var/backups/ezvps/nginx-default-conf.*` exists
 - [ ] `curl -s -H 'Host: example.com' http://127.0.0.1/` returns the backend's
       directory listing (reverse proxy works); with the backend stopped it returns 502
-- [ ] the message says the site is HTTP only and to use the Certificates
-      module once it exists; no certificate was created (`ls /etc/letsencrypt` fails / empty)
+- [ ] the message says the site is HTTP only and to use Certificates -> Issue
+      certificate for HTTPS; no certificate was created (`/etc/ssl/ezvps` does not exist yet)
+- [ ] site template: `cat /etc/nginx/conf.d/example.com.conf` has
+      `client_max_body_size 64M;`, `proxy_http_version 1.1;`, the headers `Host`,
+      `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Upgrade`,
+      `Connection $connection_upgrade` (no literal `"upgrade"`), and
+      `proxy_connect_timeout 60s;` / `proxy_read_timeout 120s;` / `proxy_send_timeout 120s;`
+- [ ] connection map: `/etc/nginx/nginx.conf` now has
+      `map $http_upgrade $connection_upgrade {` exactly once inside `http { }`
+      (`grep -c 'map \$http_upgrade' /etc/nginx/nginx.conf` prints `1`), a backup
+      `/var/backups/ezvps/nginx.conf-map.<timestamp>.<pid>` equals the old file, and
+      `nginx -t` passes; adding a second site does not add the map or a backup again
+- [ ] WebSocket headers: with a backend that prints request headers, a normal
+      `curl --http1.1 -H 'Host: example.com' http://127.0.0.1/` shows `Connection: close`,
+      and adding `-H 'Upgrade: websocket' -H 'Connection: Upgrade'` shows
+      `Connection: upgrade`
 - [ ] the same `5) Add site` again: `already exists with the same upstream ...
       Nothing to do`; no new file, no backup, no second reload (journal)
 - [ ] `5) Add site` `example.com` with `127.0.0.1:4000`: asks before
@@ -330,8 +345,14 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 **6e. List and Remove**
 
 - [ ] `4) List sites`: table of `conf.d/*.conf` with `example.com.conf
-      example.com 127.0.0.1:4000 ezvps` and `default.conf localhost ... not ezvps` (until disabled) and `legacy.conf taken.example.com ...
-      not ezvps`; `sites-enabled` entries are not listed
+      example.com 127.0.0.1:4000 ezvps` and `default.conf localhost - not ezvps`
+      (until disabled) and `legacy.conf taken.example.com - not ezvps`;
+      `sites-enabled` entries are not listed
+- [ ] List sites shows the upstream of a file ezvps did not make: add
+      `/etc/nginx/conf.d/hand.conf` with `server_name hand.example.com;` and
+      `location / { proxy_pass http://127.0.0.1:8080; }` and check the row
+      `hand.conf hand.example.com 127.0.0.1:8080 not ezvps`; `sha256sum` of every
+      file in `conf.d` is the same before and after (List never edits)
 - [ ] `6) Remove site` with an unknown domain: `No site named ...`, nothing changed
 - [ ] `6) Remove site` `example.com`, answer `n`: file remains, no backup
 - [ ] `6) Remove site` `example.com`, answer `y`: backup
@@ -360,18 +381,105 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 - [ ] the migrated site now appears in the table and works with `curl -H 'Host: old.example.com' http://127.0.0.1/`
 - [ ] clean up: remove the test sites and backups
 
-## 7. Non-root
+## 7. Certificates
+
+Needs outbound HTTPS to raw.githubusercontent.com, acme-v02.api.letsencrypt.org
+and nginx.org, **a real domain whose A record points at this VPS** (use a
+throwaway name you control, never one in production), and ports 80 and 443 open
+to the internet. Let's Encrypt rate limits apply: do not repeat Issue more often
+than needed. nginx (section 6) must be installed and running, and the domain must
+be served by an nginx site, for example `5) Add site` in the Nginx submenu with the
+test domain and a backend on `127.0.0.1:3000` (`python3 -m http.server 3000`).
+
+**7a. Submenu**
+- [ ] `ezvps` -> `6` shows exactly: `1) Install acme.sh`, `2) Issue certificate`,
+      `3) List certificates`, `4) Renew certificates`, `5) Remove certificate`,
+      `0) Back`; `abc` prints `Invalid choice: abc`; Ctrl-D exits cleanly
+- [ ] with acme.sh not installed, `2`, `3` (empty list is fine), `4` and `5` do not
+      fail: `2` and `4` say `Choose 'Install acme.sh' first.`
+
+**7b. Install acme.sh**
+- [ ] `1) Install acme.sh`: the plan shows
+      `https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh`,
+      the pinned sha256 `c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7`
+      and the home `/root/.acme.sh`; answering `n` changes nothing (`ls /root/.acme.sh` fails)
+- [ ] `y`: `Downloaded acme.sh matches the pinned sha256.`, then
+      `Verified: the acme.sh command works (v3.1.6, /root/.acme.sh/acme.sh)`;
+      `crontab -l` has one `acme.sh --cron` line; your shell profile (`~/.bashrc`)
+      was not modified; if root already had a crontab it is saved in
+      `/var/backups/ezvps/crontab-root.*` (mode 600)
+- [ ] `1) Install acme.sh` again: `already installed ... Not reinstalling.` and no download
+- [ ] on an image without `crontab` (`apt-get purge -y cron` first): the plan warns it
+      installs WITHOUT the renewal job and `acme.sh --install ... --nocron` is used
+
+**7c. Issue certificate**
+- [ ] with nginx stopped (`systemctl stop nginx`): refused, `nginx is not running`;
+      start it again
+- [ ] a domain no nginx site serves is refused (`No nginx server block serves ...`),
+      and `*.example.com`, `a.example.com,b.example.com` and `a b` are rejected
+- [ ] `2) Issue certificate` with the test domain: the output says the DNS record
+      must point to THIS server, mentions port 80, and states that no DNS provider
+      credentials are asked for; answer `n`: nothing changes (no
+      `/etc/ssl/ezvps`, no acme.sh run)
+- [ ] answer `y`: acme.sh succeeds, then
+      `ls -l /etc/ssl/ezvps/<domain>` shows `fullchain.pem` (644) and `privkey.pem`
+      (600), `stat -c %a /etc/ssl/ezvps /etc/ssl/ezvps/<domain>` prints `700 700`;
+      the expiry is shown; **no private key text appears anywhere in the output**
+- [ ] `grep -c 'ACME_NGINX_START' /etc/nginx/conf.d/*.conf` prints 0 everywhere
+      (acme.sh put the file back) and `nginx -t` passes
+- [ ] the HTTPS offer names the site; answer `y`: `/var/backups/ezvps/nginx-site-<domain>.*`
+      holds the old plain file, `conf.d/<domain>.conf` now has `# ezvps:https=on`, a
+      `listen 80` block whose `location /` is `return 301 https://$host$request_uri;`,
+      and a `listen 443 ssl;` block with `http2 on;`, `ssl_certificate
+      /etc/ssl/ezvps/<domain>/fullchain.pem;`, `ssl_certificate_key
+      /etc/ssl/ezvps/<domain>/privkey.pem;` and the proxy location; no `4443`, no `stream`
+- [ ] `curl -sI http://<domain>/x` is `301` with `Location: https://<domain>/x`;
+      `curl -s https://<domain>/` returns the backend with a valid certificate (no `-k`);
+      `curl -sI --http2 https://<domain>/` reports `HTTP/2 200`
+- [ ] the same `2) Issue certificate` again: the existing certificate is mentioned and
+      backed up to `/var/backups/ezvps/cert-<domain>.*` (its `privkey.pem` is still
+      mode 600), acme.sh says it is not due, `HTTPS is already enabled` and nginx reloads
+- [ ] a hand-written site: create `/etc/nginx/conf.d/other.conf` with
+      `server_name other.example.org;` (a second name you control), issue for it: the
+      certificate is stored, `There is no ezvps nginx site ...`, `other.conf` is unchanged
+- [ ] failing config test during the HTTPS offer rolls back: put
+      `BROKEN_DIRECTIVE on;` in `/etc/nginx/conf.d/zz.conf` before answering `y` to a
+      fresh offer, then check `config test FAILED`, `Rolled back`, the site file equal
+      to the backup and nginx not reloaded; remove `zz.conf`
+
+**7d. List, Renew, Remove**
+- [ ] `3) List certificates`: one row per certificate with the expiry date,
+      `(N days left)` and `yes (<domain>.conf)` for the site; read-only
+- [ ] `4) Renew certificates`: acme.sh reports the certificate is not due,
+      `No certificate was renewed ... nginx was not reloaded.` and the journal shows no
+      reload; (to see a real renewal: `/root/.acme.sh/acme.sh --renew -d <domain> --force`
+      works too, then `4)` on the next day)
+- [ ] `5) Remove certificate` with an unknown domain: `No certificate for ...`; with the
+      test domain answering `n`: nothing changes
+- [ ] `5) Remove certificate`, `y`: backups `cert-<domain>.*` (key mode 600) and
+      `nginx-site-<domain>.*` (the HTTPS version) exist, `conf.d/<domain>.conf` is the
+      plain HTTP proxy again (no `ssl`, no `443`, no `https=on`), `/etc/ssl/ezvps/<domain>`
+      is gone, `acme.sh will no longer renew`, `nginx -t` passes and nginx reloaded;
+      `curl -s http://<domain>/` reaches the backend over HTTP again
+- [ ] with `other.conf` (hand-written) using a stored certificate through
+      `ssl_certificate /etc/ssl/ezvps/<domain>/fullchain.pem;`, Remove refuses and names
+      that file; nothing changes
+- [ ] clean up: remove the test sites, `rm -rf /root/.acme.sh` if you want acme.sh gone
+      (`crontab -e` to drop its line), and `/etc/ssl/ezvps`
+
+## 8. Non-root
 
 - [ ] as a normal user: `ezvps` prints `ezvps must be run as root.`, exit 1
 - [ ] as a normal user: `ezvps --version` still works
 
-## 8. Cleanup (no uninstall module yet)
+## 9. Cleanup (no uninstall module yet)
 
 ```bash
 x-ui uninstall            # 3x-ui's own uninstaller, if you installed it
 apt-get purge -y nginx    # if you installed nginx for this test
 rm -f /usr/local/bin/ezvps
 rm -rf /var/backups/ezvps /var/lib/ezvps
+rm -rf /root/.acme.sh /etc/ssl/ezvps   # if you installed acme.sh / issued certificates
 ```
 
 - [ ] ezl2tp (if present) still works after cleanup

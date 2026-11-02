@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # ezvps - bash TUI/CLI VPS manager for Debian 12/13 and Ubuntu 22.04/24.04/26.04 LTS (run as root).
 #
-# Implemented modules: L2TP (PR 1), 3x-ui (PR 2) and Nginx (PR 3). Every other module
-# prints a clean "not implemented yet" message and returns without failing.
+# Implemented modules: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3) and Certificates
+# (PR 8). Every other module prints a clean "not implemented yet" message and
+# returns without failing.
 #
 # Menu, L2TP and the rest of the script use bash builtins only. The 3x-ui
-# module also needs coreutils, systemctl and curl, and the Nginx module needs
-# coreutils, systemctl, apt-get and nginx itself; each is checked with
-# `command -v` before use and the module degrades with a clear message.
+# module also needs coreutils, systemctl and curl, the Nginx module needs
+# coreutils, systemctl, apt-get and nginx itself, and the Certificates module
+# needs nginx, systemctl, curl and sha256sum (acme.sh install only) and openssl
+# (expiry dates only); each is checked with `command -v` before use and the
+# module degrades with a clear message.
 
 set -uo pipefail
 
@@ -468,11 +471,11 @@ xui_preflight() {
     return 0
 }
 
-# curl is needed to download the installer. Offer to install it (minimal
-# Debian/Ubuntu images do not always ship it); never install without a yes.
-xui_ensure_curl() {
+# ensure_curl <purpose>: curl is needed for a download. Offer to install it
+# (minimal Debian/Ubuntu images do not always ship it); never install without a yes.
+ensure_curl() {
     have_cmd curl && return 0
-    info "curl is not installed; it is needed to download the 3x-ui installer."
+    info "curl is not installed; it is needed to ${1}."
     if ! have_cmd apt-get; then
         err "apt-get not found; install curl manually and try again."
         return 1
@@ -488,6 +491,8 @@ xui_ensure_curl() {
     fi
     return 0
 }
+
+xui_ensure_curl() { ensure_curl "download the 3x-ui installer"; }
 
 # --- backup ------------------------------------------------------------------
 
@@ -1022,9 +1027,10 @@ module_3x_ui() {
 # domain: /etc/nginx/conf.d/<domain>.conf. ezvps does not create or manage
 # anything in sites-available/sites-enabled; those directories are only read to
 # migrate sites an older ezvps put there (marked "# Managed by ezvps") and to
-# offer disabling Debian's default site. HTTP ONLY: certificates and HTTPS
-# belong to the separate Certificates module (later PR); nothing here issues,
-# stores or references a certificate.
+# offer disabling Debian's default site. Add site writes HTTP only: certificates
+# and HTTPS belong to the Certificates module, which later rewrites an
+# ezvps-made site file with a 443 block (ngx_render_site's https mode). Nothing in
+# the Nginx menu issues or stores a certificate.
 #
 # Rule used everywhere: `nginx -t` must pass before nginx is reloaded or
 # restarted. A change whose test fails is rolled back and nginx is left alone.
@@ -1039,14 +1045,20 @@ NGX_AVAIL="${NGX_DIR}/sites-available"
 NGX_ENABLED="${NGX_DIR}/sites-enabled"
 NGX_HTTP_PORT="${EZVPS_NGINX_HTTP_PORT:-80}"
 NGX_BACKUP_BASE="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
+# Where the Certificates module keeps certificates, <dir>/<domain>/{fullchain,privkey}.pem.
+# The https form of the site template (ngx_render_site) points ssl_certificate here.
+CERT_DIR="${EZVPS_CERT_DIR:-/etc/ssl/ezvps}"
 
 # Filled by ngx_config_test / ngx_probe / ngx_read_site / ngx_parse_upstream / backup_file.
 NGX_TEST_OUT=""
 NGX_PROBE_CODE=""
-NGX_SITE_DOMAIN="" NGX_SITE_UPSTREAM="" NGX_SITE_MANAGED=0
+NGX_SITE_DOMAIN="" NGX_SITE_UPSTREAM="" NGX_SITE_MANAGED=0 NGX_SITE_HTTPS=0
+NGX_SITE_PROXY="" NGX_SITE_PROXY_MORE=0
 NGX_UP=""
 BACKUP_FILE_PATH=""
 NGX_SERVER_NAME_RE='^[[:space:]]*server_name[[:space:]]+([^;]+);'
+# proxy_pass anywhere on a (comment-stripped) line, also inside `location / { ... }` on one line
+NGX_PROXY_PASS_RE='(^|[[:space:];{])proxy_pass[[:space:]]+([^;[:space:]]+)[[:space:]]*;'
 
 # Installed = the nginx command exists, or dpkg says the package is installed.
 ngx_installed() {
@@ -1786,8 +1798,8 @@ ngx_install() {
     info "Nginx is installed ($(ngx_version)) from the nginx.org stable repository."
     info "Upgrades stay on nginx.org stable through the apt pin ${NGX_APT_PREF}."
     info "Add reverse-proxy sites with 'Add site' (they live in ${NGX_CONFD})."
-    info "This module serves plain HTTP only. For HTTPS use the Certificates module"
-    info "once it exists (not available yet)."
+    info "Sites added here serve plain HTTP. For HTTPS use the Certificates module"
+    info "(Issue certificate, then enable HTTPS for the site)."
     return 0
 }
 
@@ -1901,19 +1913,38 @@ ngx_parse_upstream() {
 }
 
 # ngx_read_site <file>: sets NGX_SITE_DOMAIN / NGX_SITE_UPSTREAM / NGX_SITE_MANAGED
-# (1 = created by ezvps). For other files the first server_name is reported.
+# (1 = created by ezvps) / NGX_SITE_HTTPS (1 = the ezvps "https=on" marker).
+# For other files the first server_name is reported. For every file (ezvps or
+# not) NGX_SITE_PROXY is the first proxy_pass target found in the file without a
+# leading http:// (empty when there is none) and NGX_SITE_PROXY_MORE counts the
+# other distinct targets. Read-only.
 ngx_read_site() {
-    local line first_name=""
-    NGX_SITE_DOMAIN="" NGX_SITE_UPSTREAM="" NGX_SITE_MANAGED=0
+    local line first_name="" code p seen=" "
+    NGX_SITE_DOMAIN="" NGX_SITE_UPSTREAM="" NGX_SITE_MANAGED=0 NGX_SITE_HTTPS=0
+    NGX_SITE_PROXY="" NGX_SITE_PROXY_MORE=0
     [[ -r "$1" ]] || return 1
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
             "# Managed by ezvps"*) NGX_SITE_MANAGED=1 ;;
             "# ezvps:domain="*) NGX_SITE_DOMAIN="${line#\# ezvps:domain=}" ;;
             "# ezvps:upstream="*) NGX_SITE_UPSTREAM="${line#\# ezvps:upstream=}" ;;
+            "# ezvps:https=on"*) NGX_SITE_HTTPS=1 ;;
             *)
-                if [[ -z "$first_name" && "$line" =~ $NGX_SERVER_NAME_RE ]]; then
+                code="${line%%#*}"
+                if [[ -z "$first_name" && "$code" =~ $NGX_SERVER_NAME_RE ]]; then
                     read -r first_name _ <<<"${BASH_REMATCH[1]}"
+                fi
+                if [[ "$code" =~ $NGX_PROXY_PASS_RE ]]; then
+                    p="${BASH_REMATCH[2]//[[:cntrl:]]/}"
+                    p="${p#http://}"
+                    if [[ "$seen" != *" ${p} "* ]]; then
+                        seen+="${p} "
+                        if [[ -z "$NGX_SITE_PROXY" ]]; then
+                            NGX_SITE_PROXY="$p"
+                        else
+                            NGX_SITE_PROXY_MORE=$((NGX_SITE_PROXY_MORE + 1))
+                        fi
+                    fi
                 fi
                 ;;
         esac
@@ -1921,6 +1952,7 @@ ngx_read_site() {
     if ((NGX_SITE_MANAGED == 0)); then
         NGX_SITE_DOMAIN="$first_name"
         NGX_SITE_UPSTREAM=""
+        NGX_SITE_HTTPS=0
     fi
     NGX_SITE_DOMAIN="${NGX_SITE_DOMAIN//[[:cntrl:]]/}"
     NGX_SITE_UPSTREAM="${NGX_SITE_UPSTREAM//[[:cntrl:]]/}"
@@ -1932,41 +1964,91 @@ ngx_read_site() {
 # supported by protocol".
 ngx_ipv6_available() { [[ -e "${EZVPS_IF_INET6_FILE:-/proc/net/if_inet6}" ]]; }
 
+# The reverse-proxy part of the site template, shared by the HTTP block and the
+# HTTPS (443) block so both proxy the same way: ngx_render_proxy_body <upstream>.
+# Connection comes from the $connection_upgrade map (ngx_ensure_upgrade_map), so
+# it is "upgrade" only for real WebSocket requests and "close" otherwise.
 # shellcheck disable=SC2016 # nginx variables ($host ...) must stay literal
-ngx_render_site() { # ngx_render_site <domain> <upstream>
+ngx_render_proxy_body() {
     printf '%s\n' \
-        "# Managed by ezvps (Nginx module). HTTP reverse proxy; edit via ezvps or keep the markers." \
-        "# ezvps:domain=${1}" \
-        "# ezvps:upstream=${2}" \
-        "server {" \
-        "    listen 80;"
-    ngx_ipv6_available && printf '%s\n' "    listen [::]:80;"
-    printf '%s\n' \
-        "    server_name ${1};" \
+        "    client_max_body_size 64M;" \
         "" \
         "    location / {" \
-        "        proxy_pass http://${2};" \
+        "        proxy_pass http://${1};" \
         "        proxy_http_version 1.1;" \
         '        proxy_set_header Host $host;' \
         '        proxy_set_header X-Real-IP $remote_addr;' \
         '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
         '        proxy_set_header X-Forwarded-Proto $scheme;' \
+        '        proxy_set_header X-Forwarded-Port $server_port;' \
         '        proxy_set_header Upgrade $http_upgrade;' \
-        '        proxy_set_header Connection "upgrade";' \
+        '        proxy_set_header Connection $connection_upgrade;' \
+        "        proxy_connect_timeout 60s;" \
+        "        proxy_read_timeout 120s;" \
+        "        proxy_send_timeout 120s;" \
+        "    }"
+}
+
+# ngx_render_site <domain> <upstream> [https]: the complete conf.d/<domain>.conf.
+#   plain  (default): one `listen 80` server that proxies to the upstream.
+#   https:  the Certificates module's form. The HTTP server only redirects (301 to
+#           https://$host$request_uri) and a `listen 443 ssl` server with `http2 on`
+#           and the certificate from the ezvps store (CERT_DIR) does the proxying.
+# The redirect is inside `location /` on purpose: a server-level `return` runs
+# before locations are matched, which would stop acme.sh's temporary
+# /.well-known/acme-challenge/ location (HTTP-01 renewals) from ever answering.
+# shellcheck disable=SC2016 # nginx variables ($host ...) must stay literal
+ngx_render_site() {
+    local https=0
+    [[ "${3:-}" == "https" ]] && https=1
+    printf '%s\n' \
+        "# Managed by ezvps (Nginx module). Reverse proxy; edit via ezvps or keep the markers." \
+        "# ezvps:domain=${1}" \
+        "# ezvps:upstream=${2}"
+    ((https == 1)) && printf '%s\n' "# ezvps:https=on"
+    printf '%s\n' \
+        "server {" \
+        "    listen 80;"
+    ngx_ipv6_available && printf '%s\n' "    listen [::]:80;"
+    printf '%s\n' "    server_name ${1};" ""
+    if ((https == 0)); then
+        ngx_render_proxy_body "$2"
+        printf '%s\n' "}"
+        return 0
+    fi
+    printf '%s\n' \
+        "    location / {" \
+        '        return 301 https://$host$request_uri;' \
         "    }" \
-        "}"
+        "}" \
+        "" \
+        "server {" \
+        "    listen 443 ssl;"
+    ngx_ipv6_available && printf '%s\n' "    listen [::]:443 ssl;"
+    printf '%s\n' \
+        "    http2 on;" \
+        "    server_name ${1};" \
+        "" \
+        "    ssl_certificate ${CERT_DIR}/${1}/fullchain.pem;" \
+        "    ssl_certificate_key ${CERT_DIR}/${1}/privkey.pem;" \
+        ""
+    ngx_render_proxy_body "$2"
+    printf '%s\n' "}"
     return 0
 }
 
 # Another site file (not <domain>.conf itself) that already serves <domain>:
 # any other conf.d/*.conf (default.conf is handled separately only in that it
 # is offered for disabling), or a file in the legacy sites-enabled. Prints "conf.d/<file>" or
-# "sites-enabled/<file>". Read-only.
+# "sites-enabled/<file>". Read-only. With a second argument ("any") nothing is
+# excluded, so it answers "does any loaded file serve <domain>?" (Certificates).
 ngx_find_conflict() {
     local f line tok code hit=0
     for f in "$NGX_CONFD"/*.conf "$NGX_ENABLED"/*; do
         [[ -f "$f" ]] || continue
-        [[ "$f" == "${NGX_CONFD}/${1}.conf" || "$f" == "$NGX_DEFAULT_CONF" ]] && continue
+        if [[ -z "${2:-}" ]]; then
+            [[ "$f" == "${NGX_CONFD}/${1}.conf" || "$f" == "$NGX_DEFAULT_CONF" ]] && continue
+        fi
         while IFS= read -r line; do
             code="${line%%#*}"
             if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
@@ -2162,6 +2244,126 @@ ngx_ensure_confd_include() {
     return 0
 }
 
+# --- nginx.conf must define $connection_upgrade -------------------------------------------
+# The site template sends `Connection $connection_upgrade` instead of a fixed
+# "upgrade" (which would break keep-alive for normal requests). The variable
+# comes from the standard WebSocket map, which must exist exactly once in the
+# http context: a second `map ... $connection_upgrade` makes nginx -t fail.
+
+# shellcheck disable=SC2016 # \$ is a regex escape here, not a shell expansion
+NGX_MAP_RE='^[[:space:]]*map[[:space:]]+\$http_upgrade[[:space:]]+\$connection_upgrade[[:space:]]*\{'
+
+# Does <file> have a (non-comment) `map $http_upgrade $connection_upgrade {` line?
+ngx_file_has_map() {
+    local line code
+    [[ -r "$1" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        code="${line%%#*}"
+        [[ "$code" =~ $NGX_MAP_RE ]] && return 0
+    done <"$1"
+    return 1
+}
+
+# Already defined anywhere nginx loads it from: nginx.conf, conf.d/*.conf, or a
+# legacy sites-enabled file. Defining it again would break the config test.
+ngx_has_upgrade_map() {
+    local f
+    for f in "$NGX_CONF" "$NGX_CONFD"/*.conf "$NGX_ENABLED"/*; do
+        [[ -f "$f" ]] || continue
+        ngx_file_has_map "$f" && return 0
+    done
+    return 1
+}
+
+# ngx_scan_map <file> <out>: copy <file> to <out> with the map added inside the
+# http block, just before its conf.d include (else before the closing brace).
+# Sets NGX_HAS_HTTP and NGX_INSERTED.
+ngx_scan_map() {
+    local line code trimmed depth=0 http_in=0 pre o c
+    NGX_HAS_HTTP=0 NGX_INSERTED=0
+    : >"$2"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        code="${line%%#*}"
+        trimmed="${code#"${code%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        pre=$depth
+        if ((http_in == 0 && depth == 0)) && [[ "$code" =~ $NGX_HTTP_OPEN_RE ]]; then
+            NGX_HAS_HTTP=1
+            http_in=$((depth + 1))
+        fi
+        if ((http_in > 0 && pre == http_in && NGX_INSERTED == 0)); then
+            if [[ "$code" =~ $NGX_INCLUDE_RE || "$trimmed" == "}" ]]; then
+                # shellcheck disable=SC2016 # nginx variables, written literally
+                printf '%s\n' \
+                    "    # added by ezvps: WebSocket upgrade map used by the ezvps site template" \
+                    '    map $http_upgrade $connection_upgrade {' \
+                    "        default upgrade;" \
+                    "        ''      close;" \
+                    "    }" >>"$2"
+                NGX_INSERTED=1
+            fi
+        fi
+        printf '%s\n' "$line" >>"$2"
+        o="${code//[^\{]/}"
+        c="${code//[^\}]/}"
+        depth=$((depth + ${#o} - ${#c}))
+        ((depth < http_in)) && http_in=0
+    done <"$1"
+    return 0
+}
+
+# Make sure the map exists before a site that uses $connection_upgrade is
+# written. Missing: nginx.conf is backed up, the map is added inside http, and
+# `nginx -t` must pass; otherwise nginx.conf is restored. Present anywhere (even
+# in a conf.d file): nothing is touched, so it is never duplicated. Non-zero =
+# not safe to go on.
+ngx_ensure_upgrade_map() {
+    local bk tmp
+    if [[ ! -f "$NGX_CONF" ]]; then
+        err "${NGX_CONF} not found; cannot check for the \$connection_upgrade map."
+        return 1
+    fi
+    ngx_has_upgrade_map && return 0
+    info ""
+    # shellcheck disable=SC2016 # nginx variable names, printed literally
+    info 'ezvps sites use $connection_upgrade (WebSocket support) and no map for it exists yet.'
+    info "ezvps will back up nginx.conf and add the standard map inside its http block."
+    backup_file "$NGX_CONF" "nginx.conf-map" || return 1
+    bk="$BACKUP_FILE_PATH"
+    tmp="${NGX_DIR}/.nginx.conf.ezvps-map-tmp.$$"
+    ngx_scan_map "$NGX_CONF" "$tmp"
+    if ((NGX_INSERTED == 0)); then
+        rm -f "$tmp"
+        if ((NGX_HAS_HTTP == 0)); then
+            err "Found no http block in ${NGX_CONF}. Add the map inside http { } yourself:"
+        else
+            err "Could not find the end of the http block in ${NGX_CONF}. Add the map inside http { } yourself:"
+        fi
+        # shellcheck disable=SC2016 # nginx syntax, printed literally
+        err '    map $http_upgrade $connection_upgrade { default upgrade; '"''"' close; }'
+        return 1
+    fi
+    if ! cp "$tmp" "$NGX_CONF"; then
+        rm -f "$tmp"
+        cp -a "$bk" "$NGX_CONF" 2>/dev/null
+        err "Could not write ${NGX_CONF}; the original was kept (backup: ${bk})."
+        return 1
+    fi
+    rm -f "$tmp"
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED after adding the connection map; nginx was NOT reloaded."
+        ngx_print_test_output
+        if cp -a "$bk" "$NGX_CONF"; then
+            info "Rolled back: ${NGX_CONF} was restored from ${bk}."
+        else
+            err "ROLLBACK PROBLEM: restore ${NGX_CONF} from ${bk} by hand."
+        fi
+        return 1
+    fi
+    info "Added the connection map to ${NGX_CONF}. Config test passes."
+    return 0
+}
+
 # --- legacy layout (sites-available + sites-enabled) --------------------------------------
 # ezvps no longer creates or manages sites there. Only the migration below
 # reads those directories, and only for files carrying the ezvps marker.
@@ -2310,13 +2512,16 @@ ngx_offer_migration() {
 
 # --- list ------------------------------------------------------------------------
 
+# Read-only apart from the legacy-migration offer: every conf.d/*.conf file is
+# parsed (never edited) and its proxy_pass upstream shown when it has one, for
+# files written by hand or by other tools as well as for ezvps-made sites.
 ngx_list_sites() {
     ngx_installed || {
         info "Nginx is not installed. Choose 'Install Nginx' first."
         return 0
     }
     ngx_offer_migration || true
-    local f name shown=0 dom
+    local f name shown=0 dom up
     info ""
     info "Sites (${NGX_CONFD}/*.conf):"
     for f in "$NGX_CONFD"/*.conf; do
@@ -2333,10 +2538,17 @@ ngx_list_sites() {
         fi
         ngx_read_site "$f" || true
         dom="${NGX_SITE_DOMAIN:--}"
+        # The real proxy_pass wins; an ezvps file without one falls back to its marker.
+        up="${NGX_SITE_PROXY:-}"
+        if [[ -z "$up" && $NGX_SITE_MANAGED -eq 1 ]]; then
+            up="$NGX_SITE_UPSTREAM"
+        fi
+        up="${up:--}"
+        ((NGX_SITE_PROXY_MORE > 0)) && up+=" (+${NGX_SITE_PROXY_MORE} more)"
         if ((NGX_SITE_MANAGED == 1)); then
-            printf '  %-32s %-28s %-24s %s\n' "$name" "$dom" "${NGX_SITE_UPSTREAM:--}" "ezvps"
+            printf '  %-32s %-28s %-24s %s\n' "$name" "$dom" "$up" "ezvps"
         else
-            printf '  %-32s %-28s %-24s %s\n' "$name" "$dom" "-" "not ezvps"
+            printf '  %-32s %-28s %-24s %s\n' "$name" "$dom" "$up" "not ezvps"
         fi
     done
     ((shown == 0)) && info "  (none)"
@@ -2409,6 +2621,10 @@ ngx_add_site() {
         else
             info "  ${f}  (NOT created by ezvps)"
         fi
+        if ((NGX_SITE_HTTPS == 1)); then
+            warn "  HTTPS is enabled on it. Overwriting writes a plain HTTP site: the 443 block is dropped"
+            warn "  (the certificate stays in ${CERT_DIR}; run Certificates -> Issue certificate to enable HTTPS again)."
+        fi
         ask_yes_no "Overwrite it with a reverse proxy to ${up}? The old file is backed up first." || {
             info "Cancelled. Nothing was changed."
             return 0
@@ -2433,6 +2649,11 @@ ngx_add_site() {
     fi
 
     ngx_ensure_confd_include || {
+        info "The site was not added."
+        return 0
+    }
+    # The template uses $connection_upgrade: its map must be in place first.
+    ngx_ensure_upgrade_map || {
         info "The site was not added."
         return 0
     }
@@ -2463,8 +2684,9 @@ ngx_add_site() {
     fi
     info ""
     info "Point the DNS record of ${domain} at this server and make sure port 80 is open."
-    info "This site is HTTP only. If it needs HTTPS, use the Certificates module once it"
-    info "exists (not available yet); this module does not touch certificates."
+    info "This site is HTTP only. For HTTPS use Certificates -> Issue certificate, which can"
+    info "enable HTTPS for this site once the certificate is issued; this module does not"
+    info "touch certificates."
     return 0
 }
 
@@ -2493,6 +2715,10 @@ ngx_remove_site() {
         info "  ${f}  (created by ezvps, upstream ${NGX_SITE_UPSTREAM:-unknown})"
     else
         warn "  ${f}  (NOT created by ezvps - it was written by hand or another tool)"
+    fi
+    if ((NGX_SITE_HTTPS == 1)); then
+        info "  HTTPS is enabled on it; its certificate stays in ${CERT_DIR}/${domain}"
+        info "  (remove it with Certificates -> Remove certificate)."
     fi
     ask_yes_no "Remove ${domain}? A backup of the file is kept." || {
         info "Cancelled. Nothing was changed."
@@ -2552,6 +2778,716 @@ module_nginx() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Certificates module (PR 8)
+#
+# Free certificates from Let's Encrypt through acme.sh, validated with HTTP-01
+# THROUGH NGINX (acme.sh --nginx), for ONE domain at a time. No wildcard, no DNS
+# API, no DNS provider credentials of any kind.
+#
+# acme.sh comes from its official project (https://github.com/acmesh-official/acme.sh):
+# the script at a pinned release tag, downloaded to a temp file, checked against a
+# pinned SHA-256 and installed with its own `--install`; never piped into a shell.
+#
+# Certificates live in ${CERT_DIR}/<domain>/{fullchain,privkey}.pem (the dir is
+# mode 700, the key mode 600). An existing ezvps nginx site can be switched to
+# HTTPS: ezvps rewrites that site's conf.d file (backup first, `nginx -t` before
+# any reload, rollback on failure) and nothing else. The private key is never
+# printed.
+#
+# To bump acme.sh: pick a newer tag, read the script, update ACME_PINNED_TAG and
+# ACME_SCRIPT_SHA256 together (sha256 of acme.sh at that tag) and SPEC.md 6.4.
+# ---------------------------------------------------------------------------
+
+ACME_UPSTREAM="acmesh-official/acme.sh"
+ACME_PINNED_TAG="3.1.6"
+ACME_SCRIPT_URL="https://raw.githubusercontent.com/${ACME_UPSTREAM}/${ACME_PINNED_TAG}/acme.sh"
+ACME_SCRIPT_SHA256="c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7"
+ACME_HOME="${EZVPS_ACME_HOME:-${HOME:-/root}/.acme.sh}"
+# acme.sh 3.x defaults to ZeroSSL, which needs an account with an e-mail address;
+# Let's Encrypt needs neither, so ezvps always asks for it explicitly.
+CERT_CA_SERVER="letsencrypt"
+# Run by acme.sh after it installs a certificate (issue and every later renewal,
+# including its own cron job): reload nginx, but only with a valid config.
+CERT_RELOADCMD="nginx -t && systemctl reload nginx"
+
+# Filled by the helpers below.
+ACME_BIN="" ACME_ARGS=() ACME_OUT="" ACME_RC=0 ACME_VER="" ACME_TMP_DIR=""
+CERT_EXPIRY_DATE="" CERT_EXPIRY_NOTE=""
+CERT_SITE_STATE="" CERT_SITE_UP="" CERT_USERS=()
+CERT_SSLCERT_RE='(^|[[:space:];{])ssl_certificate[[:space:]]+([^;[:space:]]+)[[:space:]]*;'
+
+# --- acme.sh -------------------------------------------------------------------
+
+# acme_find: the acme.sh that ezvps manages (${ACME_HOME}/acme.sh), else one on
+# PATH. Sets ACME_BIN and ACME_ARGS (the --home argument when it is ours).
+acme_find() {
+    ACME_BIN="" ACME_ARGS=()
+    if [[ -f "${ACME_HOME}/acme.sh" && -x "${ACME_HOME}/acme.sh" ]]; then
+        ACME_BIN="${ACME_HOME}/acme.sh"
+        ACME_ARGS=(--home "$ACME_HOME")
+        return 0
+    fi
+    if have_cmd acme.sh; then
+        ACME_BIN="$(command -v acme.sh)"
+        return 0
+    fi
+    return 1
+}
+
+# acme_exec <args...>: run acme.sh, keep its output in ACME_OUT and its status in ACME_RC.
+acme_exec() {
+    ACME_OUT="$("$ACME_BIN" "${ACME_ARGS[@]}" "$@" 2>&1)"
+    ACME_RC=$?
+    return "$ACME_RC"
+}
+
+# Show ACME_OUT, but never anything between private-key markers (acme.sh does
+# not print keys unless debugging is on; this makes sure ezvps never does).
+acme_print_output() {
+    local line skip=0
+    [[ -n "$ACME_OUT" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if ((skip == 1)); then
+            [[ "$line" == *"PRIVATE KEY-----"* ]] && skip=0
+            continue
+        fi
+        if [[ "$line" == *"PRIVATE KEY-----"* ]]; then
+            skip=1
+            info "  (private key material hidden)"
+            continue
+        fi
+        info "  ${line//[[:cntrl:]]/}"
+    done <<<"$ACME_OUT"
+    return 0
+}
+
+# acme_version: does `acme.sh --version` work? Sets ACME_VER (for example v3.1.6).
+acme_version() {
+    local out line
+    ACME_VER=""
+    out="$("$ACME_BIN" "${ACME_ARGS[@]}" --version 2>&1)" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && ACME_VER="$line"
+    done <<<"$out"
+    [[ -n "$ACME_VER" ]]
+}
+
+acme_report_version() {
+    if acme_version; then
+        info "Verified: the acme.sh command works (${ACME_VER}, ${ACME_BIN})."
+        return 0
+    fi
+    err "acme.sh is at ${ACME_BIN} but '${ACME_BIN} --version' did not work."
+    err "Fix or remove it, then run Install acme.sh again."
+    return 1
+}
+
+acme_cleanup_tmp() {
+    [[ -n "$ACME_TMP_DIR" && -d "$ACME_TMP_DIR" ]] && rm -rf "$ACME_TMP_DIR"
+    ACME_TMP_DIR=""
+    return 0
+}
+
+# Downloads the pinned acme.sh to $ACME_TMP_DIR/acme.sh and verifies it.
+acme_fetch_script() {
+    local actual
+    ACME_TMP_DIR="$(mktemp -d)" || {
+        err "Cannot create a temporary directory."
+        return 1
+    }
+    if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 --max-time 120 \
+        -o "${ACME_TMP_DIR}/acme.sh" "$ACME_SCRIPT_URL"; then
+        err "Download failed: ${ACME_SCRIPT_URL}"
+        acme_cleanup_tmp
+        return 1
+    fi
+    actual="$(sha256sum "${ACME_TMP_DIR}/acme.sh")" || {
+        err "sha256sum failed."
+        acme_cleanup_tmp
+        return 1
+    }
+    actual="${actual%% *}"
+    if [[ "$actual" != "$ACME_SCRIPT_SHA256" ]]; then
+        err "SHA-256 mismatch for the downloaded acme.sh; refusing to run it."
+        err "  expected: ${ACME_SCRIPT_SHA256}"
+        err "  got:      ${actual}"
+        acme_cleanup_tmp
+        return 1
+    fi
+    info "Downloaded acme.sh matches the pinned sha256."
+    return 0
+}
+
+# acme.sh --install adds a line to root's crontab: keep a copy of the current one.
+cert_backup_crontab() {
+    local out dest
+    have_cmd crontab || return 0
+    out="$(crontab -l 2>/dev/null)" || out=""
+    [[ -n "$out" ]] || return 0
+    dest="${NGX_BACKUP_BASE}/crontab-root.$(date +%Y%m%d-%H%M%S).$$"
+    if ! { mkdir -p "$NGX_BACKUP_BASE" && chmod 700 "$NGX_BACKUP_BASE" && printf '%s\n' "$out" >"$dest" && chmod 600 "$dest"; }; then
+        err "Backup of the current crontab to ${dest} failed; aborting before any change."
+        return 1
+    fi
+    info "Backed up the current crontab to ${dest}"
+    return 0
+}
+
+# Is acme.sh's renewal job in root's crontab?
+acme_cron_present() {
+    have_cmd crontab || return 1
+    [[ "$(crontab -l 2>/dev/null)" == *"acme.sh --cron"* ]]
+}
+
+cert_install_acme() {
+    local nocron=0 args
+    require_supported_os "acme.sh install" || return 0
+    if acme_find; then
+        info ""
+        info "acme.sh is already installed (${ACME_BIN}). Not reinstalling."
+        acme_report_version || true
+        return 0
+    fi
+    require_cmds cp mkdir rm mktemp date chmod sha256sum || return 0
+    ensure_curl "download acme.sh" || return 0
+    have_cmd crontab || nocron=1
+    info ""
+    info "ezvps will install acme.sh, the ACME client that gets the certificates:"
+    info "  project:  https://github.com/${ACME_UPSTREAM}"
+    info "  version:  ${ACME_PINNED_TAG} (pinned release tag)"
+    info "  from:     ${ACME_SCRIPT_URL}"
+    info "  sha256:   ${ACME_SCRIPT_SHA256} (expected)"
+    info "  into:     ${ACME_HOME}"
+    info "The file is saved to a temporary directory and checked against that hash first;"
+    info "it is never piped into a shell. Only the acme.sh script is installed (no DNS API"
+    info "plugins: ezvps validates with HTTP-01 through nginx only). It is run with its own"
+    info "--install, without touching your shell profile."
+    if ((nocron == 1)); then
+        warn "crontab is not installed, so acme.sh is installed WITHOUT its daily renewal job."
+        warn "Install cron (apt-get install cron) and re-run acme.sh --install later, or use Renew certificates by hand."
+    else
+        info "It adds acme.sh's daily renewal job to root's crontab (your current crontab is backed up first)."
+    fi
+    info ""
+    ask_yes_no "Download and install acme.sh ${ACME_PINNED_TAG} now?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    cert_backup_crontab || return 0
+    acme_fetch_script || return 0
+    args=(--install --home "$ACME_HOME" --no-profile)
+    ((nocron == 1)) && args+=(--nocron)
+    if ! (cd "$ACME_TMP_DIR" && bash ./acme.sh "${args[@]}"); then
+        err "The acme.sh installer failed (see its output above)."
+        acme_cleanup_tmp
+        return 0
+    fi
+    acme_cleanup_tmp
+    if ! acme_find; then
+        err "acme.sh was not found at ${ACME_HOME}/acme.sh after the install."
+        return 0
+    fi
+    acme_report_version || return 0
+    if [[ "$ACME_VER" != "v${ACME_PINNED_TAG}" ]]; then
+        warn "Expected v${ACME_PINNED_TAG} but the command reports ${ACME_VER}."
+    fi
+    info "acme.sh is ready. Use 'Issue certificate' next."
+    return 0
+}
+
+# --- certificate files -----------------------------------------------------------
+
+# cert_expiry <fullchain.pem>: sets CERT_EXPIRY_DATE (YYYY-MM-DD) and CERT_EXPIRY_NOTE
+# ("N days left" / "EXPIRED"). Non-zero when openssl is missing or the file is not a certificate.
+cert_expiry() {
+    local out end epoch now days
+    CERT_EXPIRY_DATE="" CERT_EXPIRY_NOTE=""
+    have_cmd openssl || return 1
+    out="$(openssl x509 -enddate -noout -in "$1" 2>/dev/null)" || return 1
+    [[ "$out" == notAfter=* ]] || return 1
+    end="${out#notAfter=}"
+    epoch="$(date -d "$end" +%s 2>/dev/null)" || return 1
+    CERT_EXPIRY_DATE="$(TZ=UTC date -d "@${epoch}" +%Y-%m-%d)" || return 1
+    now="$(date +%s)"
+    if ((epoch <= now)); then
+        CERT_EXPIRY_NOTE="EXPIRED"
+    else
+        days=$(((epoch - now) / 86400))
+        CERT_EXPIRY_NOTE="${days} days left"
+    fi
+    return 0
+}
+
+# cert_sites_using <domain>: fills CERT_USERS with the names of ALL conf.d files
+# whose ssl_certificate is this domain's ezvps certificate (ezvps-made or not).
+# Returns 1 when there are none. Read-only.
+cert_sites_using() {
+    local f line code want="${CERT_DIR}/${1}/fullchain.pem"
+    CERT_USERS=()
+    for f in "$NGX_CONFD"/*.conf; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            code="${line%%#*}"
+            if [[ "$code" =~ $CERT_SSLCERT_RE && "${BASH_REMATCH[2]}" == "$want" ]]; then
+                CERT_USERS+=("${f##*/}")
+                break
+            fi
+        done <"$f"
+    done
+    ((${#CERT_USERS[@]} > 0))
+}
+
+# cert_site_state <domain>: what is conf.d/<domain>.conf? Sets CERT_SITE_STATE:
+#   none         there is no such file
+#   ezvps        made by ezvps (valid markers), plain HTTP
+#   ezvps-https  made by ezvps, with the https marker
+#   foreign      anything else (hand-written, symlink, broken markers): never edited
+# and CERT_SITE_UP, the validated upstream of an ezvps site.
+cert_site_state() {
+    local f="${NGX_CONFD}/${1}.conf"
+    CERT_SITE_STATE="none" CERT_SITE_UP=""
+    [[ -e "$f" || -L "$f" ]] || return 0
+    CERT_SITE_STATE="foreign"
+    [[ -f "$f" && ! -L "$f" ]] || return 0
+    ngx_read_site "$f" || return 0
+    ((NGX_SITE_MANAGED == 1)) && [[ "$NGX_SITE_DOMAIN" == "$1" ]] || return 0
+    ngx_parse_upstream "$NGX_SITE_UPSTREAM" 2>/dev/null || return 0
+    CERT_SITE_UP="$NGX_UP"
+    if ((NGX_SITE_HTTPS == 1)); then
+        CERT_SITE_STATE="ezvps-https"
+    else
+        CERT_SITE_STATE="ezvps"
+    fi
+    return 0
+}
+
+# Put the certificate directory back as it was: remove what is there, then copy
+# the backup (if there was a certificate before).
+cert_store_rollback() { # cert_store_rollback <dir> <backup|"">
+    local ok=0
+    if [[ "$1" == "${CERT_DIR}/"?* ]]; then
+        rm -rf "$1" || ok=1
+        [[ -n "$2" ]] && { cp -a "$2" "$1" || ok=1; }
+    else
+        ok=1
+    fi
+    if ((ok != 0)); then
+        err "ROLLBACK PROBLEM: could not restore ${1}. Backup: ${2:-none}"
+        return 1
+    fi
+    info "Rolled back: the certificate directory is as it was."
+    return 0
+}
+
+# --- nginx site <-> HTTPS ------------------------------------------------------------
+
+# cert_site_write <domain> <upstream> <plain|https>: rewrite conf.d/<domain>.conf
+# (an ezvps-made site) from the site template. Order: nginx.conf checks, backup of
+# the site file, write (temp file + mv), `nginx -t`; a failing test restores the
+# file. It never reloads nginx: the caller does, after this returns 0.
+cert_site_write() {
+    local domain="$1" up="$2" mode="$3" f tmp bk
+    f="${NGX_CONFD}/${domain}.conf"
+    ngx_ensure_confd_include || {
+        info "The site was not changed."
+        return 1
+    }
+    ngx_ensure_upgrade_map || {
+        info "The site was not changed."
+        return 1
+    }
+    backup_file "$f" "nginx-site-${domain}" || return 1
+    bk="$BACKUP_FILE_PATH"
+    tmp="${NGX_CONFD}/.${domain}.ezvps-tmp.$$"
+    if ! { ngx_render_site "$domain" "$up" "$mode" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$f"; }; then
+        rm -f "$tmp"
+        err "Could not write ${f}. The site was not changed."
+        return 1
+    fi
+    if ! ngx_config_test; then
+        err "The nginx config test FAILED after rewriting ${f}; nginx was NOT reloaded."
+        ngx_print_test_output
+        ngx_rollback_site "$f" "$bk" ""
+        return 1
+    fi
+    return 0
+}
+
+# Config test, then reload; a failing test means no reload.
+cert_reload_checked() {
+    if ngx_config_test; then
+        ngx_reload
+        return 0
+    fi
+    err "The nginx config test FAILED; nginx was NOT reloaded."
+    ngx_print_test_output
+    return 1
+}
+
+# After a certificate is stored: offer HTTPS for the ezvps site of that domain.
+cert_offer_https() {
+    local domain="$1" f
+    f="${NGX_CONFD}/${domain}.conf"
+    cert_site_state "$domain"
+    case "$CERT_SITE_STATE" in
+        ezvps-https)
+            info ""
+            info "HTTPS is already enabled for ${domain} (${f} uses this certificate)."
+            info "Reloading nginx so it serves the stored certificate (config test first)..."
+            cert_reload_checked || true
+            ;;
+        ezvps)
+            info ""
+            info "An ezvps nginx site exists for ${domain} (${f}, upstream ${CERT_SITE_UP})."
+            info "Enabling HTTPS rewrites that one file: a 443 ssl server block (http2 on) with this"
+            info "certificate and the same proxy settings, and the HTTP block becomes a 301 redirect"
+            info "to https://\$host\$request_uri. The file is backed up first, nginx -t must pass"
+            info "before nginx is reloaded, and a failing test restores the file."
+            if ask_yes_no "Enable HTTPS for ${domain} now?"; then
+                if cert_site_write "$domain" "$CERT_SITE_UP" https; then
+                    info "HTTPS enabled for ${domain}. Config test passes."
+                    ngx_reload
+                    info "Make sure port 443 is open (the firewall is not changed here): https://${domain}/"
+                else
+                    info "HTTPS was not enabled; the site is as it was. The certificate stays stored."
+                fi
+            else
+                info "HTTPS was not enabled. Run Issue certificate again for ${domain} to be asked again."
+            fi
+            ;;
+        *)
+            info ""
+            info "There is no ezvps nginx site for ${domain} (nginx serves it from a file ezvps did not"
+            info "create), so the certificate was only stored. ezvps did not create or edit any site."
+            info "Point ssl_certificate and ssl_certificate_key at the files above in your own config,"
+            info "or add an ezvps site (Nginx -> Add site) and run Issue certificate again to enable HTTPS."
+            ;;
+    esac
+    return 0
+}
+
+# --- menu actions ----------------------------------------------------------------------
+
+# Like ngx_ask_domain, with clear messages for wildcards and lists.
+cert_ask_domain() {
+    local d t
+    REPLY_DOMAIN=""
+    read -r -p "Domain (one domain, for example example.com): " d || {
+        info ""
+        return 1
+    }
+    t="${d#"${d%%[![:space:]]*}"}"
+    t="${t%"${t##*[![:space:]]}"}"
+    if [[ -z "$t" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 1
+    fi
+    if [[ "$t" == *"*"* ]]; then
+        err "Wildcard certificates need DNS validation, which is not supported (single-domain HTTP-01 only). Nothing was changed."
+        return 1
+    fi
+    if [[ "$t" == *[,[:space:]]* ]]; then
+        err "Enter exactly one domain (several domains or lists are not supported). Nothing was changed."
+        return 1
+    fi
+    ngx_clean_domain "$t"
+}
+
+cert_issue() {
+    local domain dir bk="" rc
+    require_supported_os "Certificate issue" || return 0
+    if ! acme_find; then
+        info "acme.sh is not installed. Choose 'Install acme.sh' first."
+        return 0
+    fi
+    ngx_need_nginx || return 0
+    require_cmds cp mkdir mv rm date chmod systemctl || return 0
+    if [[ "$(ngx_service_state)" != "running" ]]; then
+        err "nginx is not running; it must answer the HTTP-01 validation. Start it with Nginx -> Restart. Nothing was changed."
+        return 0
+    fi
+    if ! port_in_use "$NGX_HTTP_PORT"; then
+        err "Nothing is listening on port ${NGX_HTTP_PORT}, so the HTTP-01 validation cannot reach nginx. Nothing was changed."
+        return 0
+    fi
+    cert_ask_domain || return 0
+    domain="$REPLY_DOMAIN"
+    dir="${CERT_DIR}/${domain}"
+    if ! ngx_find_conflict "$domain" any >/dev/null; then
+        err "No nginx server block serves ${domain}. acme.sh answers the validation through the nginx"
+        err "server block of the domain, so add the site first (Nginx -> Add site). Nothing was changed."
+        return 0
+    fi
+    info ""
+    info "Issue a certificate for ${domain}: single domain, HTTP-01 validation through nginx,"
+    info "issued by Let's Encrypt. No DNS provider credentials are asked for or stored."
+    warn "The DNS record of ${domain} must point to THIS server before issuing, and port 80 must be"
+    warn "reachable from the internet (the firewall is not changed here); otherwise the validation fails."
+    if [[ -d "$dir" ]]; then
+        info "A certificate for ${domain} is already stored in ${dir}; it is backed up before it is replaced."
+    fi
+    ask_yes_no "Does ${domain} point to this server? Issue the certificate now?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    info ""
+    info "Running acme.sh (nginx mode: it briefly adds an ACME challenge location to the nginx server"
+    info "block of ${domain} and puts the file back afterwards)..."
+    acme_exec --issue -d "$domain" --nginx --server "$CERT_CA_SERVER"
+    rc=$ACME_RC
+    acme_print_output
+    if ! ngx_config_test; then
+        err "The nginx config test FAILS after acme.sh ran; nginx was NOT reloaded by ezvps and no certificate was stored."
+        ngx_print_test_output
+        err "acme.sh keeps backups of the files it edits as <domain>.nginx.conf under ${ACME_HOME}."
+        return 0
+    fi
+    if ((rc == 2)); then
+        info "acme.sh did not issue a new certificate: the existing one for ${domain} is still valid (not due for renewal)."
+    elif ((rc != 0)); then
+        err "acme.sh could not issue the certificate for ${domain} (exit ${rc}). Nothing was stored; no site was changed."
+        info "Check that the DNS record points here, that port 80 is open to the internet, that nginx serves"
+        info "${domain} on port 80, and Let's Encrypt's rate limits."
+        return 0
+    fi
+
+    if ! { mkdir -p "$CERT_DIR" && chmod 700 "$CERT_DIR"; }; then
+        err "Cannot create ${CERT_DIR}. The certificate was issued by acme.sh but not stored."
+        return 0
+    fi
+    if [[ -d "$dir" ]]; then
+        backup_file "$dir" "cert-${domain}" || return 0
+        bk="$BACKUP_FILE_PATH"
+    fi
+    if ! { mkdir -p "$dir" && chmod 700 "$dir"; }; then
+        err "Cannot create ${dir}. The certificate was issued by acme.sh but not stored."
+        return 0
+    fi
+    acme_exec --install-cert -d "$domain" --fullchain-file "${dir}/fullchain.pem" \
+        --key-file "${dir}/privkey.pem" --reloadcmd "$CERT_RELOADCMD"
+    acme_print_output
+    chmod 600 "${dir}/privkey.pem" 2>/dev/null
+    chmod 644 "${dir}/fullchain.pem" 2>/dev/null
+    if ((ACME_RC != 0)) || [[ ! -s "${dir}/fullchain.pem" || ! -s "${dir}/privkey.pem" ]]; then
+        err "acme.sh could not install the certificate into ${dir} (exit ${ACME_RC})."
+        cert_store_rollback "$dir" "$bk"
+        return 0
+    fi
+    info ""
+    info "Certificate for ${domain} stored in ${dir}:"
+    info "  ${dir}/fullchain.pem   certificate chain"
+    info "  ${dir}/privkey.pem     private key (mode 600, readable only by root; never shown)"
+    if cert_expiry "${dir}/fullchain.pem"; then
+        info "  expires: ${CERT_EXPIRY_DATE} (${CERT_EXPIRY_NOTE})"
+    fi
+    if acme_cron_present; then
+        info "acme.sh renews it automatically (daily cron job), copies the new files here and reloads nginx."
+    else
+        warn "No acme.sh renewal job was found in root's crontab: renew with 'Renew certificates' before it expires."
+    fi
+    cert_offer_https "$domain"
+    return 0
+}
+
+cert_list() {
+    local d dom shown=0 exp site u
+    info ""
+    info "Certificates (${CERT_DIR}):"
+    for d in "$CERT_DIR"/*/; do
+        [[ -d "$d" ]] || continue
+        dom="${d%/}"
+        dom="${dom##*/}"
+        dom="${dom//[[:cntrl:]]/}"
+        if ((shown == 0)); then
+            printf '  %-32s %-34s %s\n' "DOMAIN" "EXPIRES" "NGINX SITE"
+            shown=1
+        fi
+        if [[ ! -f "${d}fullchain.pem" ]]; then
+            exp="no certificate file"
+        elif cert_expiry "${d}fullchain.pem"; then
+            exp="${CERT_EXPIRY_DATE} (${CERT_EXPIRY_NOTE})"
+        elif ! have_cmd openssl; then
+            exp="unknown (openssl not installed)"
+        else
+            exp="unreadable certificate"
+        fi
+        if cert_sites_using "$dom"; then
+            site=""
+            for u in "${CERT_USERS[@]}"; do
+                site+="${site:+, }${u}"
+            done
+            site="yes (${site})"
+        else
+            site="no"
+        fi
+        printf '  %-32s %-34s %s\n' "$dom" "$exp" "$site"
+    done
+    if ((shown == 0)); then
+        info "  (none) Use Issue certificate to get one."
+    fi
+    return 0
+}
+
+# Snapshot every certificate file acme.sh and the ezvps store hold, by content
+# (pure bash, no checksum tool): cert_snapshot <name of an associative array>.
+cert_snapshot() {
+    local -n _snap="$1"
+    local f
+    _snap=()
+    for f in "$ACME_HOME"/*/fullchain.cer "$CERT_DIR"/*/fullchain.pem; do
+        [[ -f "$f" ]] && _snap["$f"]="$(<"$f")"
+    done
+    return 0
+}
+
+cert_renew() {
+    local -A before=() after=()
+    local f changed=0
+    if ! acme_find; then
+        info "acme.sh is not installed. Choose 'Install acme.sh' first."
+        return 0
+    fi
+    cert_snapshot before
+    info ""
+    info "Renewing every acme.sh certificate that is due (acme.sh --renew-all)..."
+    acme_exec --renew-all
+    acme_print_output
+    ((ACME_RC != 0)) && warn "acme.sh reported errors (exit ${ACME_RC}); see its output above."
+    cert_snapshot after
+    for f in "${!after[@]}"; do
+        if [[ -z "${before[$f]+set}" || "${after[$f]}" != "${before[$f]}" ]]; then
+            changed=1
+        fi
+    done
+    if ((changed == 0)); then
+        info "No certificate was renewed (none is due yet). nginx was not reloaded."
+        return 0
+    fi
+    info "At least one certificate was renewed."
+    if ! ngx_installed || ! have_cmd nginx; then
+        info "nginx is not installed here, so there is nothing to reload."
+        return 0
+    fi
+    cert_reload_checked || true
+    return 0
+}
+
+cert_remove() {
+    local domain dir using cbk restore=0 up="" have_nginx=0
+    cert_ask_domain || return 0
+    domain="$REPLY_DOMAIN"
+    dir="${CERT_DIR}/${domain}"
+    if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+        info "No certificate for ${domain} in ${CERT_DIR}. Nothing was changed."
+        return 0
+    fi
+    if [[ -L "$dir" || ! -d "$dir" ]]; then
+        err "${dir} is not a plain directory; ezvps will not remove it. Nothing was changed."
+        return 0
+    fi
+    require_cmds cp mkdir rm date chmod || return 0
+    if ngx_installed && have_cmd nginx; then
+        have_nginx=1
+        # Every file that uses this certificate must be the ezvps HTTPS site of the
+        # domain itself (the one ezvps can safely turn back into plain HTTP); any
+        # other file would break when the certificate files disappear.
+        cert_sites_using "$domain" || true
+        for using in "${CERT_USERS[@]}"; do
+            if [[ "$using" == "${domain}.conf" ]]; then
+                cert_site_state "$domain"
+                if [[ "$CERT_SITE_STATE" == "ezvps-https" ]]; then
+                    restore=1
+                    up="$CERT_SITE_UP"
+                    continue
+                fi
+            fi
+            err "${NGX_CONFD}/${using} uses this certificate but is not an ezvps-made HTTPS site for ${domain},"
+            err "so ezvps will not edit it. Change that file so it no longer uses ${dir}, then try again."
+            err "Nothing was changed."
+            return 0
+        done
+    fi
+    info ""
+    info "Remove the certificate for ${domain}:"
+    info "  - back up ${dir} to ${NGX_BACKUP_BASE} first"
+    if ((restore == 1)); then
+        info "  - rewrite ${NGX_CONFD}/${domain}.conf back to its plain HTTP proxy to ${up}"
+        info "    (the file is backed up first, nginx -t must pass before nginx is reloaded,"
+        info "    and a failing test restores the file and keeps the certificate)"
+    fi
+    info "  - delete ${dir}"
+    if acme_find; then
+        info "  - tell acme.sh to stop renewing it (acme.sh --remove)"
+    fi
+    ask_yes_no "Remove the certificate for ${domain}?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    backup_file "$dir" "cert-${domain}" || return 0
+    cbk="$BACKUP_FILE_PATH"
+    if ((restore == 1)); then
+        if ! cert_site_write "$domain" "$up" plain; then
+            info "The certificate was kept (backup of it: ${cbk}). Nothing else was changed."
+            return 0
+        fi
+        info "${NGX_CONFD}/${domain}.conf is a plain HTTP proxy to ${up} again. Config test passes."
+    fi
+    if [[ "$dir" == "${CERT_DIR}/"?* ]] && rm -rf "$dir"; then
+        info "Removed ${dir}."
+    else
+        err "Could not remove ${dir}. Backup: ${cbk}"
+    fi
+    if acme_find; then
+        acme_exec --remove -d "$domain"
+        acme_print_output
+        if ((ACME_RC != 0)); then
+            warn "acme.sh did not remove ${domain} from its renewal list (exit ${ACME_RC})."
+        else
+            info "acme.sh will no longer renew ${domain}."
+        fi
+        info "acme.sh keeps its own copy of the files in ${ACME_HOME}/${domain}; delete that directory yourself if you do not want it."
+    fi
+    ((restore == 1 && have_nginx == 1)) && ngx_reload
+    info "Backup of the removed certificate: ${cbk}"
+    return 0
+}
+
+# --- submenu ---------------------------------------------------------------------------
+
+CERT_MENU_LABELS=("Install acme.sh" "Issue certificate" "List certificates" "Renew certificates" "Remove certificate")
+
+module_certs() {
+    local choice i
+    while true; do
+        info ""
+        info "${C_BOLD}Certificates${C_RESET}"
+        info ""
+        for i in "${!CERT_MENU_LABELS[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${CERT_MENU_LABELS[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) cert_install_acme || true ;;
+            2) cert_issue || true ;;
+            3) cert_list || true ;;
+            4) cert_renew || true ;;
+            5) cert_remove || true ;;
+            *)
+                warn "Invalid choice: ${choice:-<empty>}"
+                ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
@@ -2559,7 +3495,8 @@ run_module() {
         l2tp) module_l2tp ;;
         3x-ui) module_3x_ui ;;
         nginx) module_nginx ;;
-        backpack | ctunnel | certs | lazyports | ssh | firewall | backup | update | uninstall)
+        certs) module_certs ;;
+        backpack | ctunnel | lazyports | ssh | firewall | backup | update | uninstall)
             module_not_implemented "$1"
             ;;
         *)
@@ -2623,8 +3560,8 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp, 3x-ui and nginx are implemented in this release; the others report
-that they are not implemented yet."
+Only l2tp, 3x-ui, nginx and certs are implemented in this release; the others
+report that they are not implemented yet."
 }
 
 require_root() {

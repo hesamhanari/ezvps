@@ -55,17 +55,31 @@ SPEC.md  README.md  AGENTS.md
   the few external commands its SPEC section lists (3x-ui: `systemctl`,
   `sha256sum`, `curl`, optionally `ss`/`sqlite3`/`hostname`; Nginx:
   `systemctl`, `apt-get`, `apt-cache`, `nginx`, `gpg`, `curl` (key only),
-  `dpkg-query`, optionally `ss`). Shared
+  `dpkg-query`, optionally `ss`; Certificates: `nginx`, `systemctl`,
+  `curl` and `sha256sum` (acme.sh download only), the installed `acme.sh`
+  itself, optionally `openssl` (expiry dates), `crontab` (presence check and
+  backup) and `ss`). Shared
   helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_supported_os`,
   `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
   message; do not assume it.
-* Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`
-  and in `ngx_fetch_key` (the nginx.org signing key); lint enforces it.
+* Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`,
+  in `ngx_fetch_key` (the nginx.org signing key) and in `acme_fetch_script`
+  (the pinned acme.sh script); lint enforces it.
   Download to a temp file, show URL and hash, verify, ask, then run. Never
   pipe or process-substitute a download into a shell. Pin a tag/version plus
   a SHA-256 (the nginx.org key is pinned by fingerprint); never
-  `master`/`main`.
+  `master`/`main`. acme.sh is the script at a release tag with a SHA-256 (SPEC
+  6.4), never `get.acme.sh`.
+* Certificates: HTTP-01 through nginx, one domain, Let's Encrypt only. No
+  wildcard, DNS API, DNS provider credentials, `stream` or certbot. A private
+  key is never printed or read by ezvps; certificates live in `/etc/ssl/ezvps`
+  (dir 700, key 600). Only an ezvps-made site file (valid markers) is ever
+  rewritten for HTTPS or back; hand-written files are never edited.
+* The site template (`ngx_render_site`) is shared by the HTTP and HTTPS forms;
+  `Connection` comes from the `$connection_upgrade` map, never a hardcoded
+  `"upgrade"`, and `ngx_ensure_upgrade_map` must run before any site that uses
+  it is written. `nginx -t` before every reload, rollback on failure.
 * nginx comes only from the nginx.org **stable** repository (never the Debian
   or Ubuntu package, never mainline) with the apt pin; do not weaken that
   (SPEC 6.3). The repository path follows the detected distro
@@ -85,8 +99,8 @@ SPEC.md  README.md  AGENTS.md
 * Output goes through `info` / `warn` / `err`. Colour only on a TTY and
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
-  section 7a (`EZVPS_ALLOW_NONROOT`, `EZVPS_XUI_DIR`, ...). Do not add switches that
-  weaken real behaviour.
+  section 7a (`EZVPS_ALLOW_NONROOT`, `EZVPS_XUI_DIR`, `EZVPS_ACME_HOME`,
+  `EZVPS_CERT_DIR`, ...). Do not add switches that weaken real behaviour.
 
 ## Adding a module
 
@@ -95,8 +109,12 @@ SPEC.md  README.md  AGENTS.md
 2. Follow the module contract in `SPEC.md` section 5.
 3. Extend `tests/smoke-test.sh` with stubs/fakes: no network, no real
    system changes, fake data only (the 3x-ui section is the template: a fake
-   panel CLI, stub `systemctl`/`curl`/`ss`, per-scenario temp dirs). Remove
-   the module from the not-yet-implemented loop.
+   panel CLI, stub `systemctl`/`curl`/`ss`, per-scenario temp dirs; the
+   Certificates section adds a fake `acme.sh`). Remove the module from the
+   not-yet-implemented loop. The test sandbox `PATH` holds only bash, a few
+   coreutils and the stubs, so module code may not rely on other tools. When a
+   test compares a file to a copy of itself it proves nothing: check that each
+   new assertion fails when the behaviour it covers is broken.
 4. Add a section to `tests/fresh-vps-test.md` and update the status table in
    `SPEC.md`.
 5. One module per PR.
