@@ -1,9 +1,10 @@
 # Fresh VPS test (manual)
 
-Run on a **throwaway Debian 13 VPS** and again on a **throwaway Ubuntu 24.04
-LTS VPS**, as root, before merging changes that touch the installer or a
-module. Where the two differ the steps say so (Ubuntu: `noble`,
-`nginx.org/packages/ubuntu`, L2TP is Debian-only). Use fake data only; do not paste real IPs,
+Run on a **throwaway VPS of each supported release** (Debian 12 `bookworm`,
+Debian 13 `trixie`, Ubuntu 22.04 `jammy`, Ubuntu 24.04 `noble`, Ubuntu 26.04
+`resolute`), as root, before merging changes that touch the installer or a
+module. Where they differ the steps say so (Ubuntu: `nginx.org/packages/ubuntu`;
+L2TP is Debian 13 only). Use fake data only; do not paste real IPs,
 tokens or usernames into notes or issues. Placeholders: `<owner>`,
 `192.0.2.10`, `example.com`, `testuser`.
 
@@ -11,9 +12,10 @@ Tick each box; note failures with the exact output.
 
 ## 0. Prerequisites
 
-- [ ] `cat /etc/os-release` shows Debian 13 (`ID=debian`, `VERSION_ID="13"`,
-      `trixie`) or Ubuntu 24.04 (`ID=ubuntu`, `VERSION_ID="24.04"`, `noble`);
-      note which one this run is
+- [ ] `cat /etc/os-release` shows one of: Debian 12 (`ID=debian`,
+      `VERSION_ID="12"`, `bookworm`), Debian 13 (`13`, `trixie`), Ubuntu 22.04
+      (`ID=ubuntu`, `VERSION_ID="22.04"`, `jammy`), Ubuntu 24.04 (`24.04`,
+      `noble`) or Ubuntu 26.04 (`26.04`, `resolute`); note which one this run is
 - [ ] `id -u` prints `0`
 - [ ] `git` is available (`git --version`); if not, `apt-get install -y git`
 - [ ] `command -v ezvps` prints nothing (clean start)
@@ -50,11 +52,13 @@ ls /var/backups/ezvps/
 
 ## 3. L2TP
 
-**3-ubuntu. Ubuntu 24.04 LTS only** (L2TP via ezl2tp is Debian 13 only for now;
-do the Debian steps below on Debian 13 and only this block on Ubuntu)
+**3-other. Debian 12 and Ubuntu 22.04 / 24.04 / 26.04** (L2TP via ezl2tp is
+Debian 13 only for now; do the Debian steps below on Debian 13 and only this
+block on every other supported system)
 
 - [ ] `ezvps` -> `1` prints `L2TP via ezl2tp is Debian 13 only for now (found
-      Ubuntu 24.04).` and `Nothing was changed.`, then the menu returns
+      <System> <version>, <codename>).` and `Nothing was changed.`, then the
+      menu returns
 - [ ] no `Launching ezl2tp...` and no git clone instructions, even if an
       `ezl2tp` command exists; nothing was installed (`command -v ezl2tp`
       unchanged)
@@ -101,9 +105,9 @@ credentials; the default password is a known value and the VPS is throwaway.
 - [ ] `Status`, `Restart`, `Panel info`, `Change password` before any install
       print `3x-ui is not installed.` and return to the submenu
 - [ ] `0` returns to the main menu; invalid input prints `Invalid choice`
-- [ ] on an unsupported host (for example Ubuntu 22.04 or Debian 12; optional,
+- [ ] on an unsupported host (for example Ubuntu 25.10 or Debian 11; optional,
       only on another throwaway VPS) the install options refuse with
-      `needs Debian 13 or Ubuntu 24.04 LTS` and change nothing
+      `needs a supported system: Debian 12 (bookworm), ...` and change nothing
 - [ ] with port 3389 occupied (`python3 -m http.server 3389 &`) `Install 3x-ui`
       says `Port 3389 is already in use` and changes nothing; stop the listener
 - [ ] on an image without curl (`command -v curl` empty) the install asks
@@ -200,8 +204,9 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 **6b. Install (nginx.org stable only)**
 
 - [ ] `1) Install Nginx`: the plan names the `https://nginx.org/packages/debian`
-      repository line for `trixie` (Debian 13) or the
-      `https://nginx.org/packages/ubuntu` line for `noble` (Ubuntu 24.04), the key URL, the pin (`origin nginx.org,
+      repository line with this system's codename (`bookworm` or `trixie`) or
+      the `https://nginx.org/packages/ubuntu` line (`jammy`, `noble` or
+      `resolute`), the key URL, the pin (`origin nginx.org,
       priority 900`) and says stable 1.30 or newer; answer `n` first: nothing
       is changed (`ls /etc/apt/sources.list.d/nginx.list` fails), then repeat
       with `y`
@@ -211,16 +216,17 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       the same fingerprints)
 - [ ] `cat /etc/apt/sources.list.d/nginx.list` is exactly `deb
       [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg]
-      https://nginx.org/packages/debian trixie nginx` on Debian, or `...
-      https://nginx.org/packages/ubuntu noble nginx` on Ubuntu (no `mainline`);
+      https://nginx.org/packages/debian <codename> nginx` on Debian, or `...
+      https://nginx.org/packages/ubuntu <codename> nginx` on Ubuntu, where
+      `<codename>` is this system's own (no `mainline`);
       `cat /etc/apt/preferences.d/99nginx` has `Package: *`, `Pin: origin
       nginx.org`, `Pin-Priority: 900`
-- [ ] `apt-cache policy nginx` shows candidate `1.30.x-1~trixie` (Debian) or
-      `1.30.x-1~noble` (Ubuntu) or newer stable (even minor), with the nginx.org
+- [ ] `apt-cache policy nginx` shows candidate `1.30.x-1~<codename>` or newer
+      stable (even minor), with the nginx.org
       source above the distribution's own
 - [ ] output shows `Version check passes: nginx/1.30.x (nginx.org stable)`;
       `nginx -v` agrees; `dpkg-query -W -f='${Version}\n' nginx` ends in
-      `~trixie` (`~noble` on Ubuntu); `systemctl is-enabled nginx` is `enabled`, `systemctl
+      `~<codename>`; `systemctl is-enabled nginx` is `enabled`, `systemctl
       is-active nginx` is `active`
 - [ ] output shows `Config test passes.` and `Verified: nginx answers on
       127.0.0.1:80 (HTTP 200)`, then the HTTP-only / Certificates note
@@ -234,7 +240,7 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 - [ ] `apt-get upgrade` never offers a Debian/Ubuntu `nginx` (`apt-cache policy
       nginx`: nginx.org stays the candidate)
 - [ ] mainline refusal: add `deb https://nginx.org/packages/mainline/debian
-      trixie nginx` (Ubuntu: `.../mainline/ubuntu noble nginx`) to a file in `/etc/apt/sources.list.d/` on a *fresh*
+      <codename> nginx` (Ubuntu: `.../mainline/ubuntu <codename> nginx`) to a file in `/etc/apt/sources.list.d/` on a *fresh*
       image: `1) Install Nginx` says `MAINLINE source is configured in ...` and
       changes nothing; remove the file
 
@@ -254,7 +260,7 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       and was created before `apt-get purge` ran (see `/var/log/apt/history.log`
       timestamps / the terminal order)
 - [ ] afterwards `dpkg -l | grep nginx` shows only the nginx.org `nginx`
-      (`~trixie`), `nginx -v` is stable 1.30+, and the pin exists
+      (`~<codename>`), `nginx -v` is stable 1.30+, and the pin exists
 - [ ] `/etc/nginx/conf.d/old.example.com.conf` exists (moved, with the
       marker), the `sites-enabled` symlink and the `sites-available` file for it
       are gone; `nginx -t` passes and the log shows the reload came after the

@@ -1,25 +1,40 @@
 # ezvps
 
-A bash TUI/CLI VPS manager for **Debian 13** and **Ubuntu 24.04 LTS**, run as
+A bash TUI/CLI VPS manager for the **Debian and Ubuntu LTS families**, run as
 **root**. One script, no extra dependencies.
 
 ## Supported systems
 
-| System | Version | Status | Notes |
-|--------|---------|--------|-------|
-| Debian | 13 (trixie) | **supported** | all implemented modules |
-| Ubuntu | 24.04 LTS (noble) | **supported** | all implemented modules except L2TP, which is **Debian 13 only** for now |
-| anything else | Ubuntu 22.04, Debian 12, other distros | **rejected** | ezvps and its installer refuse with a clear message and change nothing |
+| System | Version | Codename | Status |
+|--------|---------|----------|--------|
+| Debian | 12 | `bookworm` | **supported** |
+| Debian | 13 | `trixie` | **supported** |
+| Ubuntu | 22.04 LTS | `jammy` | **supported** |
+| Ubuntu | 24.04 LTS | `noble` | **supported** |
+| Ubuntu | 26.04 LTS | `resolute` | **supported** |
+| anything else | Ubuntu interim releases (23.10, 25.04, 25.10, 26.10, ...), Debian 11 and older, Debian testing/sid, other distros, derivatives | n/a | **rejected** |
 
-The system is detected from `/etc/os-release` (`ID`, `VERSION_ID`,
-`VERSION_CODENAME`). Derivatives are not matched through `ID_LIKE`: a
-distribution that is not Debian or Ubuntu itself is rejected.
+Anything else is rejected by ezvps and by `install.sh` with one message that
+lists the supported systems, and nothing is changed. The system is detected
+from `/etc/os-release` (`ID`, `VERSION_ID`, `VERSION_CODENAME`; the file is
+parsed, never sourced) against an exact allowlist, and **all three values must
+agree**: Ubuntu 24.04 with codename `jammy` is rejected as a mismatch, not
+accepted as Ubuntu. `ID_LIKE` is ignored, so derivatives such as Linux Mint are
+rejected.
 
-| Module | Debian 13 | Ubuntu 24.04 LTS |
-|--------|-----------|------------------|
-| L2TP | yes | **no, Debian 13 only for now** (prints a message and returns to the menu) |
-| 3x-ui | yes | yes |
-| Nginx | yes (`nginx.org/packages/debian`, `trixie`) | yes (`nginx.org/packages/ubuntu`, `noble`) |
+### Per module
+
+| Module | Debian 12 | Debian 13 | Ubuntu 22.04 | Ubuntu 24.04 | Ubuntu 26.04 |
+|--------|-----------|-----------|--------------|--------------|--------------|
+| 3x-ui | yes | yes | yes | yes | yes |
+| Nginx (nginx.org stable 1.30+) | yes (`packages/debian`, `bookworm`) | yes (`packages/debian`, `trixie`) | yes (`packages/ubuntu`, `jammy`) | yes (`packages/ubuntu`, `noble`) | yes (`packages/ubuntu`, `resolute`) |
+| L2TP | see below | yes | see below | see below | see below |
+
+**L2TP is gated separately.** The L2TP menu item launches the separate ezl2tp
+product, so it is available only where ezl2tp itself is supported, which is
+currently **Debian 13 only**. ezvps does not port ezl2tp. On every other
+system in the table the L2TP item prints a clear message, installs and
+launches nothing, and returns to the menu.
 
 > **Status: v0.0.1 in development.** **L2TP**, **3x-ui** and **Nginx** work so
 > far. The other menu items (Backpack, ctunnel, Certificates, Lazyports, SSH
@@ -35,7 +50,7 @@ cd ezvps
 sudo bash install.sh
 ```
 
-`install.sh` refuses any system other than Debian 13 or Ubuntu 24.04 LTS, then
+`install.sh` refuses any system that is not in the supported list above, then
 copies the script to `/usr/local/bin/ezvps`. It is safe to
 re-run: an identical install is left alone, a changed one is backed up to
 `/var/backups/ezvps/` before being replaced. An existing ezl2tp install is
@@ -70,9 +85,9 @@ Menu:
 
 ### L2TP
 
-* **Debian 13 only for now.** On Ubuntu 24.04 the module prints that L2TP via
-  ezl2tp is Debian 13 only, changes nothing, does not launch or install
-  ezl2tp, and returns to the menu.
+* **Debian 13 only for now**, because that is what ezl2tp supports. On Debian
+  12 and on Ubuntu the module prints that L2TP via ezl2tp is Debian 13 only,
+  changes nothing, does not launch or install ezl2tp, and returns to the menu.
 * If the `ezl2tp` command is installed, ezvps launches it and brings you
   back to the menu when it exits.
 * If not, ezvps prints instructions to install it from its **private**
@@ -131,9 +146,9 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
 
 * **Install Nginx** installs nginx **only from the official nginx.org stable
   repository** (stable 1.30 or newer; never the Debian or Ubuntu package,
-  never mainline). It adds `https://nginx.org/packages/debian` with codename
-  `trixie` on Debian 13, or `https://nginx.org/packages/ubuntu` with codename
-  `noble` on Ubuntu 24.04,
+  never mainline). It adds `https://nginx.org/packages/debian` on Debian or
+  `https://nginx.org/packages/ubuntu` on Ubuntu, with the detected codename as
+  the suite (`bookworm` or `trixie`; `jammy`, `noble` or `resolute`),
   downloads the signing key from `https://nginx.org/keys/nginx_signing.key`
   and checks it against pinned fingerprints, stores it in
   `/usr/share/keyrings/nginx-archive-keyring.gpg`, and pins origin `nginx.org`
@@ -182,5 +197,5 @@ bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
 bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui and Nginx against fakes, pending modules, installer
 ```
 
-`tests/fresh-vps-test.md` is the manual checklist for a throwaway Debian 13
-or Ubuntu 24.04 LTS VPS. Contributor and agent rules are in [AGENTS.md](AGENTS.md).
+`tests/fresh-vps-test.md` is the manual checklist for a throwaway VPS on each
+supported Debian and Ubuntu release. Contributor and agent rules are in [AGENTS.md](AGENTS.md).
