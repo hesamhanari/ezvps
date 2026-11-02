@@ -164,7 +164,7 @@ credentials; the default password is a known value and the VPS is throwaway.
 
 ## 6. Nginx
 
-Needs outbound HTTPS to the Debian mirrors (apt). Start from an image where
+Needs outbound HTTPS to the Debian mirrors (apt) and to `nginx.org`. Start from an image where
 `command -v nginx` prints nothing and nothing listens on port 80
 (`ss -ltn | grep ':80 '` prints nothing). Use `example.com`-style placeholder
 domains and a throwaway backend such as `python3 -m http.server 3000
@@ -182,16 +182,68 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       shows the listener and asks before going on; answer `n`, nothing is
       installed; stop the listener
 
-**6b. Install**
+**6b. Install (nginx.org stable only)**
 
-- [ ] `1) Install Nginx` -> `y`: apt installs the `nginx` package;
-      `systemctl is-enabled nginx` is `enabled`, `systemctl is-active nginx` is `active`
+- [ ] `1) Install Nginx`: the plan names the `https://nginx.org/packages/debian`
+      repository line for `trixie`, the key URL, the pin (`origin nginx.org,
+      priority 900`) and says stable 1.30 or newer; answer `n` first: nothing
+      is changed (`ls /etc/apt/sources.list.d/nginx.list` fails), then repeat
+      with `y`
+- [ ] the key fingerprints are listed as `matches the pinned nginx.org key`;
+      `/usr/share/keyrings/nginx-archive-keyring.gpg` exists
+      (`gpg --show-keys /usr/share/keyrings/nginx-archive-keyring.gpg` shows
+      the same fingerprints)
+- [ ] `cat /etc/apt/sources.list.d/nginx.list` is exactly `deb
+      [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg]
+      https://nginx.org/packages/debian trixie nginx` (no `mainline`);
+      `cat /etc/apt/preferences.d/99nginx` has `Package: *`, `Pin: origin
+      nginx.org`, `Pin-Priority: 900`
+- [ ] `apt-cache policy nginx` shows candidate `1.30.x-1~trixie` or newer
+      stable (even minor), with the nginx.org source above Debian's
+- [ ] output shows `Version check passes: nginx/1.30.x (nginx.org stable)`;
+      `nginx -v` agrees; `dpkg-query -W -f='${Version}\n' nginx` ends in
+      `~trixie`; `systemctl is-enabled nginx` is `enabled`, `systemctl
+      is-active nginx` is `active`
 - [ ] output shows `Config test passes.` and `Verified: nginx answers on
       127.0.0.1:80 (HTTP 200)`, then the HTTP-only / Certificates note
-- [ ] `curl -sI http://127.0.0.1/` shows the default Debian welcome page headers
+- [ ] `curl -sI http://127.0.0.1/` shows the nginx.org welcome page headers;
+      `/etc/nginx/conf.d/default.conf` exists, and `/etc/nginx/sites-enabled`
+      does not
 - [ ] running `1) Install Nginx` again says `already installed ... Not
-      reinstalling`, shows the status, and `apt` is not run (check
-      `grep nginx /var/log/apt/history.log` shows a single install)
+      reinstalling`, shows the status, downloads no key and runs no `apt`
+      (`grep -c 'Commandline: apt-get install' /var/log/apt/history.log`
+      did not grow)
+- [ ] `apt-get upgrade` never offers a Debian `nginx` (`apt-cache policy
+      nginx`: nginx.org stays the candidate)
+- [ ] mainline refusal: add `deb https://nginx.org/packages/mainline/debian
+      trixie nginx` to a file in `/etc/apt/sources.list.d/` on a *fresh*
+      image: `1) Install Nginx` says `MAINLINE source is configured in ...` and
+      changes nothing; remove the file
+
+**6b2. Replacing a Debian nginx** (use a throwaway image: this removes a package)
+
+- [ ] on a fresh image `apt-get install -y nginx` (Debian's package, version
+      `1.26.x-...+deb13...`); create an old-layout ezvps site and a hand-written
+      one: write `/etc/nginx/sites-available/old.example.com` with the `# Managed by ezvps`
+      / `# ezvps:domain=old.example.com` / `# ezvps:upstream=127.0.0.1:3000`
+      header and a `server { listen 80; server_name old.example.com; ... }`,
+      enable it with a symlink in `sites-enabled`, and add a hand-written
+      `/etc/nginx/conf.d/hand.conf` (`server_name hand.example.com;`)
+- [ ] `1) Install Nginx`: the plan says an nginx package that is not from
+      nginx.org will be REPLACED and lists the packages to purge; `y`
+- [ ] `/var/backups/ezvps/nginx-etc.<timestamp>.<pid>/` exists and contains the
+      old `nginx.conf`, `sites-available/old.example.com` and `conf.d/hand.conf`,
+      and was created before `apt-get purge` ran (see `/var/log/apt/history.log`
+      timestamps / the terminal order)
+- [ ] afterwards `dpkg -l | grep nginx` shows only the nginx.org `nginx`
+      (`~trixie`), `nginx -v` is stable 1.30+, and the pin exists
+- [ ] `/etc/nginx/conf.d/old.example.com.conf` exists (moved, with the
+      marker), the `sites-enabled` symlink and the `sites-available` file for it
+      are gone; `nginx -t` passes and the log shows the reload came after the
+      config test
+- [ ] the hand-written `conf.d/hand.conf` is either still there or, if it was
+      removed by the purge, listed under `Not restored automatically` with the
+      backup path (it is never silently lost: it is in the backup)
 
 **6c. Status and Restart**
 
@@ -216,11 +268,11 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       ezvps` header and `# ezvps:domain=` / `# ezvps:upstream=` lines; nothing
       new in `sites-available` or `sites-enabled`; output says `Config test
       passes.` and `nginx reloaded.`; no `ssl` or `443` anywhere in the file.
-      If the Debian default site is enabled, ezvps first warns that it may
-      conflict (default_server for port 80) and asks: answer `y` once, check
-      only `/etc/nginx/sites-enabled/default` (the symlink) is gone, that
-      `/etc/nginx/sites-available/default` still exists and that
-      `/var/backups/ezvps/nginx-default-site.*` exists
+      The nginx.org `default.conf` listens on port 80, so ezvps first warns
+      that it may conflict and asks: answer `y` once, check that
+      `/etc/nginx/conf.d/default.conf` is gone, `default.conf.disabled` exists
+      with the original content, and
+      `/var/backups/ezvps/nginx-default-conf.*` exists
 - [ ] `curl -s -H 'Host: example.com' http://127.0.0.1/` returns the backend's
       directory listing (reverse proxy works); with the backend stopped it returns 502
 - [ ] the message says the site is HTTP only and to use the Certificates
@@ -254,8 +306,8 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 **6e. List and Remove**
 
 - [ ] `4) List sites`: table of `conf.d/*.conf` with `example.com.conf
-      example.com 127.0.0.1:4000 ezvps` and `legacy.conf taken.example.com ...
-      not ezvps`; `sites-enabled` entries (such as `default`) are not listed
+      example.com 127.0.0.1:4000 ezvps` and `default.conf localhost ... not ezvps` (until disabled) and `legacy.conf taken.example.com ...
+      not ezvps`; `sites-enabled` entries are not listed
 - [ ] `6) Remove site` with an unknown domain: `No site named ...`, nothing changed
 - [ ] `6) Remove site` `example.com`, answer `n`: file remains, no backup
 - [ ] `6) Remove site` `example.com`, answer `y`: backup

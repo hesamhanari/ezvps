@@ -107,10 +107,21 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
  0) Back
 ```
 
-* **Install Nginx** installs the `nginx` package from apt, enables and starts
-  the service and checks that it answers. If nginx is already installed it is
-  not reinstalled, only its status is shown. Port 80 is checked first and a
-  conflicting service is reported.
+* **Install Nginx** installs nginx **only from the official nginx.org stable
+  repository** (stable 1.30 or newer; never Debian's package, never mainline).
+  It adds `https://nginx.org/packages/debian` for your Debian codename,
+  downloads the signing key from `https://nginx.org/keys/nginx_signing.key`
+  and checks it against pinned fingerprints, stores it in
+  `/usr/share/keyrings/nginx-archive-keyring.gpg`, and pins origin `nginx.org`
+  at priority 900 in `/etc/apt/preferences.d/99nginx` so upgrades stay on
+  nginx.org stable. After the install `nginx -v` is checked and the install
+  aborts if the version is below 1.30, a mainline build (such as 1.31) or still
+  a Debian package. If a Debian nginx is installed, `/etc/nginx` is backed up,
+  the Debian packages are purged and nginx.org stable is installed; ezvps sites
+  are restored/moved to `conf.d` and the config is tested before any reload.
+  Nothing is removed unless apt would really pick the nginx.org package. If
+  nginx.org stable is already installed it is not reinstalled, only its status
+  is shown. Port 80 is checked first and a conflicting service is reported.
 * **Status** shows whether the service runs and whether `nginx -t` passes.
   **Restart** runs the config test first and never restarts or reloads a
   broken config.
@@ -123,8 +134,8 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
   duplicates a site and asks before overwriting; the old file is backed up to
   `/var/backups/ezvps/` first. It also checks that `nginx.conf` includes
   `conf.d` (adding the include after a backup and a config test if not) and,
-  if Debian's default site conflicts, asks before disabling it (its symlink
-  only, with a backup). **Remove site** asks for confirmation, backs the file
+  if the nginx.org `default.conf` conflicts, asks before disabling it (backup,
+  then renamed to `default.conf.disabled`, not deleted). **Remove site** asks for confirmation, backs the file
   up, deletes it and reloads only after a passing test.
 * Sites made by an older ezvps in `sites-available`/`sites-enabled` are
   offered a **migration** to `conf.d` (backup, copy, config test, then the old

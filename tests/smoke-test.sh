@@ -301,7 +301,13 @@ EOF
 mkstub "$STUBS/nginx" <<'EOF'
 case "${1:-}" in
     -v)
-        echo "nginx version: nginx/1.26.3" >&2
+        ver="${FAKE_NGX_VERSION:-1.30.2}"
+        if [[ -f "${FAKE_DPKG:-/nonexistent}" ]]; then
+            while read -r st pkg v; do
+                [[ "$st" == ii && "$pkg" == nginx ]] && ver="${v%%-*}"
+            done <"$FAKE_DPKG"
+        fi
+        echo "nginx version: nginx/$ver" >&2
         exit 0 ;;
     -t)
         echo "nginx -t" >>"$FAKE_LOG"
@@ -337,9 +343,79 @@ case "${1:-}" in
 esac
 EOF
 
+# fake dpkg state: $FAKE_DPKG holds lines "<status> <package> <version>" (e.g. "ii nginx 1.30.2-1~trixie")
 mkstub "$STUBS/dpkg-query" <<'EOF'
-printf 'ii '
+fmt="" pats=() prev=""
+for a in "$@"; do
+    if [[ "$a" == -f* && "$a" != -f ]]; then # dpkg accepts -f='...' (value starts with '=')
+        fmt="${a#-f}"
+        fmt="${fmt#=}"
+    elif [[ "$prev" == "-f" ]]; then
+        fmt="$a"
+    elif [[ "$a" != -* ]]; then
+        pats+=("$a")
+    fi
+    prev="$a"
+done
+state="${FAKE_DPKG:-/nonexistent}"
+[[ -f "$state" ]] || exit 1
+found=0
+while read -r st pkg ver; do
+    for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053 # glob patterns on purpose
+        if [[ "$pkg" == $p ]]; then
+            out="${fmt//'${db:Status-Abbrev}'/$st }"
+            out="${out//'${Package}'/$pkg}"
+            out="${out//'${Version}'/$ver}"
+            printf '%b' "$out"
+            found=1
+        fi
+    done
+done <"$state"
+((found == 1))
 EOF
+
+# fake `apt-cache policy nginx`: the nginx.org package only when BOTH the apt source and
+# the pin exist (that is what the real pin guarantees), unless FAKE_APT_IGNORE_PIN=1
+mkstub "$STUBS/apt-cache" <<'EOF'
+pinned=0
+[[ -f "$EZVPS_APT_DIR/preferences.d/99nginx" && -f "$EZVPS_APT_DIR/sources.list.d/nginx.list" ]] && pinned=1
+cand="1.26.3-3+deb13u1"
+[[ "$pinned" == 1 && "${FAKE_APT_IGNORE_PIN:-0}" != 1 ]] && cand="${FAKE_ORG_VERSION:-1.30.2-1~trixie}"
+[[ "${FAKE_APT_NOCAND:-0}" == 1 ]] && cand="(none)"
+printf 'nginx:\n  Installed: (none)\n  Candidate: %s\n  Version table:\n' "$cand"
+EOF
+
+# fake gpg: --dearmor copies the file; --show-keys prints a pub/fpr pair (plus a sub/fpr pair that must be
+# ignored) for every "fpr=HEX" line of the fake key file
+mkstub "$STUBS/gpg" <<'EOF'
+mode="" out="" last=""
+prev=""
+for a in "$@"; do
+    case "$a" in
+        --dearmor) mode=dearmor ;;
+        --show-keys) mode=show ;;
+    esac
+    [[ "$prev" == "-o" ]] && out="$a"
+    prev="$a"
+    last="$a"
+done
+case "$mode" in
+    dearmor)
+        : >"$out"
+        while IFS= read -r line; do printf '%s\n' "$line" >>"$out"; done <"$last"
+        ;;
+    show)
+        while IFS= read -r line; do
+            [[ "$line" == fpr=* ]] || continue
+            printf 'pub:-:4096:1:0000000000000000:1716988950:::-:::scSC::::::23::0:\nfpr:::::::::%s:\n' "${line#fpr=}"
+            printf 'sub:-:4096:1:1111111111111111:1716988950::::::e::::::23:\nfpr:::::::::DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF:\n'
+        done <"$last"
+        ;;
+    *) echo "gpg UNEXPECTED $*" >>"$FAKE_LOG"; exit 2 ;;
+esac
+EOF
+
 
 mkstub "$STUBS/curl" <<'EOF'
 out="" url="" prev=""
@@ -353,6 +429,12 @@ case "$url" in
         echo "curl DOWNLOAD $url" >>"$FAKE_LOG"
         [[ "${FAKE_DOWNLOAD_FAIL:-0}" == "1" ]] && exit 22
         cp "$WORK_FAKE_INSTALLER" "$out"
+        exit 0 ;;
+    https://nginx.org/keys/nginx_signing.key)
+        echo "curl KEY $url" >>"$FAKE_LOG"
+        [[ "$*" == *"--proto =https"* && "$*" == *"--tlsv1.2"* ]] || echo "curl KEY-INSECURE" >>"$FAKE_LOG"
+        [[ "${FAKE_KEY_FAIL:-0}" == "1" ]] && exit 22
+        cp "$FAKE_KEY_FILE" "$out"
         exit 0 ;;
     http*://127.0.0.1:*)
         hostpart="${url#*127.0.0.1:}"
@@ -396,14 +478,62 @@ EOF
 
 mkstub "$STUBS/apt-get" <<'EOF'
 echo "apt-get $*" >>"$FAKE_LOG"
-if [[ "$*" == *"install"* && "$*" == *"curl"* ]]; then
+verb="" pkgs=()
+for a in "$@"; do
+    [[ "$a" == -* ]] && continue
+    if [[ -z "$verb" ]]; then verb="$a"; else pkgs+=("$a"); fi
+done
+if [[ "$verb" == install && "$*" == *"curl"* ]]; then
     cp "$STUBS_DIR/curl" "$SBOX_NOCURL_DIR/curl"
+    if [[ "$*" == *"gnupg"* ]]; then
+        tools="${FAKE_TOOLS_DIR:-$NGX_BOX_DIR}"
+        cp "$STUBS_DIR/curl" "$tools/curl"
+        cp "$STUBS_DIR/gpg" "$tools/gpg"
+    fi
 fi
-if [[ "$*" == *"install"* && "$*" == *"nginx"* ]]; then
+etc="$EZVPS_NGINX_DIR"
+if [[ "$verb" == update ]]; then
+    [[ "${FAKE_APT_UPDATE_FAIL:-0}" == "1" ]] && exit 100
+fi
+if [[ "$verb" == purge ]]; then
+    n=0
+    for d in "$EZVPS_BACKUP_DIR"/nginx-etc.*; do [[ -e "$d" ]] && n=$((n + 1)); done
+    echo "purge-state etc-backup=$n" >>"$FAKE_LOG"
+    : >"$FAKE_DPKG.new"
+    while read -r st pkg ver; do
+        keep=1
+        for p in "${pkgs[@]}"; do [[ "$p" == "$pkg" ]] && keep=0; done
+        ((keep == 1)) && printf '%s %s %s\n' "$st" "$pkg" "$ver" >>"$FAKE_DPKG.new"
+    done <"$FAKE_DPKG"
+    mv -f "$FAKE_DPKG.new" "$FAKE_DPKG"
+    rm -f "$NGX_BOX_DIR/nginx" "$FAKE_NGX_SVC" "$etc/nginx.conf" "$etc/mime.types"
+    [[ "${FAKE_PURGE_WIPES_SITES:-0}" == "1" ]] && rm -rf "$etc/sites-available" "$etc/sites-enabled"
+    [[ "${FAKE_PURGE_WIPES_CONFD:-0}" == "1" ]] && rm -rf "$etc/conf.d"
+fi
+if [[ "$verb" == install && "$*" == *"nginx"* ]]; then
     [[ "${FAKE_APT_FAIL:-0}" == "1" ]] && exit 100
+    # without the repository + pin apt would choose Debian's package
+    ver="1.26.3-3+deb13u1"
+    pinned=0
+    [[ -f "$EZVPS_APT_DIR/preferences.d/99nginx" && -f "$EZVPS_APT_DIR/sources.list.d/nginx.list" ]] && pinned=1
+    [[ "$pinned" == 1 && "${FAKE_APT_IGNORE_PIN:-0}" != 1 ]] && ver="${FAKE_ORG_VERSION:-1.30.2-1~trixie}"
+    [[ -n "${FAKE_APT_INSTALL_VERSION:-}" ]] && ver="$FAKE_APT_INSTALL_VERSION"
+    : >"$FAKE_DPKG.new"
+    if [[ -f "$FAKE_DPKG" ]]; then
+        while read -r st pkg v; do
+            [[ "$pkg" == nginx ]] || printf '%s %s %s\n' "$st" "$pkg" "$v" >>"$FAKE_DPKG.new"
+        done <"$FAKE_DPKG"
+    fi
+    printf 'ii nginx %s\n' "$ver" >>"$FAKE_DPKG.new"
+    mv -f "$FAKE_DPKG.new" "$FAKE_DPKG"
     cp "$STUBS_DIR/nginx" "$NGX_BOX_DIR/nginx"
-    mkdir -p "$EZVPS_NGINX_DIR/conf.d" "$EZVPS_NGINX_DIR/sites-available" "$EZVPS_NGINX_DIR/sites-enabled"
-    printf '%s\n' "http {" "    include $EZVPS_NGINX_DIR/conf.d/*.conf;" "    include $EZVPS_NGINX_DIR/sites-enabled/*;" "}" >"$EZVPS_NGINX_DIR/nginx.conf"
+    mkdir -p "$etc/conf.d"
+    if [[ ! -f "$etc/nginx.conf" ]]; then
+        printf '%s\n' "user nginx;" "events {" "}" "http {" "    include $etc/mime.types;" "    include $etc/conf.d/*.conf;" "}" >"$etc/nginx.conf"
+    fi
+    if [[ "$ver" == *"~"* && ! -f "$etc/conf.d/default.conf" && ! -f "$etc/conf.d/default.conf.disabled" ]]; then
+        printf '%s\n' "server {" "    listen       80;" "    server_name  localhost;" "    location / { root /usr/share/nginx/html; }" "}" >"$etc/conf.d/default.conf"
+    fi
     [[ "${FAKE_NGX_NOSTART:-0}" == "1" ]] || echo active >"$FAKE_NGX_SVC"
 fi
 exit 0
@@ -413,24 +543,24 @@ for c in systemctl curl sha256sum ss apt-get hostname; do ln -s "$STUBS/$c" "$SB
 ln -s "$STUBS/apt-get" "$SBOX_NOCURL/apt-get"
 for c in systemctl sha256sum ss; do ln -s "$STUBS/$c" "$SBOX_NOCURL/$c"; done
 # Nginx sandboxes: NGX_BOX has no nginx (apt-get stub "installs" it), NGX_BOX_INST
-# has it, NGX_BOX_DPKG has only a dpkg-query stub that says the package is installed.
+# has it, NGX_BOX_DPKG has everything but the nginx command (a package that is
+# installed without the command in PATH), NGX_BOX_NOTOOLS has no curl/gpg.
 NGX_BOX="$WORK/ngx-box"
 NGX_BOX_INST="$WORK/ngx-box-inst"
 NGX_BOX_DPKG="$WORK/ngx-box-dpkg"
-mkdir -p "$NGX_BOX" "$NGX_BOX_INST" "$NGX_BOX_DPKG"
-for c in systemctl ss apt-get; do
-    ln -s "$STUBS/$c" "$NGX_BOX/$c"
-    ln -s "$STUBS/$c" "$NGX_BOX_INST/$c"
-    ln -s "$STUBS/$c" "$NGX_BOX_DPKG/$c"
+NGX_BOX_NOTOOLS="$WORK/ngx-box-notools"
+mkdir -p "$NGX_BOX" "$NGX_BOX_INST" "$NGX_BOX_DPKG" "$NGX_BOX_NOTOOLS"
+for box in "$NGX_BOX" "$NGX_BOX_INST" "$NGX_BOX_DPKG" "$NGX_BOX_NOTOOLS"; do
+    for c in systemctl ss apt-get apt-cache dpkg-query; do ln -s "$STUBS/$c" "$box/$c"; done
+done
+for box in "$NGX_BOX" "$NGX_BOX_INST" "$NGX_BOX_DPKG"; do
+    for c in curl gpg; do ln -s "$STUBS/$c" "$box/$c"; done
 done
 ln -s "$STUBS/nginx" "$NGX_BOX_INST/nginx"
-ln -s "$STUBS/dpkg-query" "$NGX_BOX_DPKG/dpkg-query"
 for c in "$CORE_BIN"/*; do
     ln -s "$c" "$SBOX/${c##*/}"
     ln -s "$c" "$SBOX_NOCURL/${c##*/}"
-    ln -s "$c" "$NGX_BOX/${c##*/}"
-    ln -s "$c" "$NGX_BOX_INST/${c##*/}"
-    ln -s "$c" "$NGX_BOX_DPKG/${c##*/}"
+    for box in "$NGX_BOX" "$NGX_BOX_INST" "$NGX_BOX_DPKG" "$NGX_BOX_NOTOOLS"; do ln -s "$c" "$box/${c##*/}"; done
 done
 export WORK_FAKE_INSTALLER="$WORK/fake-installer.sh" FAKE_XUI_TEMPLATE="$WORK/fake-xui"
 export STUBS_DIR="$STUBS" SBOX_NOCURL_DIR="$SBOX_NOCURL" NGX_BOX_DIR="$NGX_BOX"
@@ -846,6 +976,12 @@ check_py() { # like check, but skipped when no local HTTP server could be starte
 
 file_sum() { cksum <"$1"; }
 
+# Fixtures: the primary-key fingerprints nginx.org publishes (as the fake gpg reads them),
+# and a Debian 13 os-release (codename trixie) for the nginx.org repository line.
+printf 'fpr=%s\n' 8540A6F18833A80E9C1653A42FD21310B49F6B46 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3 >"$WORK/nginx-key"
+printf '%s\n' 'ID=debian' 'VERSION_ID="13"' 'VERSION_CODENAME=trixie' >"$WORK/os-debian13"
+export EZVPS_OS_RELEASE="$WORK/os-debian13"
+
 # new_ngx <name>: a fresh fake machine without nginx
 new_ngx() {
     new_scn "ngx-$1"
@@ -853,7 +989,13 @@ new_ngx() {
     export EZVPS_NGINX_HTTP_PORT="$PORT_UP" EZVPS_NGINX_WAIT_SECONDS=0
     export FAKE_NGX_FAIL_DOMAIN="" FAKE_NGX_TEST_FAIL=0 FAKE_NGX_NOSTART=0 FAKE_APT_FAIL=0
     export FAKE_NGX_RESTART_FAIL=0 FAKE_NGX_RELOAD_FAIL=0 FAKE_NGX_FAIL_NTH=0
-    rm -f "$NGX_BOX/nginx"
+    # nginx.org source: fake apt/dpkg/gpg state, key file and apt/keyring dirs of this scenario
+    export FAKE_DPKG="$SCN/dpkg" FAKE_KEY_FILE="$WORK/nginx-key" FAKE_KEY_FAIL=0
+    export EZVPS_APT_DIR="$SCN/apt" EZVPS_KEYRING_DIR="$SCN/keyrings"
+    export FAKE_ORG_VERSION="1.30.2-1~trixie" FAKE_APT_INSTALL_VERSION="" FAKE_APT_IGNORE_PIN=0
+    export FAKE_APT_NOCAND=0 FAKE_APT_UPDATE_FAIL=0 FAKE_PURGE_WIPES_SITES=0 FAKE_PURGE_WIPES_CONFD=0
+    export FAKE_NGX_VERSION="1.30.2" FAKE_TOOLS_DIR="$NGX_BOX" NGX_BOX_DIR="$NGX_BOX"
+    rm -f "$NGX_BOX/nginx" "$NGX_BOX_NOTOOLS/nginx" "$NGX_BOX_NOTOOLS/curl" "$NGX_BOX_NOTOOLS/gpg"
 }
 # nginx.conf fixture shaped like Debian's: mk_nginx_conf [1|0] (0 = the conf.d
 # include is missing; only a commented-out one remains)
@@ -872,8 +1014,10 @@ ngx_layout() {
     mkdir -p "$EZVPS_NGINX_DIR/conf.d" "$EZVPS_NGINX_DIR/sites-available" "$EZVPS_NGINX_DIR/sites-enabled"
     mk_nginx_conf 1
 }
-ngx_up() { ngx_layout && echo active >"$FAKE_NGX_SVC"; }
-ngx_down() { ngx_layout && echo inactive >"$FAKE_NGX_SVC"; }
+# the installed package, as dpkg reports it: ngx_dpkg [version]
+ngx_dpkg() { printf 'ii nginx %s\n' "${1:-1.30.2-1~trixie}" >"$FAKE_DPKG"; }
+ngx_up() { ngx_layout && ngx_dpkg && echo active >"$FAKE_NGX_SVC"; }
+ngx_down() { ngx_layout && ngx_dpkg && echo inactive >"$FAKE_NGX_SVC"; }
 CF() { printf '%s' "$EZVPS_NGINX_DIR/conf.d/$1.conf"; }
 # legacy layout (what an older ezvps wrote); used for the migration and "not touched" tests
 AV() { printf '%s' "$EZVPS_NGINX_DIR/sites-available/$1"; }
@@ -940,56 +1084,229 @@ run_ezvps "$NGX_BOX_INST" "" nginx
 check "'ezvps nginx' opens the submenu" contains "$OUT" " 6) Remove site"
 check "nginx is no longer reported as not implemented" not_contains "$OUT" "Nginx is not implemented yet"
 
-echo "-- install: detection of an existing nginx"
+KR() { printf '%s' "$EZVPS_KEYRING_DIR/nginx-archive-keyring.gpg"; }
+LST() { printf '%s' "$EZVPS_APT_DIR/sources.list.d/nginx.list"; }
+PRF() { printf '%s' "$EZVPS_APT_DIR/preferences.d/99nginx"; }
+repo_absent() { [[ ! -e "$(KR)" && ! -e "$(LST)" && ! -e "$(PRF)" ]]; }
+no_key_download() { [[ "$(nlog_count '^curl KEY ')" -eq 0 ]]; }
+no_apt_install_or_purge() { [[ "$(nlog_count '^apt-get (install|purge)')" -eq 0 ]]; }
+nothing_installed() { no_apt_install_or_purge && repo_absent && no_mutation; }
+etc_backups() { find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'nginx-etc.*' 2>/dev/null | wc -l; }
+etc_backup() { find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'nginx-etc.*' | head -n1; }
+FPR_A=8540A6F18833A80E9C1653A42FD21310B49F6B46
+FPR_B=573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+FPR_C=9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3
+
+echo "-- install: an existing nginx"
 new_ngx inst_have
 ngx_up
 run_ezvps "$NGX_BOX_INST" "${N}1\n\n0\n\n0\n"
-check "installed nginx is detected" contains "$OUT" "Nginx is already installed (nginx/1.26.3)"
-check "installed nginx is not reinstalled" contains "$OUT" "Not reinstalling"
-check "installed nginx: apt-get is never called" no_apt
-check "installed nginx: nothing is enabled/started/restarted" no_mutation
-check "installed nginx: status is reported instead" contains "$OUT" "Nginx status"
-check "installed nginx: exit 0" equals "$RC" 0
+check "nginx.org stable is detected" contains "$OUT" "Nginx is already installed (nginx/1.30.2; nginx.org stable package 1.30.2-1~trixie)"
+check "nginx.org stable is not reinstalled" contains "$OUT" "Not reinstalling"
+check "nginx.org stable: apt-get is never called" no_apt
+check "nginx.org stable: no key download" no_key_download
+check "nginx.org stable: nothing is enabled/started/restarted" no_mutation
+check "nginx.org stable: warns that the apt pin is missing" contains "$OUT" "apt pin"
+check "nginx.org stable: status is reported instead" contains "$OUT" "Nginx status"
+check "nginx.org stable: exit 0" equals "$RC" 0
+new_ngx inst_have_pin
+ngx_up
+mkdir -p "$EZVPS_APT_DIR/preferences.d"
+: >"$(PRF)"
+run_ezvps "$NGX_BOX_INST" "${N}1\n\n0\n\n0\n"
+check "with the pin in place there is no pin warning" not_contains "$OUT" "apt pin"
 new_ngx inst_dpkg
+ngx_dpkg
 run_ezvps "$NGX_BOX_DPKG" "${N}1\n\n0\n\n0\n"
-check "package known to dpkg counts as installed" contains "$OUT" "Not reinstalling"
+check "an installed nginx.org package without the command counts as installed" contains "$OUT" "Not reinstalling"
 check "dpkg-detected nginx: apt-get is never called" no_apt
 check "dpkg-detected nginx without the command is explained" contains "$OUT" "not in PATH"
+new_ngx inst_manual
+rm -f "$FAKE_DPKG"
+ngx_layout
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "nginx without an apt package (built by hand) is not replaced" contains "$OUT" "not as an apt package"
+check "built-by-hand nginx: nothing installed or removed" nothing_installed
+check "built-by-hand nginx: no key download" no_key_download
 
-echo "-- install: fresh machine"
+echo "-- install: fresh machine, nginx.org stable"
 new_ngx inst_new
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "installs from apt (update first)" contains "$(log)" "apt-get update -q"
-check "installs the nginx package non-interactively" has_line "$(log)" "apt-get install -y -q nginx"
+check "plan: says nginx.org stable only" contains "$OUT" "ONLY from the official nginx.org STABLE repository"
+check "plan: shows the repository line" contains "$OUT" "deb [signed-by=$(KR)] https://nginx.org/packages/debian trixie nginx"
+check "plan: shows the key URL" contains "$OUT" "https://nginx.org/keys/nginx_signing.key"
+check "plan: shows the pin" contains "$OUT" "origin nginx.org, priority 900"
+check "key is downloaded over https/TLS1.2" has_line "$(log)" "curl KEY https://nginx.org/keys/nginx_signing.key"
+check "key download uses --proto =https --tlsv1.2" equals "$(nlog_count 'KEY-INSECURE')" 0
+check "fingerprints are verified and reported" contains "$OUT" "key fingerprint ${FPR_B}: matches the pinned nginx.org key"
+check "all three pinned nginx.org keys are accepted" equals "$(count_lines "$OUT" "matches the pinned nginx.org key")" 3
+check "...including the other two fingerprints" contains "$OUT" "${FPR_A}: matches"
+check "...and the third" contains "$OUT" "${FPR_C}: matches"
+check "keyring stored at the keyring path" file_has "$(KR)" "fpr=${FPR_B}"
+check "keyring is mode 644" equals "$(stat -c %a "$(KR)")" 644
+check "apt source: stable repo for the current codename, signed-by the keyring" file_has "$(LST)" "deb [signed-by=$(KR)] https://nginx.org/packages/debian trixie nginx"
+check "apt source: never mainline" file_lacks "$(LST)" "mainline"
+check "apt pin: all packages" file_has "$(PRF)" "Package: *"
+check "apt pin: origin nginx.org" file_has "$(PRF)" "Pin: origin nginx.org"
+check "apt pin: priority 900" file_has "$(PRF)" "Pin-Priority: 900"
+check "pin and source exist before nginx is installed" runs_before '^apt-get update' '^apt-get install .*nginx$'
+check "key is verified before apt is touched" runs_before '^curl KEY ' '^apt-get update'
+check "installs the nginx package non-interactively, keeping existing config" has_line "$(log)" "apt-get install -y -q -o Dpkg::Options::=--force-confold nginx"
+check "what dpkg now has is the nginx.org package" file_has "$FAKE_DPKG" "ii nginx 1.30.2-1~trixie"
+check "Debian's package is never installed" file_lacks "$FAKE_DPKG" "deb13"
+check "fresh install: nothing is purged" equals "$(nlog_count '^apt-get purge')" 0
+check "fresh install: no /etc/nginx backup" equals "$(etc_backups)" 0
+check "version is checked after the install" contains "$OUT" "Version check passes: nginx/1.30.2 (nginx.org stable)"
 check "enables and starts the service" has_line "$(log)" "systemctl enable --now nginx"
 check "runs the config test" contains "$(log)" "nginx -t"
 check "service ends up running" equals "$(<"$FAKE_NGX_SVC")" active
 check_py "verifies that nginx responds" contains "$OUT" "Verified: nginx answers on 127.0.0.1:${PORT_UP} (HTTP 200)"
+check "mentions that upgrades stay on nginx.org stable" contains "$OUT" "Upgrades stay on nginx.org stable"
 check "says it is HTTP only and defers HTTPS to Certificates" contains "$OUT" "Certificates module"
 check "does not touch the firewall" contains "$OUT" "firewall is not changed"
 check "fresh install exits 0" equals "$RC" 0
+echo "-- install: re-run is a no-op"
+KEYS_BEFORE="$(nlog_count '^curl KEY ')"
+run_ezvps "$NGX_BOX_INST" "${N}1\n\n0\n\n0\n"
+check "re-run: recognised as already installed" contains "$OUT" "Not reinstalling"
+check "re-run: no second key download" equals "$(nlog_count '^curl KEY ')" "$KEYS_BEFORE"
+check "re-run: exactly one install" equals "$(nlog_count '^apt-get install .*nginx$')" 1
+check "re-run: pin and source exist, so no pin warning" not_contains "$OUT" "apt pin"
+echo "-- install: repository files that already exist"
+ngx_dpkg 1.31.0-1~trixie # simulate: an unsuitable nginx.org build is installed, source/pin/key from the first run
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "existing identical key/source/pin are left alone" equals "$(count_lines "$OUT" "already up to date")" 3
+check "identical files: no apt-* backups" equals "$(bk_count 'apt-*')" 0
+new_ngx inst_oldlist
+mkdir -p "$EZVPS_APT_DIR/sources.list.d"
+echo "deb http://nginx.org/packages/debian trixie nginx" >"$(LST)"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a different nginx.list is backed up first" file_has "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'apt-nginx.list.*' | head -n1)" "deb http://nginx.org/packages/debian trixie nginx"
+check "a different nginx.list is replaced by the https stable line" file_has "$(LST)" "deb [signed-by=$(KR)] https://nginx.org/packages/debian trixie nginx"
+
+echo "-- install: key and source checks (nothing may change)"
+new_ngx inst_badkey
+printf 'fpr=%s\n' 0123456789ABCDEF0123456789ABCDEF01234567 >"$SCN/badkey"
+FAKE_KEY_FILE="$SCN/badkey"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "wrong key fingerprint is refused" contains "$OUT" "NOT a pinned nginx.org key"
+check "wrong key fingerprint: refusal is explicit" contains "$OUT" "Fingerprint check FAILED"
+check "wrong key fingerprint: no keyring, source or pin" repo_absent
+check "wrong key fingerprint: apt is never called" no_apt
+check "wrong key fingerprint: menu survives" equals "$RC" 0
+new_ngx inst_extrakey
+printf 'fpr=%s\nfpr=%s\n' "$FPR_B" 0123456789ABCDEF0123456789ABCDEF01234567 >"$SCN/extrakey"
+FAKE_KEY_FILE="$SCN/extrakey"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a good key plus an unknown key is refused too" contains "$OUT" "Fingerprint check FAILED"
+check "extra key: nothing written" repo_absent
+new_ngx inst_keyfail
+FAKE_KEY_FAIL=1
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "key download failure is reported" contains "$OUT" "Download failed: https://nginx.org/keys/nginx_signing.key"
+check "key download failure: nothing written, apt untouched" repo_absent
+check "key download failure: apt never called" no_apt
+new_ngx inst_mainline_src
+mkdir -p "$EZVPS_APT_DIR/sources.list.d"
+echo "deb https://nginx.org/packages/mainline/debian trixie nginx" >"$EZVPS_APT_DIR/sources.list.d/other.list"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a configured mainline source is refused" contains "$OUT" "MAINLINE source is configured in ${EZVPS_APT_DIR}/sources.list.d/other.list"
+check "mainline source: no key download, no apt, nothing written" no_key_download
+check "mainline source: apt never called" no_apt
+new_ngx inst_mainline_comment
+mkdir -p "$EZVPS_APT_DIR/sources.list.d"
+echo "#deb https://nginx.org/packages/mainline/debian trixie nginx" >"$EZVPS_APT_DIR/sources.list.d/other.list"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a commented-out mainline line is ignored" contains "$OUT" "Version check passes"
+new_ngx inst_nopin
+FAKE_APT_IGNORE_PIN=1
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "candidate that is not from nginx.org is refused" contains "$OUT" "which is not the nginx.org package"
+check "candidate not from nginx.org: the pin is reported as not working" contains "$OUT" "pin is not taking effect"
+check "candidate not from nginx.org: nothing installed or purged" no_apt_install_or_purge
+check "candidate not from nginx.org: repository files rolled back" repo_absent
+new_ngx inst_cand_main
+FAKE_ORG_VERSION="1.31.0-1~trixie"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "mainline 1.31 candidate is refused" contains "$OUT" "a MAINLINE build"
+check "mainline candidate: nothing installed" no_apt_install_or_purge
+check "mainline candidate: repository files rolled back" repo_absent
+new_ngx inst_cand_old
+FAKE_ORG_VERSION="1.28.3-1~trixie"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "candidate below 1.30 is refused" contains "$OUT" "older than 1.30"
+check "old candidate: nothing installed" no_apt_install_or_purge
+new_ngx inst_cand_none
+FAKE_APT_NOCAND=1
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "no candidate at all is reported" contains "$OUT" "no installation candidate"
+check "no candidate: nothing installed" no_apt_install_or_purge
+new_ngx inst_updfail
+FAKE_APT_UPDATE_FAIL=1
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a failing apt-get update is reported and rolled back" contains "$OUT" "apt-get update failed"
+check "failing apt-get update: repository files rolled back" repo_absent
+check "failing apt-get update: nothing installed" no_apt_install_or_purge
+
+echo "-- install: version check after the install"
+new_ngx inst_v_main
+FAKE_APT_INSTALL_VERSION="1.31.0-1~trixie"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "mainline build after install aborts" contains "$OUT" "VERSION CHECK FAILED: nginx/1.31.0 is a mainline build"
+check "mainline build: nginx is not started" no_mutation
+check "mainline build: says it aborted" contains "$OUT" "Aborting: nginx was NOT started"
+check "mainline build: menu survives" equals "$RC" 0
+new_ngx inst_v_old
+FAKE_APT_INSTALL_VERSION="1.28.3-1~trixie"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "version below 1.30 after install aborts" contains "$OUT" "VERSION CHECK FAILED: nginx/1.28.3 is older than 1.30"
+check "version below 1.30: nginx is not started" no_mutation
+new_ngx inst_v_deb
+FAKE_APT_INSTALL_VERSION="1.26.3-3+deb13u1"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a Debian package version after install aborts" contains "$OUT" "still a Debian package version (1.26.3-3+deb13u1)"
+check "Debian package version: nginx is not started" no_mutation
+new_ngx inst_v_even
+FAKE_ORG_VERSION="1.32.0-1~trixie"
+run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "a newer stable (1.32) is accepted" contains "$OUT" "Version check passes: nginx/1.32.0"
+
+echo "-- install: declined, other failures, tools, platform"
+new_ngx inst_no
+run_ezvps "$NGX_BOX" "${N}1\nn\n\n0\n\n0\n"
+check "declining the install changes nothing" contains "$OUT" "Cancelled. Nothing was changed."
+check "declined: no key download, no apt, no files" no_key_download
+check "declined: apt-get never called" no_apt
+check "declined: no repository files" repo_absent
+check "declined: exit 0" equals "$RC" 0
 new_ngx inst_nostart
 FAKE_NGX_NOSTART=1
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
 check "a package that does not auto-start is started by enable --now" equals "$(<"$FAKE_NGX_SVC")" active
-new_ngx inst_no
-run_ezvps "$NGX_BOX" "${N}1\nn\n\n0\n\n0\n"
-check "declining the install changes nothing" contains "$OUT" "Cancelled. Nothing was changed."
-check "declined: apt-get never called" no_apt
-check "declined: exit 0" equals "$RC" 0
 new_ngx inst_deb
-printf 'ID=ubuntu\nVERSION_ID="24.04"\n' >"$SCN/os-ubuntu"
+printf 'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n' >"$SCN/os-ubuntu"
 OUT="$(printf '%b' "${N}1\ny\n\n0\n\n0\n" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$SCN/os-ubuntu" PATH="$NGX_BOX" "$BASH_BIN" "$EZVPS" 2>&1)"
 RC=$?
 check "non-Debian-13 is refused" contains "$OUT" "Nginx install needs Debian 13"
 check "non-Debian-13: apt-get never called" no_apt
 check "non-Debian-13: menu survives" equals "$RC" 0
+new_ngx inst_nocodename
+printf 'ID=debian\nVERSION_ID="13"\n' >"$SCN/os-nocodename"
+EZVPS_OS_RELEASE="$SCN/os-nocodename" run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "missing Debian codename is refused" contains "$OUT" "Could not read the Debian codename"
+check "missing codename: nothing changed" nothing_installed
 new_ngx inst_aptfail
 FAKE_APT_FAIL=1
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "a failed apt install is reported" contains "$OUT" "still not available"
+check "a failed apt install is reported" contains "$OUT" "apt-get install nginx failed"
 check "a failed apt install: nothing enabled" no_mutation
 check "a failed apt install: menu survives" equals "$RC" 0
+new_ngx inst_tools
+FAKE_TOOLS_DIR="$NGX_BOX_NOTOOLS" NGX_BOX_DIR="$NGX_BOX_NOTOOLS" run_ezvps "$NGX_BOX_NOTOOLS" "${N}1\ny\n\n0\n\n0\n"
+check "missing curl/gpg are installed first (and said so in the plan)" contains "$OUT" "apt-get install curl gnupg ca-certificates"
+check "missing curl/gpg: apt installs them" has_line "$(log)" "apt-get install -y -q curl gnupg ca-certificates"
+check "missing curl/gpg: tools come before the key download" runs_before '^apt-get install -y -q curl' '^curl KEY '
+check "missing curl/gpg: the install then goes ahead" contains "$OUT" "Version check passes"
 
 echo "-- install: port 80 busy"
 new_ngx inst_busy
@@ -999,11 +1316,98 @@ check "busy port is warned about" contains "$OUT" "Port ${PORT_UP} is already in
 check "busy port: the listener is shown" contains "$OUT" "LISTEN 0 4096 0.0.0.0:${PORT_UP}"
 check "busy port: declining installs nothing" no_apt
 run_ezvps "$NGX_BOX" "${N}1\ny\ny\n\n0\n\n0\n"
-check "busy port: the user may install anyway" has_line "$(log)" "apt-get install -y -q nginx"
+check "busy port: the user may install anyway" has_line "$(log)" "apt-get install -y -q -o Dpkg::Options::=--force-confold nginx"
 new_ngx inst_free
 FAKE_LISTEN=""
 run_ezvps "$NGX_BOX" "${N}1\nn\n\n0\n\n0\n"
 check "free port: no port warning" not_contains "$OUT" "already in use"
+
+echo "-- install: replacing a Debian nginx"
+# new_deb: Debian nginx installed with ezvps sites in both layouts and a hand-written one
+new_deb() {
+    new_ngx "$1"
+    ngx_up
+    ngx_dpkg 1.26.3-3+deb13u1
+    printf 'ii nginx-common 1.26.3-3+deb13u1\nii libnginx-mod-http-geoip2 1.26.3-3+deb13u1\nii unrelated-pkg 1.0\n' >>"$FAKE_DPKG"
+    mk_ezvps_site example.com 127.0.0.1:3000
+    mk_foreign_site handmade hand.example.com
+    mk_legacy_site old.example.com 127.0.0.1:3001 1
+    cp "$(CF example.com)" "$SCN/example-original"
+    cp "$(AV old.example.com)" "$SCN/old-original"
+}
+new_deb rep
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "replace: the Debian package is called out" contains "$OUT" "not from nginx.org is installed (1.26.3-3+deb13u1; for example Debian's). It will be REPLACED"
+check "replace: plan names the packages that will be purged" contains "$OUT" "the old package(s) are purged: nginx nginx-common libnginx-mod-http-geoip2"
+check "replace: /etc/nginx is backed up" equals "$(etc_backups)" 1
+check "replace: the backup holds the old nginx.conf" test -f "$(etc_backup)/nginx.conf"
+check "replace: the backup holds the sites" test -f "$(etc_backup)/conf.d/example.com.conf" -a -f "$(etc_backup)/sites-available/old.example.com"
+check "replace: backup was taken BEFORE the purge" has_line "$(log)" "purge-state etc-backup=1"
+check "replace: Debian packages purged" has_line "$(log)" "apt-get purge -y -q nginx nginx-common libnginx-mod-http-geoip2"
+check "replace: unrelated packages untouched" file_has "$FAKE_DPKG" "ii unrelated-pkg 1.0"
+check "replace: repository and pin set up before the purge" runs_before '^apt-get update' '^apt-get purge'
+check "replace: key checked before the purge" runs_before '^curl KEY ' '^apt-get purge'
+check "replace: purge before the nginx.org install" runs_before '^apt-get purge' '^apt-get install .*nginx$'
+check "replace: only the nginx.org package is left" file_has "$FAKE_DPKG" "ii nginx 1.30.2-1~trixie"
+check "replace: Debian's nginx-common is gone" file_lacks "$FAKE_DPKG" "nginx-common"
+check "replace: version check passes" contains "$OUT" "Version check passes: nginx/1.30.2 (nginx.org stable)"
+check "replace: ezvps conf.d site still there, unchanged" cmp -s "$SCN/example-original" "$(CF example.com)"
+check "replace: old-layout ezvps site moved to conf.d" cmp -s "$SCN/old-original" "$(CF old.example.com)"
+check "replace: ...and its legacy files are gone" test ! -e "$(AV old.example.com)" -a ! -L "$(EN old.example.com)"
+check "replace: hand-written site untouched" test -f "$(CF handmade)"
+check "replace: the config test ran before the reload" runs_before '^nginx-t-state' '^systemctl reload nginx$'
+check "replace: nginx was enabled and started" has_line "$(log)" "systemctl enable --now nginx"
+check "replace: exit 0" equals "$RC" 0
+new_deb rep_wipe
+FAKE_PURGE_WIPES_SITES=1 FAKE_PURGE_WIPES_CONFD=1
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "replace, purge removed the sites: ezvps conf.d site restored from the backup" cmp -s "$SCN/example-original" "$(CF example.com)"
+check "replace, purge removed the sites: old-layout site restored and moved to conf.d" cmp -s "$SCN/old-original" "$(CF old.example.com)"
+check "replace, purge removed the sites: no legacy files left behind" test ! -e "$(AV old.example.com)" -a ! -L "$(EN old.example.com)"
+check "replace, purge removed the sites: hand-written site is NOT restored" test ! -e "$(CF handmade)"
+check "replace, purge removed the sites: ...but listed, with the backup path" contains "$OUT" "conf.d/handmade.conf"
+check "replace, purge removed the sites: hand-written site still in the backup" test -f "$(etc_backup)/conf.d/handmade.conf"
+check "replace, purge removed the sites: nginx.org default site present" test -f "$(CF default)"
+check "replace, purge removed the sites: config test before reload" runs_before '^nginx-t-state' '^systemctl reload nginx$'
+new_deb rep_fail
+rm -f "$(AV old.example.com)" "$(EN old.example.com)" # only the conf.d site is restored here
+FAKE_PURGE_WIPES_CONFD=1 FAKE_NGX_FAIL_DOMAIN="example.com"
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "replace, failing config test with the restored site: reported" contains "$OUT" "config test FAILED with the restored sites"
+check "replace, failing config test: nginx is NOT reloaded" equals "$(nlog_count '^systemctl reload')" 0
+check "replace, failing config test: the restored file is removed again" test ! -e "$(CF example.com)"
+check "replace, failing config test: the site is still in the backup" test -f "$(etc_backup)/conf.d/example.com.conf"
+check "replace, failing config test: nginx.org stable is installed anyway" file_has "$FAKE_DPKG" "ii nginx 1.30.2-1~trixie"
+check "replace, failing config test: menu survives" equals "$RC" 0
+new_deb rep_nopin
+FAKE_APT_IGNORE_PIN=1
+SUM_ETC="$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")"
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "never over a Debian nginx without a working pin: refused" contains "$OUT" "pin is not taking effect"
+check "no working pin: the Debian package is not purged" no_apt_install_or_purge
+check "no working pin: dpkg still has the Debian nginx" file_has "$FAKE_DPKG" "ii nginx 1.26.3-3+deb13u1"
+check "no working pin: /etc/nginx untouched" equals "$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")" "$SUM_ETC"
+check "no working pin: no /etc/nginx backup was needed" equals "$(etc_backups)" 0
+check "no working pin: repository files rolled back" repo_absent
+check "no working pin: nginx not touched" no_mutation
+new_deb rep_cand_main
+FAKE_ORG_VERSION="1.31.0-1~trixie"
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "mainline candidate: the Debian nginx is left alone" no_apt_install_or_purge
+check "mainline candidate: dpkg unchanged" file_has "$FAKE_DPKG" "ii nginx 1.26.3-3+deb13u1"
+new_deb rep_verify
+FAKE_APT_INSTALL_VERSION="1.26.3-3+deb13u1" FAKE_PURGE_WIPES_CONFD=1
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "replace, wrong version installed: aborts" contains "$OUT" "still a Debian package version"
+check "replace, wrong version installed: tells where the old /etc/nginx is" contains "$OUT" "previous /etc/nginx is backed up in $(etc_backup)"
+check "replace, wrong version installed: nginx not started, no site restored" test ! -e "$(CF example.com)"
+check "replace, wrong version installed: nginx not started" no_mutation
+new_deb rep_orgbad
+ngx_dpkg 1.31.0-1~trixie
+run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "an nginx.org mainline package is replaced by stable" contains "$OUT" "from nginx.org but is not stable 1.30+"
+check "mainline nginx.org package: purged and replaced" file_has "$FAKE_DPKG" "ii nginx 1.30.2-1~trixie"
+check "mainline nginx.org package: /etc/nginx backed up first" has_line "$(log)" "purge-state etc-backup=1"
 
 echo "-- status"
 new_ngx st_none
@@ -1016,7 +1420,7 @@ run_ezvps "$NGX_BOX_INST" "${N}2\n\n0\n\n0\n"
 check "status: service running" contains "$OUT" "nginx - running (boot: enabled)"
 check "status: config test passes" contains "$OUT" "Config test:  passes"
 check_py "status: responds" contains "$OUT" "Responds:     yes (HTTP 200 on 127.0.0.1:${PORT_UP})"
-check "status: version" contains "$OUT" "nginx/1.26.3"
+check "status: version" contains "$OUT" "nginx/1.30.2"
 check "status changes nothing (no restart/reload)" no_mutation
 new_ngx st_down
 ngx_down
@@ -1310,48 +1714,65 @@ rm -f "$EZVPS_NGINX_DIR/nginx.conf"
 run_ezvps "$NGX_BOX_INST" "${N}5\nh.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
 check "missing nginx.conf: reported, no site written" contains "$OUT" "nginx.conf not found"
 
-echo "-- add site: Debian default site"
+echo "-- add site: nginx.org default site (conf.d/default.conf)"
 new_ngx def
 ngx_up
-mk_legacy_foreign default _ 1 "listen 80 default_server;"
+mk_foreign_site default localhost
+cp "$(CF default)" "$SCN/default-original"
 mk_legacy_foreign other.example.com other.example.com 1
 run_ezvps "$NGX_BOX_INST" "${N}5\ndef.example.com\n127.0.0.1:3000\nn\n\n0\n\n0\n"
-check "default site: conflict is warned about" contains "$OUT" "may conflict with def.example.com: it is the default_server for port 80"
-check "default site: declined, symlink stays" test -L "$(EN default)"
-check "default site: declined, no backup" equals "$(bk_count 'nginx-default-site.*')" 0
+check "default site: conflict is warned about" contains "$OUT" "default site (${EZVPS_NGINX_DIR}/conf.d/default.conf) may conflict with def.example.com: it listens on port 80 too"
+check "default site: declined, still in place" cmp -s "$SCN/default-original" "$(CF default)"
+check "default site: declined, not renamed" test ! -e "$(CF default).disabled"
+check "default site: declined, no backup" equals "$(bk_count 'nginx-default-conf.*')" 0
 check "default site: declined, the site is still added" test -f "$(CF def.example.com)"
 new_ngx def2
 ngx_up
-mk_legacy_foreign default _ 1 "listen 80 default_server;"
+mk_foreign_site default localhost
+cp "$(CF default)" "$SCN/default-original"
 mk_legacy_foreign other.example.com other.example.com 1
-DEF_TARGET="$(readlink "$(EN default)")"
 run_ezvps "$NGX_BOX_INST" "${N}5\ndef.example.com\n127.0.0.1:3000\ny\n\n0\n\n0\n"
-check "default site: confirmed, only its symlink is removed" test ! -e "$(EN default)" -a ! -L "$(EN default)"
-check "default site: its sites-available file stays" test -f "$(AV default)"
-check "default site: backup of the symlink taken (points at the same target)" equals "$(readlink "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'nginx-default-site.*' | head -n1)")" "$DEF_TARGET"
+check "default site: confirmed, default.conf is no longer loaded" test ! -e "$(CF default)"
+check "default site: ...it is renamed, not deleted" cmp -s "$SCN/default-original" "$(CF default).disabled"
+check "default site: backup taken, identical to the original" cmp -s "$SCN/default-original" "$(find "$EZVPS_BACKUP_DIR" -maxdepth 1 -name 'nginx-default-conf.*' | head -n1)"
 check "default site: other files in sites-enabled are untouched" test -L "$(EN other.example.com)"
 check "default site: the site is added" test -f "$(CF def.example.com)"
 check "default site: one config test, then one reload" equals "$(nlog_count '^nginx -t$')" 1
 check "default site: reloaded after the test" runs_before '^nginx -t$' '^systemctl reload nginx$'
 new_ngx def3
 ngx_up
-mk_legacy_foreign default _ 1 "listen 80 default_server;"
-DEF_TARGET="$(readlink "$(EN default)")"
+mk_foreign_site default localhost
+cp "$(CF default)" "$SCN/default-original"
 FAKE_NGX_FAIL_DOMAIN="def.example.com"
 run_ezvps "$NGX_BOX_INST" "${N}5\ndef.example.com\n127.0.0.1:3000\ny\n\n0\n\n0\n"
 check "default site, failing test: not reloaded" equals "$(nlog_count '^systemctl reload')" 0
-check "default site, failing test: symlink restored" equals "$(readlink "$(EN default)")" "$DEF_TARGET"
+check "default site, failing test: default.conf restored byte for byte" cmp -s "$SCN/default-original" "$(CF default)"
+check "default site, failing test: not left renamed" test ! -e "$(CF default).disabled"
 check "default site, failing test: new site removed" test ! -e "$(CF def.example.com)"
 new_ngx def4
 ngx_up
-mk_legacy_foreign default _ 1 "listen 8080;"
+printf '%s\n' "server {" "    listen 8080;" "    server_name internal.example.com;" "}" >"$(CF default)"
 run_ezvps "$NGX_BOX_INST" "${N}5\nquiet.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
-check "default site that does not conflict: no question" not_contains "$OUT" "default site"
+check "a default.conf that does not touch port 80 or the domain: no question" not_contains "$OUT" "default site"
+check "...and it is left alone" test -f "$(CF default)"
 new_ngx def5
 ngx_up
-mk_legacy_foreign default quiet.example.com 1
+printf '%s\n' "server {" "    listen 8080;" "    server_name quiet.example.com;" "}" >"$(CF default)"
 run_ezvps "$NGX_BOX_INST" "${N}5\nquiet.example.com\n127.0.0.1:3000\nn\n\n0\n\n0\n"
-check "default site listing the domain itself is a conflict" contains "$OUT" "it also serves quiet.example.com"
+check "default.conf listing the domain itself is a conflict (and not a refusal)" contains "$OUT" "it also serves quiet.example.com"
+new_ngx def6
+ngx_up
+mk_foreign_site default localhost
+ln -s "$SCN/does-not-matter" "$SCN/link-target" 2>/dev/null
+mv "$(CF default)" "$SCN/real-default"
+ln -s "$SCN/real-default" "$(CF default)"
+run_ezvps "$NGX_BOX_INST" "${N}5\nlink.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "a symlinked default.conf is never touched" contains "$OUT" "It is a symlink, so ezvps will not touch it"
+check "...the link is still there" test -L "$(CF default)"
+new_ngx def7
+ngx_up
+run_ezvps "$NGX_BOX_INST" "${N}5\nnodefault.example.com\n127.0.0.1:3000\n\n0\n\n0\n"
+check "no default.conf: no question" not_contains "$OUT" "default site"
 
 echo "-- remove site"
 new_ngx rm
@@ -1535,6 +1956,8 @@ only_pinned_urls() {
         # shellcheck disable=SC2016 # literal text from the script, not expansions
         case "$u" in
             https://github.com/\$\{XUI_UPSTREAM\}* | https://raw.githubusercontent.com/\$\{XUI_UPSTREAM\}/\$\{XUI_PINNED_TAG\}/install.sh | 'http://127.0.0.1'* | 'http://<server-ip>'* | 'https://github.com/<owner>/'* | 'https://www.shellcheck.net'*) ;;
+            # Nginx module: the nginx.org stable repository and its signing key
+            'https://nginx.org/packages/debian' | 'https://nginx.org/keys/nginx_signing.key') ;;
             # Nginx module: upstream parsing/rendering, not network access
             'https://*' | 'http://}' | 'http://${2};') ;;
             *) echo "unexpected URL: $u" >&2; bad=1 ;;
@@ -1542,7 +1965,7 @@ only_pinned_urls() {
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
     ((bad == 0))
 }
-check "curl is invoked only by the 3x-ui download and probe functions" equals "$(curl_functions "$EZVPS")" "xui_fetch_installer() xui_probe() "
+check "curl is invoked only by the 3x-ui download/probe functions and the nginx.org key download" equals "$(curl_functions "$EZVPS")" "ngx_fetch_key() xui_fetch_installer() xui_probe() "
 check "ezvps never pipes a download into a shell" no_pipe_to_shell "$EZVPS"
 check "ezvps only knows the pinned upstream URL" only_pinned_urls "$EZVPS"
 check "ezvps has no URL for the private easyl2tp repo" not_contains "$(<"$EZVPS")" "raw.githubusercontent.com/<owner>"

@@ -55,14 +55,15 @@ done
 
 # 3. Download rules.
 #    - ezvps may call curl only from the 3x-ui download/probe functions
-#      (xui_fetch_installer, xui_probe); never from L2TP or anywhere else.
+#      (xui_fetch_installer, xui_probe) and the Nginx signing-key download
+#      (ngx_fetch_key); never from L2TP or anywhere else.
 #    - Nothing is ever piped or process-substituted from the network into a shell.
 #    - install.sh downloads nothing.
 bad_curl="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
     !/^[[:space:]]*#/ && /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/ {
-        if (fn != "xui_fetch_installer()" && fn != "xui_probe()") print NR": "$0 }' ezvps)"
+        if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()") print NR": "$0 }' ezvps)"
 if [[ -n "$bad_curl" ]]; then
-    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe:"
+    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe/ngx_fetch_key:"
     printf '%s\n' "$bad_curl" >&2
 fi
 for f in ezvps install.sh; do
@@ -79,6 +80,22 @@ if grep -nE 'raw\.githubusercontent\.com/[^"]*/(master|main|HEAD)/' ezvps | grep
 fi
 if ! grep -qE '^XUI_INSTALLER_SHA256="[0-9a-f]{64}"' ezvps || ! grep -qE '^XUI_PINNED_TAG="v[0-9]+\.[0-9]+\.[0-9]+"' ezvps; then
     bad "ezvps: XUI_PINNED_TAG / XUI_INSTALLER_SHA256 pin missing or malformed"
+fi
+# Nginx must come from the nginx.org STABLE repository: the repo URL has no
+# "mainline", the key URL is https, the pin is priority 900, and the key
+# fingerprints are pinned (40 hex digits each).
+if ! grep -qE '^NGX_ORG_REPO_URL="https://nginx\.org/packages/debian"$' ezvps ||
+    grep -vE '^[[:space:]]*#' ezvps | grep -q 'nginx\.org/packages/mainline"'; then
+    bad "ezvps: the nginx.org repo URL must be https://nginx.org/packages/debian (stable), never mainline"
+fi
+if ! grep -qE '^NGX_ORG_KEY_URL="https://nginx\.org/keys/nginx_signing\.key"$' ezvps; then
+    bad "ezvps: NGX_ORG_KEY_URL missing or changed"
+fi
+if [[ "$(grep -cE '^    [0-9A-F]{40}$' ezvps)" -lt 1 ]]; then
+    bad "ezvps: NGX_ORG_KEY_FPRS fingerprint pins missing or malformed"
+fi
+if ! grep -qF '"Pin-Priority: 900"' ezvps || ! grep -qF '"Pin: origin nginx.org"' ezvps; then
+    bad "ezvps: the nginx.org apt pin (origin nginx.org, priority 900) is missing"
 fi
 
 if ((fail == 0)); then
