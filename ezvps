@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # ezvps - bash TUI/CLI VPS manager for Debian 12/13 and Ubuntu 22.04/24.04/26.04 LTS (run as root).
 #
-# Implemented modules: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3) and Certificates
-# (PR 8). Every other module prints a clean "not implemented yet" message and
-# returns without failing.
+# Implemented modules: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3), Certificates
+# (PR 8) and the Backpack, ctunnel and Lazyports lifecycle modules (PR 9).
+# Every other module prints a clean "not implemented yet" message and returns
+# without failing.
 #
 # Menu, L2TP and the rest of the script use bash builtins only. The 3x-ui
 # module also needs coreutils, systemctl and curl, the Nginx module needs
 # coreutils, systemctl, apt-get and nginx itself, and the Certificates module
 # needs nginx, systemctl, curl and sha256sum (acme.sh install only) and openssl
-# (expiry dates only); each is checked with `command -v` before use and the
+# (expiry dates only). The Backpack, ctunnel and Lazyports modules need
+# coreutils, uname, bash, sha256sum and curl (installer download), git, make and
+# gcc (ctunnel build), go (Lazyports) and optionally systemctl (Backpack
+# services) and apt-get. Each is checked with `command -v` before use and the
 # module degrades with a clear message.
 
 set -uo pipefail
@@ -3488,6 +3492,652 @@ module_certs() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Tool lifecycle modules: Backpack, ctunnel, Lazyports (PR 9)
+#
+# These three tools have their own interface (Backpack: an interactive CLI,
+# ctunnel: a command-line tunnel program, Lazyports: a Go TUI). ezvps manages
+# only their lifecycle: Install, Status, Update, Uninstall. Tunnel setup, ports,
+# tokens and every other setting stay in the tool's own interface; ezvps never
+# asks for, stores, prints or logs a tunnel token, setup link, password or key.
+#
+# One shared flow (lc_*) serves all three; lc_load holds the small per-tool
+# table (installer, binary, config, version command, update and uninstall
+# method). Only what upstream documents is used (SPEC 6.5-6.7); where upstream
+# documents nothing, ezvps says so instead of guessing.
+#
+# To bump a pin: read the upstream installer at the new tag/commit, then change
+# the tag/commit and the SHA-256 together, plus SPEC.md 6.5-6.7.
+# ---------------------------------------------------------------------------
+
+LC_BACKPACK_REPO="AminMGMT/BackPack"
+LC_BACKPACK_TAG="v1.9.0"
+LC_BACKPACK_SHA256="270be80ff0599fc63f03e952b66f4721552c1965b448f5269d62645bacb9e20d"
+LC_CTUNNEL_REPO="alienrobotarmy/ctunnel"
+LC_CTUNNEL_COMMIT="ec5e388e1dd3b684cd1cea1ed5c67f99d42bf4f3"
+LC_LAZYPORTS_REPO="v9mirza/lazyports"
+LC_LAZYPORTS_COMMIT="84647db0ea0e0c7b90b247e35a6c47d44d4bba95"
+LC_LAZYPORTS_SHA256="6324d8c6e4fe736f994e41de5a985040b0d4d6b734968f0ad554833ca0940a60"
+
+LC_PREFIX="${EZVPS_TOOL_PREFIX:-/usr/local}"
+LC_BACKPACK_CONF="${EZVPS_BACKPACK_CONF_DIR:-/etc/backpack}"
+LC_HOME="${HOME:-/root}"
+
+# Filled by lc_load (the per-tool table), lc_find and lc_version.
+LC_KEY="" LC_LABEL="" LC_CMD="" LC_PROJECT="" LC_KIND="" LC_URL="" LC_SHA="" LC_PIN_TEXT=""
+LC_GIT_URL="" LC_GIT_COMMIT="" LC_ARCHES="" LC_NEEDS_GO=0 LC_VERSION_ARG="" LC_UNITS_GLOB=""
+LC_NO_SERVICE_TEXT="" LC_UPDATE="" LC_UNINSTALL="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT=""
+LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=() LC_BINS_FOUND=()
+LC_BIN_FOUND="" LC_VERSION=""
+
+# lc_load <key>: the per-tool table. Everything that differs between the tools
+# is here; the flow below is shared.
+lc_load() {
+    LC_KEY="$1"
+    LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=() LC_NEEDS_GO=0
+    LC_URL="" LC_SHA="" LC_GIT_URL="" LC_GIT_COMMIT="" LC_UNITS_GLOB="" LC_VERSION_ARG=""
+    LC_NO_SERVICE_TEXT="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT=""
+    case "$1" in
+        backpack)
+            LC_LABEL="Backpack" LC_CMD="backpack"
+            LC_PROJECT="https://github.com/${LC_BACKPACK_REPO}"
+            # Upstream's one documented install: its own install.sh (docs/install.md).
+            LC_KIND="script"
+            LC_URL="https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh"
+            LC_SHA="$LC_BACKPACK_SHA256"
+            LC_PIN_TEXT="release tag ${LC_BACKPACK_TAG}"
+            # README: "Supported release architectures currently include x86_64 -> amd64, aarch64 -> arm64".
+            LC_ARCHES="x86_64 aarch64"
+            LC_BINS=("${LC_PREFIX}/bin/backpack")
+            LC_CONFIGS=("$LC_BACKPACK_CONF")
+            LC_VERSION_ARG="version" # `backpack version` (docs/troubleshooting.md)
+            LC_UNITS_GLOB="backpack-*.service" # docs/server-layout.md: backpack-<name>.service, backpack-monitor.service
+            LC_UPDATE="menu"
+            LC_UNINSTALL="menu"
+            LC_UPDATE_HINT="In Backpack's menu choose 8 (Update), follow its prompts, then leave the menu (10, Exit)."
+            LC_UNINSTALL_HINT="In Backpack's menu choose 9 (Uninstall) and answer its own confirmation."
+            LC_OPEN_HINT="run: backpack   (Backpack's own menu: Setup, Manage, Update, ...)"
+            LC_NOTES=(
+                "The installer downloads the latest release archive for this architecture from GitHub and"
+                "verifies it against the SHA256SUMS published with the release (it refuses an archive it cannot verify)."
+                "It installs ${LC_PREFIX}/bin/backpack and creates /etc/backpack and /root/BackPack."
+                "ezvps runs it with no terminal input, so it only installs: it does not open Backpack's menu."
+            )
+            ;;
+        ctunnel)
+            LC_LABEL="ctunnel" LC_CMD="ctunnel"
+            LC_PROJECT="https://github.com/${LC_CTUNNEL_REPO}"
+            # Upstream has no installer script, no release and no tag: INSTALL/README say
+            # `make; make install` from source. ezvps builds one pinned commit.
+            LC_KIND="source"
+            LC_GIT_URL="https://github.com/${LC_CTUNNEL_REPO}.git"
+            LC_GIT_COMMIT="$LC_CTUNNEL_COMMIT"
+            LC_PIN_TEXT="commit ${LC_CTUNNEL_COMMIT} (upstream publishes no tags or releases)"
+            # Upstream states no architecture list (a C source build); ezvps accepts the two
+            # architectures of its supported systems.
+            LC_ARCHES="x86_64 aarch64"
+            LC_BINS=("${LC_PREFIX}/bin/ctunnel")
+            LC_CONFIGS=("${LC_HOME}/.passkey") # README "Keys": ctunnel keeps its pre-shared key in ~/.passkey
+            LC_VERSION_ARG="-v" # `ctunnel -v` (usage text); prints "ctunnel <major>.<minor> ..."
+            LC_NO_SERVICE_TEXT="none documented upstream (ctunnel is a command-line program started by hand)"
+            LC_UPDATE="none"
+            LC_UNINSTALL="remove"
+            LC_REMOVE_PATHS=("${LC_PREFIX}/bin/ctunnel" "${LC_PREFIX}/share/man/man1/ctunnel.1") # what `make uninstall` removes
+            LC_OPEN_HINT="run: ctunnel -h   (a command-line tunnel program; see also: man ctunnel)"
+            LC_NOTES=(
+                "ctunnel has no installer script or release; upstream's documented install is 'make; make install'"
+                "from source (OpenSSL build, upstream default). ezvps fetches that one commit with git, builds it in a"
+                "temporary directory and installs ${LC_PREFIX}/bin/ctunnel and its man page."
+                "Build tools are needed: git, make, gcc, libssl-dev, zlib1g-dev (offered via apt-get if missing)."
+            )
+            ;;
+        lazyports)
+            LC_LABEL="Lazyports" LC_CMD="lazyports"
+            LC_PROJECT="https://github.com/${LC_LAZYPORTS_REPO}"
+            LC_KIND="script"
+            LC_URL="https://raw.githubusercontent.com/${LC_LAZYPORTS_REPO}/${LC_LAZYPORTS_COMMIT}/install.sh"
+            LC_SHA="$LC_LAZYPORTS_SHA256"
+            LC_PIN_TEXT="commit ${LC_LAZYPORTS_COMMIT} (upstream publishes no tags or releases)"
+            # A Go source build (go install); upstream states no architecture list.
+            LC_ARCHES="x86_64 aarch64"
+            LC_NEEDS_GO=1
+            LC_BINS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # README: /usr/local/bin or ~/go/bin
+            # The installer may append a PATH line to a shell startup file; back them up first.
+            LC_CONFIGS=("${LC_HOME}/.bashrc" "${LC_HOME}/.zshrc")
+            LC_NO_SERVICE_TEXT="none documented upstream (Lazyports is an interactive terminal program)"
+            LC_UPDATE="none"
+            LC_UNINSTALL="remove"
+            LC_REMOVE_PATHS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # README "Uninstallation"
+            LC_OPEN_HINT="run: lazyports   (its own terminal interface)"
+            LC_NOTES=(
+                "Lazyports needs Go 1.24 or newer. The installer runs 'go install github.com/${LC_LAZYPORTS_REPO}@main'"
+                "(GOPROXY=direct), then copies the binary to ${LC_PREFIX}/bin/lazyports, and may append a PATH line to"
+                "${LC_HOME}/.bashrc or ${LC_HOME}/.zshrc. The script is pinned and hash-checked; the code it builds is upstream's current"
+                "main branch and is NOT pinned (upstream publishes no tags or releases)."
+            )
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# lc_find: the installed binary. Documented locations first, then PATH.
+# Sets LC_BIN_FOUND (first) and LC_BINS_FOUND (all documented locations that exist).
+lc_find() {
+    local b p
+    LC_BIN_FOUND="" LC_BINS_FOUND=()
+    for b in "${LC_BINS[@]}"; do
+        [[ -f "$b" && -x "$b" ]] && LC_BINS_FOUND+=("$b")
+    done
+    if ((${#LC_BINS_FOUND[@]} > 0)); then
+        LC_BIN_FOUND="${LC_BINS_FOUND[0]}"
+        return 0
+    fi
+    p="$(command -v "$LC_CMD" 2>/dev/null)" || p=""
+    if [[ "$p" == /* && -f "$p" && -x "$p" ]]; then
+        LC_BIN_FOUND="$p"
+        LC_BINS_FOUND=("$p")
+    fi
+    return 0
+}
+
+# lc_version <binary>: the first line of the tool's documented version command,
+# or empty when it has none (Lazyports) or prints nothing. Never fails.
+lc_version() {
+    local out line
+    LC_VERSION=""
+    [[ -n "$LC_VERSION_ARG" ]] || return 0
+    out="$("$1" "$LC_VERSION_ARG" </dev/null 2>/dev/null)" || true
+    while IFS= read -r line; do
+        line="${line//[^[:print:]]/}"
+        if [[ -n "$line" ]]; then
+            LC_VERSION="${line:0:80}"
+            break
+        fi
+    done <<<"$out"
+    return 0
+}
+
+# lc_check_arch: only the architectures upstream supports (table above).
+lc_check_arch() {
+    local m a
+    m="$(uname -m 2>/dev/null)" || m=""
+    for a in $LC_ARCHES; do
+        [[ "$m" == "$a" ]] && return 0
+    done
+    err "${LC_LABEL} install does not support architecture '${m:-unknown}' (supported: ${LC_ARCHES// /, }). Nothing was changed."
+    return 1
+}
+
+# lc_check_go: Lazyports builds from source with Go (go.mod: go 1.24; toolchain go1.24.12).
+# ezvps does not install Go (upstream says: install Go yourself).
+lc_check_go() {
+    local out minor
+    if ! have_cmd go; then
+        err "${LC_LABEL} needs Go 1.24 or newer, and 'go' was not found."
+        err "Install Go first (https://go.dev/doc/install); ezvps does not install it. Nothing was changed."
+        return 1
+    fi
+    out="$(go version 2>/dev/null)" || out=""
+    info "Found: ${out:-go (version unknown)}"
+    if [[ "$out" =~ go1\.([0-9]+) ]]; then
+        minor="${BASH_REMATCH[1]}"
+        if ((minor < 21)); then
+            err "${LC_LABEL} needs Go 1.24 or newer; this is older than 1.21, which cannot fetch the newer toolchain itself."
+            err "Install a current Go (https://go.dev/doc/install). Nothing was changed."
+            return 1
+        elif ((minor < 24)); then
+            warn "${LC_LABEL} needs Go 1.24 or newer; Go 1.${minor} will try to download the newer toolchain itself and the install fails if it cannot."
+        fi
+    else
+        warn "Could not read the Go version; the installer will report if it is too old."
+    fi
+    return 0
+}
+
+# lc_ensure_build_tools: ctunnel is built from source. Offer the packages after a yes.
+lc_ensure_build_tools() {
+    local c missing=()
+    for c in git make gcc; do
+        have_cmd "$c" || missing+=("$c")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    info "Missing build tools: ${missing[*]} (needed to build ${LC_LABEL} from source)."
+    if ! have_cmd apt-get; then
+        err "apt-get not found; install git, make, gcc, libssl-dev and zlib1g-dev manually and try again."
+        return 1
+    fi
+    ask_yes_no "Install git, make, gcc, libssl-dev and zlib1g-dev with apt-get now?" || {
+        info "Cancelled. Nothing was changed."
+        return 1
+    }
+    apt-get update -q && apt-get install -y -q git make gcc libssl-dev zlib1g-dev
+    for c in git make gcc; do
+        if ! have_cmd "$c"; then
+            err "${c} is still not available; cannot continue."
+            return 1
+        fi
+    done
+    return 0
+}
+
+lc_prereqs() {
+    if [[ "$LC_KIND" == "script" ]]; then
+        require_cmds sha256sum bash || return 1
+        ensure_curl "download the ${LC_LABEL} installer" || return 1
+        if ((LC_NEEDS_GO == 1)); then
+            lc_check_go || return 1
+        fi
+    else
+        lc_ensure_build_tools || return 1
+    fi
+    return 0
+}
+
+# lc_backup_all: copy the tool's config and binaries to /var/backups/ezvps first
+# (byte for byte; ezvps never reads them, and a config can hold a token or key,
+# so the backup directory is root-only). A failed copy aborts the caller.
+lc_backup_all() {
+    local p base n=0
+    for p in "${LC_CONFIGS[@]}" "${LC_BINS_FOUND[@]}"; do
+        [[ -e "$p" ]] || continue
+        base="${p##*/}"
+        base="${base#.}"
+        n=$((n + 1))
+        backup_file "$p" "${LC_KEY}-${n}-${base}" || return 1
+    done
+    if ((n == 0)); then
+        info "Nothing to back up yet."
+    else
+        info "Backups are never deleted by ezvps; they may contain secrets, so the backup directory is root-only."
+    fi
+    return 0
+}
+
+lc_show_plan() {
+    local n
+    info ""
+    info "ezvps will install ${LC_LABEL} (this system and architecture are supported):"
+    info "  project:   ${LC_PROJECT}"
+    if [[ "$LC_KIND" == "script" ]]; then
+        info "  installer: ${LC_URL}"
+        info "  pinned to: ${LC_PIN_TEXT}"
+        info "  sha256:    ${LC_SHA} (expected)"
+        info "The installer is saved to a temporary directory and checked against that hash first;"
+        info "it is never piped into a shell."
+    else
+        info "  source:    ${LC_GIT_URL}"
+        info "  pinned to: ${LC_PIN_TEXT}"
+        info "The commit is fetched with git into a temporary directory and checked before it is built."
+    fi
+    for n in "${LC_NOTES[@]}"; do
+        info "  ${n}"
+    done
+    info "Existing config and binaries are backed up to ${NGX_BACKUP_BASE}/ first."
+    info "ezvps does not start ${LC_LABEL} and asks for no tunnel settings, tokens or ports:"
+    info "all setup stays in ${LC_LABEL}'s own interface."
+    info ""
+}
+
+# Downloads the pinned installer and nothing else (the only curl for these tools).
+lc_fetch_installer() { # lc_fetch_installer <outfile>
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 --max-time 120 \
+        -o "$1" "$LC_URL"
+}
+
+# Fetches exactly the pinned commit (the only git network access for these tools).
+lc_fetch_source() { # lc_fetch_source <dir>
+    local g=(git -c protocol.allow=never -c protocol.https.allow=always)
+    "${g[@]}" init -q "$1" &&
+        "${g[@]}" -C "$1" fetch -q --depth 1 "$LC_GIT_URL" "$LC_GIT_COMMIT" &&
+        "${g[@]}" -C "$1" checkout -q --detach FETCH_HEAD &&
+        [[ "$("${g[@]}" -C "$1" rev-parse HEAD)" == "$LC_GIT_COMMIT" ]]
+}
+
+# lc_show_tail <file>: the last 20 lines of a build log, to stderr (pure bash).
+lc_show_tail() {
+    local lines=() start=0
+    mapfile -t lines <"$1"
+    ((${#lines[@]} > 20)) && start=$((${#lines[@]} - 20))
+    ((${#lines[@]} > 0)) && printf '%s\n' "${lines[@]:start}" >&2
+    return 0
+}
+
+# lc_run_script: download, verify and run the upstream installer. Its terminal
+# input is /dev/null: Backpack's installer opens its menu on a terminal, and ezvps
+# must not launch the tool.
+lc_run_script() {
+    local tmp actual rc
+    tmp="$(mktemp -d)" || {
+        err "Cannot create a temporary directory."
+        return 1
+    }
+    info "Downloading ${LC_URL}"
+    if ! lc_fetch_installer "${tmp}/install.sh"; then
+        err "Download failed: ${LC_URL}"
+        rm -rf "$tmp"
+        return 1
+    fi
+    actual="$(sha256sum "${tmp}/install.sh")" || {
+        err "sha256sum failed."
+        rm -rf "$tmp"
+        return 1
+    }
+    actual="${actual%% *}"
+    if [[ "$actual" != "$LC_SHA" ]]; then
+        err "SHA-256 mismatch for the downloaded installer; refusing to run it."
+        err "  expected: ${LC_SHA}"
+        err "  got:      ${actual}"
+        rm -rf "$tmp"
+        return 1
+    fi
+    info "Downloaded installer matches the pinned sha256."
+    info "Running the ${LC_LABEL} installer (no terminal input, so it will not open ${LC_LABEL})..."
+    bash "${tmp}/install.sh" </dev/null
+    rc=$?
+    rm -rf "$tmp"
+    if ((rc != 0)); then
+        err "The ${LC_LABEL} installer exited with status ${rc}."
+        return 1
+    fi
+    return 0
+}
+
+# lc_run_source: fetch the pinned commit and run upstream's documented `make; make install`.
+lc_run_source() {
+    local tmp
+    tmp="$(mktemp -d)" || {
+        err "Cannot create a temporary directory."
+        return 1
+    }
+    info "Fetching ${LC_GIT_URL} at commit ${LC_GIT_COMMIT}..."
+    if ! lc_fetch_source "${tmp}/src"; then
+        err "Could not fetch commit ${LC_GIT_COMMIT} from ${LC_GIT_URL}."
+        rm -rf "$tmp"
+        return 1
+    fi
+    info "Building ${LC_LABEL} (make)..."
+    if ! make -C "${tmp}/src" PREFIX="$LC_PREFIX" >"${tmp}/build.log" 2>&1; then
+        err "The build failed. Last lines of the build output:"
+        lc_show_tail "${tmp}/build.log"
+        err "Build needs the OpenSSL and zlib development headers (apt-get install libssl-dev zlib1g-dev). Nothing was installed."
+        rm -rf "$tmp"
+        return 1
+    fi
+    info "Installing (make install)..."
+    mkdir -p "${LC_PREFIX}/bin"
+    if ! make -C "${tmp}/src" install PREFIX="$LC_PREFIX" >"${tmp}/install.log" 2>&1; then
+        err "make install failed. Last lines of its output:"
+        lc_show_tail "${tmp}/install.log"
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
+# lc_report_installed <old version>: verify the binary exists after an install.
+lc_report_installed() {
+    local old="$1"
+    lc_find
+    if [[ -z "$LC_BIN_FOUND" ]]; then
+        err "The installer finished, but no ${LC_CMD} binary was found in ${LC_BINS[*]}. ${LC_LABEL} is NOT installed."
+        return 1
+    fi
+    lc_version "$LC_BIN_FOUND"
+    info ""
+    info "Installed: ${LC_BIN_FOUND}"
+    if [[ -n "$LC_VERSION_ARG" ]]; then
+        if [[ -n "$old" && -n "$LC_VERSION" ]]; then
+            info "Version:   ${old}  ->  ${LC_VERSION}"
+        else
+            info "Version:   ${LC_VERSION:-unknown (the version command printed nothing)}"
+        fi
+    else
+        info "Version:   not reported (${LC_LABEL} documents no version command)"
+    fi
+    info "To open ${LC_LABEL}: ${LC_OPEN_HINT}"
+    info "ezvps does not open it for you; tunnels, ports and tokens are set up there."
+    return 0
+}
+
+# lc_install_flow <install|update>: the shared install path. Update uses it for the
+# documented reinstall when upstream has no update command.
+lc_install_flow() {
+    local mode="$1" old=""
+    require_supported_os "${LC_LABEL} install" || return 0
+    lc_check_arch || return 0
+    require_cmds cp mkdir mv rm mktemp date chmod uname || return 0
+    lc_find
+    if [[ -n "$LC_BIN_FOUND" ]]; then
+        lc_version "$LC_BIN_FOUND"
+        old="$LC_VERSION"
+        info "${LC_LABEL} is already installed (${LC_BIN_FOUND}${old:+, version ${old}})."
+        if [[ "$mode" == "update" ]]; then
+            ask_yes_no "Reinstall ${LC_LABEL} from its documented source now? (config and binary are backed up first)" || {
+                info "Nothing was changed."
+                return 0
+            }
+        else
+            info "It will not be reinstalled unless you say so."
+            ask_yes_no "Reinstall ${LC_LABEL} anyway? (config and binary are backed up first)" || {
+                info "Nothing was changed."
+                return 0
+            }
+        fi
+    fi
+    lc_prereqs || return 0
+    lc_show_plan
+    ask_yes_no "Download and run the ${LC_LABEL} install now?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    lc_backup_all || return 0
+    if [[ "$LC_KIND" == "script" ]]; then
+        lc_run_script || return 0
+    else
+        lc_run_source || return 0
+    fi
+    lc_report_installed "$old" || true
+    return 0
+}
+
+lc_install() { lc_install_flow install; }
+
+# lc_print_services: documented systemd units, if upstream documents any.
+lc_print_services() {
+    local line unit load active sub n=0
+    if [[ -z "$LC_UNITS_GLOB" ]]; then
+        info "  Service:    ${LC_NO_SERVICE_TEXT}"
+        info "              so ezvps reports installed + binary present, not running or stopped."
+        return 0
+    fi
+    if ! have_cmd systemctl; then
+        info "  Services:   systemctl not found; ${LC_UNITS_GLOB} not checked"
+        return 0
+    fi
+    while read -r unit load active sub _; do
+        [[ "$unit" == *.service && -n "$load" ]] || continue
+        info "  Service:    ${unit}: ${active} (${sub})"
+        n=$((n + 1))
+    done < <(systemctl list-units --type=service --all --no-legend --plain "$LC_UNITS_GLOB" 2>/dev/null)
+    if ((n == 0)); then
+        info "  Services:   no ${LC_UNITS_GLOB} units found (no tunnel is configured yet)"
+    fi
+    return 0
+}
+
+lc_status() {
+    local b
+    lc_find
+    info ""
+    info "${C_BOLD}${LC_LABEL} status${C_RESET}"
+    if [[ -z "$LC_BIN_FOUND" ]]; then
+        info "  Installed:  no"
+        info "${LC_LABEL} is not installed. Choose Install to add it."
+        return 0
+    fi
+    info "  Installed:  yes"
+    for b in "${LC_BINS_FOUND[@]}"; do
+        info "  Binary:     ${b}"
+    done
+    lc_version "$LC_BIN_FOUND"
+    if [[ -n "$LC_VERSION_ARG" ]]; then
+        info "  Version:    ${LC_VERSION:-unknown (the version command printed nothing)}"
+    else
+        info "  Version:    not reported (${LC_LABEL} documents no version command)"
+    fi
+    lc_print_services
+    info "  Open it:    ${LC_OPEN_HINT}"
+    return 0
+}
+
+# lc_launch_menu <hint>: run the tool's own interface as a child process with the
+# terminal attached (the documented update/uninstall path for Backpack).
+lc_launch_menu() {
+    local rc
+    info ""
+    info "Opening ${LC_LABEL}'s own menu now. ${1}"
+    info ""
+    "$LC_BIN_FOUND"
+    rc=$?
+    info ""
+    ((rc != 0)) && warn "${LC_LABEL} exited with status ${rc}."
+    info "Returned to ezvps."
+    return 0
+}
+
+lc_update() {
+    local old new
+    lc_find
+    if [[ -z "$LC_BIN_FOUND" ]]; then
+        info "${LC_LABEL} is not installed; there is nothing to update. Choose Install first."
+        return 0
+    fi
+    lc_version "$LC_BIN_FOUND"
+    old="$LC_VERSION"
+    if [[ "$LC_UPDATE" == "none" ]]; then
+        info "${LC_LABEL} has no documented update command upstream, and ezvps does not guess one."
+        info "The documented way to get a newer ${LC_LABEL} is to install it again from its source."
+        lc_install_flow update
+        return 0
+    fi
+    info ""
+    info "${LC_LABEL} updates itself through its own Update menu (verified download, restore point,"
+    info "automatic rollback). ezvps backs up the config, opens ${LC_LABEL} for you to pick Update, and"
+    info "reports the version before and after. Installed now: ${LC_BIN_FOUND}${old:+, version ${old}}."
+    ask_yes_no "Back up ${LC_LABEL}'s config and open its menu to update?" || {
+        info "Nothing was changed."
+        return 0
+    }
+    lc_backup_all || return 0
+    lc_launch_menu "$LC_UPDATE_HINT"
+    lc_find
+    if [[ -z "$LC_BIN_FOUND" ]]; then
+        warn "${LC_LABEL} is no longer installed."
+        return 0
+    fi
+    lc_version "$LC_BIN_FOUND"
+    new="$LC_VERSION"
+    if [[ -z "$old" || -z "$new" ]]; then
+        info "Version before: ${old:-unknown}   after: ${new:-unknown}"
+    elif [[ "$old" == "$new" ]]; then
+        info "Version is unchanged (${new}): either it was already the latest or no update was applied."
+    else
+        info "Updated: ${old}  ->  ${new}"
+    fi
+    return 0
+}
+
+lc_uninstall() {
+    local p present=()
+    lc_find
+    if [[ -z "$LC_BIN_FOUND" ]]; then
+        info "${LC_LABEL} is not installed; there is nothing to uninstall."
+        return 0
+    fi
+    info ""
+    if [[ "$LC_UNINSTALL" == "menu" ]]; then
+        info "${LC_LABEL} is removed by its own Uninstall menu item, which deletes its tunnels, services,"
+        info "config in ${LC_CONFIGS[*]}, the binary and /root/BackPack including its own backup archives."
+        info "ezvps backs up ${LC_CONFIGS[*]} first; copy anything in /root/BackPack/backups you want to keep."
+    else
+        for p in "${LC_REMOVE_PATHS[@]}"; do
+            [[ -e "$p" ]] && present+=("$p")
+        done
+        if ((${#present[@]} == 0)); then
+            info "${LC_LABEL} was found at ${LC_BIN_FOUND}, which is not an upstream-documented location."
+            info "ezvps removes only: ${LC_REMOVE_PATHS[*]}. Nothing was changed; remove it the way it was installed."
+            return 0
+        fi
+        info "ezvps will remove, as upstream documents (${LC_LABEL}):"
+        for p in "${present[@]}"; do
+            info "  ${p}"
+        done
+        info "Nothing else is deleted (your config and shell startup files stay as they are)."
+    fi
+    ask_yes_no "Uninstall ${LC_LABEL}?" || {
+        info "Nothing was changed."
+        return 0
+    }
+    lc_backup_all || return 0
+    if [[ "$LC_UNINSTALL" == "menu" ]]; then
+        lc_launch_menu "$LC_UNINSTALL_HINT"
+    else
+        for p in "${present[@]}"; do
+            if rm -f -- "$p"; then
+                info "Removed ${p}"
+            else
+                err "Could not remove ${p}."
+            fi
+        done
+    fi
+    lc_find
+    if [[ -n "$LC_BIN_FOUND" ]]; then
+        warn "${LC_LABEL} is still present at ${LC_BIN_FOUND}: it was NOT fully uninstalled."
+    else
+        info "Verified: the ${LC_CMD} binary is gone."
+    fi
+    info "The backups under ${NGX_BACKUP_BASE}/ are kept."
+    return 0
+}
+
+lc_module() { # lc_module <key>: the shared submenu
+    local choice i
+    local labels=("Install" "Status" "Update" "Uninstall")
+    lc_load "$1" || return 0
+    while true; do
+        info ""
+        info "${C_BOLD}${LC_LABEL}${C_RESET}"
+        info ""
+        for i in "${!labels[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) lc_install || true ;;
+            2) lc_status || true ;;
+            3) lc_update || true ;;
+            4) lc_uninstall || true ;;
+            *)
+                warn "Invalid choice: ${choice:-<empty>}"
+                ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
+module_backpack() { lc_module backpack; }
+module_ctunnel() { lc_module ctunnel; }
+module_lazyports() { lc_module lazyports; }
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
@@ -3496,7 +4146,10 @@ run_module() {
         3x-ui) module_3x_ui ;;
         nginx) module_nginx ;;
         certs) module_certs ;;
-        backpack | ctunnel | lazyports | ssh | firewall | backup | update | uninstall)
+        backpack) module_backpack ;;
+        ctunnel) module_ctunnel ;;
+        lazyports) module_lazyports ;;
+        ssh | firewall | backup | update | uninstall)
             module_not_implemented "$1"
             ;;
         *)
@@ -3560,8 +4213,8 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp, 3x-ui, nginx and certs are implemented in this release; the others
-report that they are not implemented yet."
+Only l2tp, 3x-ui, backpack, ctunnel, nginx, certs and lazyports are implemented
+in this release; the others report that they are not implemented yet."
 }
 
 require_root() {

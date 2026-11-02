@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9).
 
 ## 1. What ezvps is
 
@@ -12,7 +12,9 @@ script, installed as `/usr/local/bin/ezvps`. It has no dependencies beyond what
 a supported install already has (bash, coreutils, systemd); anything else a
 module needs is checked with `command -v` first and installed only with the
 user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself;
-Certificates: `curl` and the pinned acme.sh script).
+Certificates: `curl` and the pinned acme.sh script; Backpack and Lazyports: `curl`;
+ctunnel: `git`, `make`, `gcc` and the OpenSSL and zlib development packages. Lazyports needs
+Go, which ezvps never installs).
 
 ### 1.1 Supported systems
 
@@ -35,6 +37,7 @@ Per module:
 | 3x-ui | yes | yes | yes | yes | yes |
 | Nginx | yes: `nginx.org/packages/debian`, suite `bookworm` | yes: `.../debian`, `trixie` | yes: `nginx.org/packages/ubuntu`, suite `jammy` | yes: `.../ubuntu`, `noble` | yes: `.../ubuntu`, `resolute` |
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
+| Backpack, ctunnel, Lazyports (`x86_64` and `aarch64` only) | yes | yes | yes | yes | yes |
 | L2TP (ezl2tp) | **no** (gate below) | yes | **no** (gate below) | **no** (gate below) | **no** (gate below) |
 
 * **L2TP has its own gate.** ezvps running on a system does not mean ezl2tp
@@ -86,6 +89,7 @@ Per module:
   | acme.sh (PR 8) | the same pinned script, `bash ./acme.sh --install`; needs `openssl` (always present), `curl`, optionally `crontab` | identical | one path |
   | `http2 on;` in the HTTPS site (PR 8) | needs nginx 1.25.1+; the module only ever installs nginx.org stable 1.30+ | identical | one path |
   | certificate store `/etc/ssl/ezvps` (PR 8) | no package owns it | no package owns it (Ubuntu's `ssl-cert` group is not used) | one path |
+  | Backpack, ctunnel, Lazyports (PR 9) | upstream installers branch on nothing distro-specific (Backpack's `install.sh` keys on `uname -m` only; ctunnel is `make`; Lazyports is `go install`); apt package names `git make gcc libssl-dev zlib1g-dev curl` are identical | identical | one path (Go is not installed by ezvps, so the distro's Go version only matters to Lazyports, see 6.7) |
 
 ## 2. Principles (same as easyl2tp)
 
@@ -170,11 +174,11 @@ redraws. EOF on stdin exits 0.
 |---|-------------------|---------------------|------------|
 | 1 | L2TP              | **implemented**     | PR 1       |
 | 2 | 3x-ui             | **implemented**     | PR 2       |
-| 3 | Backpack          | not implemented yet | later      |
-| 4 | ctunnel           | not implemented yet | later      |
+| 3 | Backpack          | **implemented**     | PR 9       |
+| 4 | ctunnel           | **implemented**     | PR 9       |
 | 5 | Nginx             | **implemented**     | PR 3       |
 | 6 | Certificates      | **implemented**     | PR 8       |
-| 7 | Lazyports         | not implemented yet | later      |
+| 7 | Lazyports         | **implemented**     | PR 9       |
 | 8 | SSH and Users     | not implemented yet | later      |
 | 9 | Firewall          | not implemented yet | later      |
 | 10| Backup            | not implemented yet | later      |
@@ -961,20 +965,236 @@ there is nothing to reload.
   backed up first, as with Add site's overwrite).
 * A certificate is not removed while a file ezvps did not make uses it.
 
-### 6.5 Backpack (later PR)
+### 6.5 Backpack (PR 9, done), with the rules shared by 6.5 to 6.7
 
-Install/update/remove **github.com/AminMGMT/BackPack**. Show what will be
-fetched, confirm, pin a release/ref, check existing install first.
+Backpack, ctunnel (6.6) and Lazyports (6.7) are **lifecycle modules** that share one
+flow. Menu items 3, 4 and 7 open the **same submenu** for each tool. Clean labels only:
 
-### 6.6 ctunnel (later PR)
+```
+ 1) Install
+ 2) Status
+ 3) Update
+ 4) Uninstall
+ 0) Back
+```
 
-Install/update/remove **github.com/alienrobotarmy/ctunnel**. Same fetch
-rules as above.
+`0` or EOF returns to the main menu; after each action "Press Enter to continue...";
+invalid input prints `Invalid choice: <input>`. Module keys `backpack`, `ctunnel`,
+`lazyports` map to `module_backpack`, `module_ctunnel`, `module_lazyports`, each a
+one-line wrapper around the shared `lc_module <key>`; all helpers are prefixed `lc_`.
 
-### 6.7 Lazyports (later PR)
+**Scope: lifecycle only.** These three tools have their own interface (Backpack: an
+interactive CLI, ctunnel: a command-line tunnel program, Lazyports: a terminal UI).
+ezvps manages Install, Status, Update and Uninstall and **nothing else**. Tunnel setup,
+port management, tokens, setup links, certificates, ciphers and every other setting stay
+in the tool's own CLI or TUI: ezvps does not rebuild, wrap or script them, does not
+launch a tool after installing it (it prints how to open it), and **never asks for,
+stores, prints or logs a tunnel token, setup link, password or private key**. The
+lifecycle code contains no input prompt other than the submenu choice and yes/no
+confirmations (a test enforces it). The one place ezvps starts a tool is Update and
+Uninstall of Backpack, whose documented method *is* Backpack's own menu: ezvps opens it
+as a child process on the terminal, the user picks the menu item, and ezvps goes on when
+it exits.
 
-Install/update/remove **github.com/v9mirza/lazyports**. Same fetch rules as
-above.
+One table, `lc_load`, holds what differs per tool (installer, binary, config, version
+command, services, update and uninstall method, architectures, the text of the plan);
+everything else is the shared flow below. Only what **upstream documents** is used; each
+fact has its upstream source named in 6.5 to 6.7. Where upstream documents nothing, ezvps
+says so and does not guess (no invented service, version flag or update command).
+
+#### Shared rules (6.5 to 6.7)
+
+**Install**
+1. A supported system (`require_supported_os`, section 1.1) and an upstream-supported
+   architecture (`uname -m`; `x86_64` or `aarch64` for all three, see each tool), otherwise
+   refuse with `<Label> install does not support architecture '<arch>' (supported: ...).
+   Nothing was changed.` or the shared OS message, with no download and no file touched.
+2. **Already installed** (a documented location, else a command on `PATH`): print
+   `<Label> is already installed (<path>[, version <v>]).` and ask before reinstalling;
+   `n` changes nothing, makes no download and no backup.
+3. Prerequisites: installer tools need `sha256sum` and `curl` (`curl` is offered via
+   `apt-get` after a yes, as elsewhere); Lazyports needs `go` (6.7); ctunnel needs `git`,
+   `make`, `gcc` (offered via one `apt-get install git make gcc libssl-dev zlib1g-dev`
+   after a yes).
+4. The plan is printed before anything is fetched: project, installer URL or git URL, the
+   pin (tag or commit), the expected SHA-256, what the upstream install does and which
+   files it touches, that existing files are backed up first and that the tool is not
+   started and nothing is asked for. Then `ezvps` asks once; `n` changes nothing.
+5. **Backup before overwriting.** Each existing config path and binary of the tool is
+   copied byte for byte with `cp -a` to `/var/backups/ezvps/<key>-<n>-<name>.<timestamp>.<pid>`
+   (dir mode 700; configs first, then binaries, `n` counts the copies). ezvps never reads
+   or prints a config; since a config can contain a token or key, the backup directory is
+   root-only. A failed backup aborts before anything is changed. Nothing existing = no
+   backup. ezvps never deletes a backup.
+6. Fetch, verify, run (per tool, below). A download or checksum failure, or an installer
+   failure, is reported and the module returns to the menu.
+7. **Verify afterwards:** the binary must exist at a documented location, otherwise
+   `The installer finished, but no <cmd> binary was found ... <Label> is NOT installed.`
+   On success print `Installed: <path>`, the version (or that none is reported) and
+   `To open <Label>: run: <command>`; nothing is launched.
+
+**Fetching rules.** An installer script is downloaded with `curl --proto '=https'
+--tlsv1.2` into a private temp directory by `lc_fetch_installer` (the only `curl` of these
+modules), hashed, compared with the pinned SHA-256 and **refused on a mismatch**, then run
+with `bash <file> </dev/null` (the script's terminal input is `/dev/null`: Backpack's
+installer would otherwise open Backpack's menu on a terminal, and ezvps must not launch the
+tool). It is never piped or process-substituted into a shell. Nothing from the network is
+run without the URL and pin having been shown and a yes. The pins live in `ezvps` as
+`LC_BACKPACK_*`, `LC_CTUNNEL_*`, `LC_LAZYPORTS_*`; to bump one, read the upstream file at
+the new tag or commit, change the tag/commit and the hash together, update 6.5 to 6.7 and
+run the tests (`tests/lint.sh` checks that the pins exist and are well formed).
+
+**Status.** Read-only. `Installed: yes/no`, each binary path found, `Version:` (the first
+line of the tool's documented version command, or `not reported` when it has none),
+services (below), and how to open the tool. A tool without a documented service says so
+(`Service: none documented upstream ...`): status is then *installed + binary present*,
+never *running* or *stopped*.
+
+**Update.** Only through the tool's documented update method, never a guessed command.
+* *Documented menu update* (Backpack): explain, ask, back up the config and binary, open
+  the tool's own menu, report `Updated: <old>  ->  <new>` (or `Version is unchanged (...)`
+  when the version did not move, e.g. already latest or the menu was left without updating).
+* *No documented update* (ctunnel, Lazyports): print `<Label> has no documented update
+  command upstream, and ezvps does not guess one.` and offer the **documented reinstall**
+  from the same source as Install: ask, the full Install flow (plan, confirmation, backup
+  first, pinned source), then `Version: <old>  ->  <new>` when the tool reports versions.
+Not installed: `... there is nothing to update. Choose Install first.`
+
+**Uninstall.** Not installed: nothing to do. Otherwise ezvps states what will be removed,
+**asks (default no)**, backs up the config and binary, removes the tool through the
+documented method, and then **verifies the binary is gone** (`Verified: the <cmd> binary is
+gone.`, or a warning that it is still present, for example when Backpack's menu was left
+without choosing Uninstall). Only paths named in the table are ever removed; a copy found
+only elsewhere on `PATH` is reported and left alone. Backups are kept and their location is
+printed.
+
+**Test-only variables** (7a): `EZVPS_TOOL_PREFIX` (default `/usr/local`; binaries live in
+`<prefix>/bin`, ctunnel's man page in `<prefix>/share/man/man1`) and
+`EZVPS_BACKPACK_CONF_DIR` (default `/etc/backpack`); `HOME` (as root, `/root`) locates
+`~/.passkey`, `~/go/bin` and the shell startup files. `EZVPS_BACKUP_DIR` and
+`EZVPS_SKIP_OS_CHECK` apply as everywhere.
+
+#### Backpack specifics
+
+* Project: <https://github.com/AminMGMT/BackPack> (public). Read for this PR at v1.9.0
+  (`README.md`, `docs/install.md`, `docs/updates.md`, `docs/server-layout.md`,
+  `docs/cli-menu.md`, `docs/troubleshooting.md`, `install.sh`, `internal/menu/system.go`).
+* **Install.** Upstream's one documented install is its own `install.sh` (docs/install.md:
+  `bash <(curl -fsSL https://raw.githubusercontent.com/AminMGMT/BackPack/main/install.sh)`).
+  ezvps downloads **the same script at the release tag v1.9.0**, never `main`, **exact URL**
+  `https://raw.githubusercontent.com/AminMGMT/BackPack/v1.9.0/install.sh`, expected SHA-256
+  `270be80ff0599fc63f03e952b66f4721552c1965b448f5269d62645bacb9e20d` (byte-identical to
+  `main` when this was written). That script downloads the latest release archive for the
+  architecture from GitHub, verifies it against the `SHA256SUMS` published with the release
+  and refuses an archive it cannot verify, installs `/usr/local/bin/backpack`, creates
+  `/etc/backpack` and `/root/BackPack`, and records `/etc/backpack/install_path`. It would
+  open Backpack's menu when it has a terminal on stdin; ezvps runs it with `</dev/null`
+  (shared rules) so it only installs. No environment variable is passed (the script also
+  reads `BP_HELPERS` and `BP_BUILD_FROM_SOURCE`, which ezvps never sets).
+* **Architectures:** `x86_64` (amd64) and `aarch64` (arm64), the release architectures the
+  README lists. (The script also maps a few 32-bit ones; ezvps does not claim them.)
+* **Config backed up:** `/etc/backpack` (tunnel `.toml` files and state, which can contain a
+  tunnel token) and the binary `/usr/local/bin/backpack`. Backpack's own backup archives in
+  `/root/BackPack/backups` are not copied by ezvps (they can be large); the Uninstall plan
+  warns that upstream's uninstaller deletes them.
+* **Version:** `backpack version` (docs/troubleshooting.md; prints the version, then the
+  source URL); ezvps shows the first line.
+* **Services:** upstream documents `backpack-<name>.service` per tunnel and
+  `backpack-monitor.service` (docs/server-layout.md). Status runs `systemctl list-units
+  --type=service --all --no-legend --plain 'backpack-*.service'` and prints each unit's
+  state; no such unit = "no tunnel is configured yet"; no `systemctl` = a message.
+* **Update:** documented as *Main menu -> 8) Update* (docs/cli-menu.md, docs/updates.md:
+  verified download, restore point, automatic rollback), and offline by repeating the
+  install with a newer archive. Backpack has **no non-interactive update command**, so
+  ezvps backs up and opens `backpack`, prints `In Backpack's menu choose 8 (Update), follow
+  its prompts, then leave the menu (10, Exit).`, and compares versions afterwards. It does
+  not re-run the online installer as an update.
+* **Uninstall:** documented as *Main menu -> 9) Uninstall* ("Removes everything Backpack
+  installed"; asks its own `Are You Sure`, deletes tunnels, services, `/etc/backpack`, the
+  binary and `/root/BackPack` including its backups). ezvps backs up `/etc/backpack` and the
+  binary, opens the menu with the hint to choose 9, then verifies the binary is gone.
+* Tunnel setup (Setup Iran / Setup Kharej), tokens, setup links, ports, transports, the web
+  panel, Telegram and everything else: Backpack's own menu only.
+
+### 6.6 ctunnel (PR 9, done)
+
+* Project: <https://github.com/alienrobotarmy/ctunnel> (public). Read at commit
+  `ec5e388e1dd3b684cd1cea1ed5c67f99d42bf4f3` (`README.md`, `INSTALL`, `Makefile`,
+  `Makefile.cfg`, `src/Makefile`, `src/opt.c`, `ctunnel.1`). It is a **command-line tunnel
+  program** (`ctunnel -c|-s -l ip:port -f ip:port -C cipher`), not a TUI panel, and has no
+  systemd unit, no installer script, no releases and no tags. ezvps invents none of them.
+* **Install:** upstream's documented method is building from source: `make; make install`
+  (README "Building", INSTALL). ezvps fetches **one pinned commit**
+  (`ec5e388e1dd3b684cd1cea1ed5c67f99d42bf4f3`, the latest when this was written; there are
+  no tags) from `https://github.com/alienrobotarmy/ctunnel.git` into a temp directory with
+  `git -c protocol.allow=never -c protocol.https.allow=always init/fetch --depth 1/checkout`
+  in `lc_fetch_source` (the only git network access), requires `git rev-parse HEAD` to equal
+  the pinned commit, runs `make PREFIX=/usr/local` (the OpenSSL build, upstream's default
+  `CRYPTO_TYPE`) and `make install PREFIX=/usr/local`. That installs `/usr/local/bin/ctunnel`
+  and `/usr/local/share/man/man1/ctunnel.1` (`Makefile`: `install ctunnel $(PREFIX)/bin`, the
+  man page). The build log is shown only on failure (last 20 lines, with a hint about
+  `libssl-dev zlib1g-dev`); nothing is installed after a failed build.
+* **Build packages:** `git`, `make`, `gcc` are checked; if any is missing, one `apt-get
+  install git make gcc libssl-dev zlib1g-dev` is offered (a yes is required).
+* **Architectures:** upstream states no list (a C source build). ezvps accepts `x86_64` and
+  `aarch64`, the two architectures the supported systems are used on.
+* **Config backed up:** `~/.passkey` (README "Keys": ctunnel keeps its pre-shared Key and IV
+  there) and the binary. The file is a secret: it is copied byte for byte, never read or
+  printed, and never deleted or created by ezvps (ctunnel creates it itself on first run).
+* **Version:** `ctunnel -v` ("Print Version information then exit", `src/opt.c`; with no
+  other option ctunnel prints its banner, then usage, and exits 0). ezvps shows the first
+  line, `ctunnel <major>.<minor> Copyright ...`. It is the only way ezvps ever runs ctunnel.
+* **Services:** none documented upstream: Status says so and reports installed + binary
+  present, not running/stopped. Tunnels are started by hand by the user.
+* **Update:** upstream documents **no update command**. Update says so
+  (`ctunnel has no documented update command upstream, and ezvps does not guess one.`) and
+  offers the documented reinstall (the Install flow above, backup first), then reports the
+  version before and after.
+* **Uninstall:** upstream's `make uninstall` is `rm -f $(PREFIX)/bin/ctunnel` and `rm -f
+  $(PREFIX)/share/man/man1/ctunnel.1`. ezvps lists those two paths (the ones that exist),
+  asks, backs up the binary and `~/.passkey`, removes exactly them (without downloading the
+  source again to run `make`) and verifies the binary is gone. `~/.passkey` and the backups
+  are left. A ctunnel found only elsewhere on `PATH` (for example a distro package) is
+  reported and not touched.
+* Tunnels, ciphers, keys, VPN mode: the `ctunnel` command line only.
+
+### 6.7 Lazyports (PR 9, done)
+
+* Project: <https://github.com/v9mirza/lazyports> (public). Read at commit
+  `84647db0ea0e0c7b90b247e35a6c47d44d4bba95` (`README.md`, `install.sh`, `go.mod`,
+  `main.go`). A Go terminal UI; no releases, tags, services, config files or version flag.
+* **Install:** upstream's documented install is its `install.sh`
+  (`curl -sL https://raw.githubusercontent.com/v9mirza/lazyports/main/install.sh | bash`).
+  ezvps downloads the same script **at that commit, never `main`**, **exact URL**
+  `https://raw.githubusercontent.com/v9mirza/lazyports/84647db0ea0e0c7b90b247e35a6c47d44d4bba95/install.sh`,
+  expected SHA-256 `6324d8c6e4fe736f994e41de5a985040b0d4d6b734968f0ad554833ca0940a60`,
+  and runs it with `</dev/null`. The script requires Go (it exits with "Go is not installed"
+  otherwise), runs `GOPROXY=direct go install github.com/v9mirza/lazyports@main`, copies the
+  binary from `$(go env GOPATH)/bin` to `/usr/local/bin/lazyports`, and, when that Go bin
+  directory is not on `PATH`, **appends an `export PATH=...` line to `~/.bashrc` or
+  `~/.zshrc`**. Honest limit, shown in the plan: the script is pinned and hash-checked but
+  `go install ...@main` builds upstream's **current main branch**, which cannot be pinned
+  without changing upstream's script.
+* **Go:** required, never installed by ezvps (upstream: "Please install Go"). Missing =
+  refuse with the Go install URL, nothing changed. `go.mod` needs Go 1.24 (toolchain
+  go1.24.12): below 1.21 (cannot fetch a newer toolchain) is refused, 1.21 to 1.23 is
+  warned about (Go will try to download the toolchain; the installer reports failure
+  otherwise), 1.24 and newer pass.
+* **Architectures:** upstream states none (a Go source build). ezvps accepts `x86_64` and
+  `aarch64`.
+* **Config backed up:** Lazyports has no config. The files its installer may change are
+  backed up first: the existing `~/.bashrc` and `~/.zshrc`, plus any installed binary.
+* **Binary:** `/usr/local/bin/lazyports` or `~/go/bin/lazyports` (README).
+* **Version:** none documented; Status prints `not reported`. No `--version` is guessed.
+* **Services:** none (an interactive TUI): Status says so.
+* **Update:** upstream documents **no update command**; Update says so and offers the
+  documented reinstall (the same installer, which rebuilds the current upstream `main`).
+* **Uninstall:** documented as removing the binary (README "Uninstallation": `sudo rm
+  /usr/local/bin/lazyports` and `rm ~/go/bin/lazyports`). ezvps lists the paths that exist,
+  asks, backs up, removes exactly those and verifies. The PATH line the installer added to a
+  shell startup file is **not** removed (upstream does not document it); the message says
+  shell startup files stay as they are.
+* Everything the TUI does (filter, sort, kill): Lazyports itself.
 
 ### 6.8 SSH and Users (later PR)
 
@@ -1031,12 +1251,12 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
-| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports), install.sh | backup dir (default `/var/backups/ezvps`) |
 | `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
 | `EZVPS_APT_DIR` | ezvps (Nginx) | apt config dir for the nginx.org source and pin (default `/etc/apt`) |
 | `EZVPS_KEYRING_DIR` | ezvps (Nginx) | where `nginx-archive-keyring.gpg` is stored (default `/usr/share/keyrings`) |
@@ -1046,6 +1266,8 @@ Defaults are the real paths; none of these relax a check on a real server.
 | `EZVPS_XUI_WAIT_SECONDS` | ezvps (3x-ui) | how long to wait for the panel to answer (default 30) |
 | `EZVPS_ACME_HOME` | ezvps (Certificates) | acme.sh home (default `$HOME/.acme.sh`) |
 | `EZVPS_CERT_DIR` | ezvps (Nginx, Certificates) | certificate store, also the path written into HTTPS sites (default `/etc/ssl/ezvps`) |
+| `EZVPS_TOOL_PREFIX` | ezvps (Backpack, ctunnel, Lazyports) | install prefix of the tools (default `/usr/local`: binaries in `<prefix>/bin`, ctunnel's man page in `<prefix>/share/man/man1`; also passed to `make` as `PREFIX`) |
+| `EZVPS_BACKPACK_CONF_DIR` | ezvps (Backpack) | Backpack's config directory, backed up before changes (default `/etc/backpack`) |
 | `EZVPS_NO_PAUSE=1` | ezvps | do not wait for Enter |
 
 ## 8. Tests
@@ -1053,7 +1275,7 @@ Defaults are the real paths; none of these relax a check on a real server.
 * `tests/lint.sh`: `bash -n` + `shellcheck` on every script, plus a hygiene
   scan (no non-documentation IPs, key material or token patterns) and the
   download rules: `curl` only inside `xui_fetch_installer` / `xui_probe` /
-  `ngx_fetch_key` / `acme_fetch_script`, no
+  `ngx_fetch_key` / `acme_fetch_script` / `lc_fetch_installer`, git network access only in `lc_fetch_source`, no
   download piped into a shell, none in `install.sh`, installer URL pinned to
   a tag (not `master`), pin constants present.
 * `tests/smoke-test.sh`: runs in a temp dir with an empty/stub `PATH`;
@@ -1162,13 +1384,56 @@ Defaults are the real paths; none of these relax a check on a real server.
   `acme.sh --remove`, a **failing config test restores the HTTPS site, keeps the
   certificate and does not reload**, refusal while another file or a non-ezvps site uses
   the certificate, no ezvps site, `--remove` failure, no nginx).
+  **Backpack, ctunnel and Lazyports** (`== Backpack, ctunnel and Lazyports lifecycle
+  modules`) share one section, run against **fake binaries and fake installers**: a fake
+  `backpack` (its `version` command, and a tiny menu that reads `8` Update / `9` Uninstall /
+  `10` Exit from stdin and records that it was opened), fake official installers for Backpack
+  and Lazyports (they record their arguments, whether they received terminal input and the
+  environment, and write the fake binary; Lazyports' also appends a PATH line to `~/.bashrc`),
+  a fake `git` (records the calls and answers `rev-parse` from a switch) and a fake `make` for
+  ctunnel, stub `curl`, `sha256sum`, `uname`, `go`, `gcc`, `systemctl` and `apt-get`, and
+  sandbox `PATH`s that each lack one command. Everything lives in per-scenario temp dirs
+  (`EZVPS_TOOL_PREFIX`, `EZVPS_BACKPACK_CONF_DIR`, `EZVPS_BACKUP_DIR`, `HOME`). Covered, for the
+  three tools unless noted: the exact submenu and its reachability from the main menu;
+  install detection and confirmation (plan with URL/commit, pin and hash shown, `n` downloads
+  and changes nothing, pinned URL fetched once with `--proto =https --tlsv1.2`, the installer
+  gets no arguments, no environment switches and **no terminal input** so the menu input that
+  follows survives and the tool is never opened, the binary is verified, only the way to open
+  the tool is printed); already installed (said so, reinstall only on a yes, a yes at the plan
+  can still stop it, config and binary backed up byte for byte into a 700 directory first, a
+  second reinstall converges); failure paths (SHA-256 mismatch, download failure, installer
+  failure, installer that installs nothing, missing `curl` offered and only installed after a
+  yes, ctunnel: commit that does not verify, git failure, build failure with the log tail,
+  missing build tools offered once and only after a yes, Lazyports: no Go, Go 1.19 refused,
+  Go 1.22 warned); status (not installed; installed with version; Backpack's
+  `backpack-*.service` units running and stopped, none, and no `systemctl`; ctunnel and
+  Lazyports say no service is documented and never claim running/stopped; Lazyports says no
+  version is reported; a ctunnel on `PATH` outside the prefix counts as installed); update
+  (Backpack: declined, backup byte for byte, the tool's own menu opened, `Updated: old -> new`,
+  `Version is unchanged`; ctunnel and Lazyports: the no-documented-update message, reinstall
+  offered, declined changes nothing, accepted backs up and reinstalls, old and new version
+  reported); uninstall (not installed, declined changes nothing, Backpack through its own menu
+  with the verify step, leaving the menu without uninstalling is reported, ctunnel removes
+  exactly the binary and man page and keeps `~/.passkey`, Lazyports removes both documented
+  locations and keeps the shell startup file, a copy outside the documented paths is left
+  alone, backups kept, secrets never printed); unsupported systems (all twelve rejected
+  `os-release` fixtures, a missing file, and the five accepted ones, for Backpack; Ubuntu
+  25.10 and Debian 11 for the others) and unsupported architectures (`armv7l`, `armv6l`,
+  `i686`, `i386`, `s390x`, `ppc64le`, `riscv64`, `mips` rejected, `aarch64` accepted) change
+  nothing and download nothing. Source rules: `curl` only in `lc_fetch_installer`, git network
+  access only in `lc_fetch_source` with https only, the installer runs with `</dev/null`, no
+  `read` in the lifecycle code outside the submenu, the yes/no helper and the parsers of the
+  tools' own output, one shared submenu and three one-line wrappers, no unpinned installer URL.
+  Each assertion was checked to fail when the behaviour it covers is broken (for example
+  removing the `</dev/null`, the hash comparison, the backup, the architecture or OS check, the
+  confirmations or the post-uninstall verification).
   It touches nothing outside its temp dir and uses no network.
   `tests/lint.sh` additionally checks that the OS allowlist block is identical
   in `ezvps` and `install.sh` and lists exactly the five supported systems, that
   the nginx.org suite is not hardcoded, that the repository URL is the stable
   one (never mainline), the key URL, the fingerprint pins and the priority-900
   pin are present, that `curl` is used only in the 3x-ui download/probe
-  functions, `ngx_fetch_key` and `acme_fetch_script`, that the acme.sh pin (tag,
+  functions, `ngx_fetch_key`, `acme_fetch_script` and `lc_fetch_installer`, that the Backpack, ctunnel and Lazyports pins (repository, tag or full commit, SHA-256) are present and well formed and their installer URLs are built from the pin, that the installer runs with `</dev/null`, that git touches the network only in `lc_fetch_source`, that the acme.sh pin (tag,
   exact tag-based URL, SHA-256) is present and well formed, and that the script has
   no `get.acme.sh`, DNS-validation, DNS-credential or certbot code.
 * **Operating systems** (`== operating systems` in the smoke test, always with

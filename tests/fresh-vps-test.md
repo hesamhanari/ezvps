@@ -83,12 +83,12 @@ script it from ezvps)
 - [ ] menu lines match exactly (no description text):
       `L2TP, 3x-ui, Backpack, ctunnel, Nginx, Certificates, Lazyports,
       SSH and Users, Firewall, Backup, Check For Updates, Uninstall`, then `0) Exit`
-- [ ] each of `3`, `4` and `7` to `12` prints `<Label> is not implemented yet.`
-      and returns to the menu after Enter (`2` opens the 3x-ui submenu, section 5;
-      `5` opens the Nginx submenu, section 6; `6` opens the Certificates
-      submenu, section 7)
+- [ ] each of `8` to `12` prints `<Label> is not implemented yet.` and returns to
+      the menu after Enter (`2` opens the 3x-ui submenu, section 5; `3`, `4` and `7`
+      open the Backpack, ctunnel and Lazyports submenus, section 8; `5` opens the
+      Nginx submenu, section 6; `6` opens the Certificates submenu, section 7)
 - [ ] `abc`, `13`, empty input -> `Invalid choice`, menu continues
-- [ ] `ezvps backpack` (and the other pending keys) print the same message, exit 0
+- [ ] `ezvps ssh` (and the other pending keys) print the same message, exit 0
 - [ ] `ezvps bogus` prints usage, exit 2
 - [ ] Ctrl-D at the prompt exits cleanly
 
@@ -467,15 +467,97 @@ test domain and a backend on `127.0.0.1:3000` (`python3 -m http.server 3000`).
 - [ ] clean up: remove the test sites, `rm -rf /root/.acme.sh` if you want acme.sh gone
       (`crontab -e` to drop its line), and `/etc/ssl/ezvps`
 
-## 8. Non-root
+## 8. Backpack, ctunnel and Lazyports
+
+Needs outbound HTTPS to github.com and raw.githubusercontent.com (Backpack's
+installer also downloads its release from GitHub). Do this on a throwaway VPS,
+**once per supported release and once per architecture you care about**
+(`x86_64`, `aarch64`). Use fake or throwaway values only: ezvps never asks for a
+tunnel token, setup link, password or key, so do not type any into ezvps. All
+tunnel setup in this section happens inside each tool's own interface.
+
+**8a. Submenus (all three)**
+- [ ] `ezvps` -> `3`, `4`, `7` each show exactly `1) Install`, `2) Status`,
+      `3) Update`, `4) Uninstall`, `0) Back` under the tool's name; `abc` prints
+      `Invalid choice: abc`; Ctrl-D exits cleanly
+- [ ] with the tool not installed, `Status`, `Update` and `Uninstall` each say it is
+      not installed and change nothing
+
+**8b. Unsupported systems and architectures** (use a spare VM or a copy of
+`/etc/os-release` via `EZVPS_OS_RELEASE`; do not edit the real file)
+- [ ] on Ubuntu 25.10, Debian 11 or a derivative, `Install` of each tool prints the
+      `needs a supported system` message and changes nothing (no download, no file)
+- [ ] on an `armv7l` or `i686` machine, `Install` prints
+      `does not support architecture '...' (supported: x86_64, aarch64)`
+
+**8c. Backpack**
+- [ ] `Install` shows the project, the installer URL
+      `https://raw.githubusercontent.com/AminMGMT/BackPack/v1.9.0/install.sh`, the tag,
+      the expected SHA-256 and what the installer does; answering `n` downloads and
+      changes nothing
+- [ ] answering `y` installs `/usr/local/bin/backpack`, `/etc/backpack` and
+      `/root/BackPack`; **Backpack's menu does not open**; ezvps prints only
+      `To open Backpack: run: backpack` and the version (`backpack version`)
+- [ ] `Install` again: it says Backpack is already installed and asks before
+      reinstalling; `n` changes nothing
+- [ ] open Backpack yourself (`backpack`), create a throwaway tunnel with fake values
+      (for example a TCP tunnel to `192.0.2.10`), exit; `Status` now lists
+      `backpack-<name>.service` with its state (`systemctl list-units 'backpack-*'`
+      agrees); ezvps never showed the tunnel token
+- [ ] `Update`: ezvps backs up `/etc/backpack` to `/var/backups/ezvps/backpack-1-backpack.*`
+      (`diff -r` against `/etc/backpack`), opens Backpack's menu; choose `8` (Update),
+      then exit; ezvps reports the version before and after (`Version is unchanged` if
+      it was already the latest)
+- [ ] `Uninstall`: `n` changes nothing; `y` backs up `/etc/backpack`, opens Backpack's
+      menu; choose `9` (Uninstall) and confirm Backpack's own prompt; ezvps then prints
+      `Verified: the backpack binary is gone.`, `command -v backpack` prints nothing
+      and the backup is still in `/var/backups/ezvps/`. Leaving Backpack's menu with
+      `10` instead makes ezvps say Backpack is still present
+
+**8d. ctunnel**
+- [ ] `Install` plan shows `https://github.com/alienrobotarmy/ctunnel.git`, the pinned
+      commit and that upstream has no installer or release; with `git`, `make` or
+      `gcc` missing it offers `apt-get install git make gcc libssl-dev zlib1g-dev`
+      and installs nothing on `n`
+- [ ] after `y`: `/usr/local/bin/ctunnel` and `/usr/local/share/man/man1/ctunnel.1`
+      exist, `Version:` shows the `ctunnel 0.8 ...` line from `ctunnel -v`, nothing was
+      started (`pgrep ctunnel` prints nothing)
+- [ ] `Status`: installed, version, and the text that no service is documented (it
+      never says running or stopped)
+- [ ] create `~/.passkey` the way ctunnel does (run ctunnel once by hand with fake
+      values) and `Update`: ezvps says there is **no documented update command**,
+      offers a reinstall, backs up the binary and `~/.passkey` to
+      `/var/backups/ezvps/ctunnel-*` (`cmp` against the originals), reinstalls and
+      reports the version before and after; `~/.passkey` is untouched
+- [ ] `Uninstall`: `n` changes nothing; `y` backs up, removes the binary and the man
+      page, prints `Verified: the ctunnel binary is gone.`; `~/.passkey` and the
+      backups remain
+
+**8e. Lazyports**
+- [ ] `Install` without Go prints that Go 1.24+ is needed and changes nothing; with Go
+      1.24+ the plan shows the installer URL at the pinned commit, its SHA-256, the
+      `go install ...@main` note (the built code is **not** pinned) and the shell-file
+      note
+- [ ] after `y`: `lazyports` exists in `/usr/local/bin` (and `~/go/bin`), `~/.bashrc`
+      was backed up to `/var/backups/ezvps/lazyports-1-bashrc.*` before the installer
+      appended its PATH line; ezvps prints only `To open Lazyports: run: lazyports`
+      and `Version: not reported`; Lazyports itself did not start
+- [ ] `Status`: installed, binary path(s), no version, no service
+- [ ] `Update`: says there is no documented update command and offers a reinstall;
+      `n` changes nothing; `y` backs up and reinstalls
+- [ ] `Uninstall`: `y` removes `/usr/local/bin/lazyports` and `~/go/bin/lazyports`,
+      verifies they are gone, leaves `~/.bashrc` (and its PATH line) alone
+
+## 9. Non-root
 
 - [ ] as a normal user: `ezvps` prints `ezvps must be run as root.`, exit 1
 - [ ] as a normal user: `ezvps --version` still works
 
-## 9. Cleanup (no uninstall module yet)
+## 10. Cleanup (no uninstall module yet)
 
 ```bash
 x-ui uninstall            # 3x-ui's own uninstaller, if you installed it
+# Backpack / ctunnel / Lazyports: use each submenu's Uninstall (section 8)
 apt-get purge -y nginx    # if you installed nginx for this test
 rm -f /usr/local/bin/ezvps
 rm -rf /var/backups/ezvps /var/lib/ezvps

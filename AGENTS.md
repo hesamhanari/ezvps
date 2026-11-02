@@ -58,19 +58,34 @@ SPEC.md  README.md  AGENTS.md
   `dpkg-query`, optionally `ss`; Certificates: `nginx`, `systemctl`,
   `curl` and `sha256sum` (acme.sh download only), the installed `acme.sh`
   itself, optionally `openssl` (expiry dates), `crontab` (presence check and
-  backup) and `ss`). Shared
+  backup) and `ss`; Backpack, ctunnel and Lazyports: `uname`, `bash`, `sha256sum`,
+  `curl` (installer download), `git`/`make`/`gcc` (ctunnel build), `go` (Lazyports,
+  never installed by ezvps), `apt-get` (offered packages) and optionally `systemctl`
+  (Backpack's `backpack-*.service` units)). Shared
   helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_supported_os`,
   `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
   message; do not assume it.
 * Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`,
-  in `ngx_fetch_key` (the nginx.org signing key) and in `acme_fetch_script`
-  (the pinned acme.sh script); lint enforces it.
+  in `ngx_fetch_key` (the nginx.org signing key), in `acme_fetch_script`
+  (the pinned acme.sh script) and in `lc_fetch_installer` (the pinned Backpack and
+  Lazyports installers); git may touch the network only in `lc_fetch_source` (the
+  pinned ctunnel commit, https only). Lint enforces both.
   Download to a temp file, show URL and hash, verify, ask, then run. Never
   pipe or process-substitute a download into a shell. Pin a tag/version plus
   a SHA-256 (the nginx.org key is pinned by fingerprint); never
   `master`/`main`. acme.sh is the script at a release tag with a SHA-256 (SPEC
   6.4), never `get.acme.sh`.
+* Backpack, ctunnel, Lazyports are **lifecycle modules only** (Install, Status, Update,
+  Uninstall) on one shared flow (`lc_*`, per-tool table in `lc_load`). Tunnel setup,
+  ports, tokens and every other setting stay in the tool's own interface: never rebuild
+  them, never launch a tool after installing it, never ask for, store, print or log a
+  tunnel token, setup link, password or key (config backups are byte-for-byte copies that
+  ezvps does not read). Use only what upstream documents: no invented service name,
+  version flag or update command; where upstream has none, say so and offer the
+  documented reinstall (backup first). Upstream installer scripts are pinned (tag or full
+  commit plus SHA-256), shown, confirmed and run with `</dev/null`. Adding a tool means a
+  new `lc_load` entry, not a new submenu.
 * Certificates: HTTP-01 through nginx, one domain, Let's Encrypt only. No
   wildcard, DNS API, DNS provider credentials, `stream` or certbot. A private
   key is never printed or read by ezvps; certificates live in `/etc/ssl/ezvps`
@@ -100,7 +115,7 @@ SPEC.md  README.md  AGENTS.md
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
   section 7a (`EZVPS_ALLOW_NONROOT`, `EZVPS_XUI_DIR`, `EZVPS_ACME_HOME`,
-  `EZVPS_CERT_DIR`, ...). Do not add switches that weaken real behaviour.
+  `EZVPS_CERT_DIR`, `EZVPS_TOOL_PREFIX`, `EZVPS_BACKPACK_CONF_DIR`, ...). Do not add switches that weaken real behaviour.
 
 ## Adding a module
 
