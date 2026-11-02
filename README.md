@@ -28,6 +28,7 @@ rejected.
 |--------|-----------|-----------|--------------|--------------|--------------|
 | 3x-ui | yes | yes | yes | yes | yes |
 | Nginx (nginx.org stable 1.30+) | yes (`packages/debian`, `bookworm`) | yes (`packages/debian`, `trixie`) | yes (`packages/ubuntu`, `jammy`) | yes (`packages/ubuntu`, `noble`) | yes (`packages/ubuntu`, `resolute`) |
+| Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | L2TP | see below | yes | see below | see below | see below |
 
 **L2TP is gated separately.** The L2TP menu item launches the separate ezl2tp
@@ -36,9 +37,9 @@ currently **Debian 13 only**. ezvps does not port ezl2tp. On every other
 system in the table the L2TP item prints a clear message, installs and
 launches nothing, and returns to the menu.
 
-> **Status: v0.0.1 in development.** **L2TP**, **3x-ui** and **Nginx** work so
-> far. The other menu items (Backpack, ctunnel, Certificates, Lazyports, SSH
-> and Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
+> **Status: v0.0.1 in development.** **L2TP**, **3x-ui**, **Nginx** and
+> **Certificates** work so far. The other menu items (Backpack, ctunnel, Lazyports,
+> SSH and Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
 > they print "not implemented yet" and return to the menu. They arrive in
 > later releases, one module per PR. See [SPEC.md](SPEC.md).
 
@@ -164,8 +165,10 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
 * **Status** shows whether the service runs and whether `nginx -t` passes.
   **Restart** runs the config test first and never restarts or reloads a
   broken config.
-* **List sites** shows the `*.conf` files in `/etc/nginx/conf.d` with their
-  domain and, for sites created by ezvps, the upstream.
+* **List sites** shows every `*.conf` file in `/etc/nginx/conf.d` with its
+  domain, its `proxy_pass` upstream when it has one (also for files not made by
+  ezvps) and whether it was created by ezvps (`ezvps` / `not ezvps`). It only
+  reads: a file ezvps did not make is never edited.
 * **Add site** asks for a domain and an upstream `host:port` and writes
   `/etc/nginx/conf.d/<domain>.conf` (one file per domain; the domain is
   sanitised, only letters, digits, dot and hyphen are accepted). It reloads
@@ -181,8 +184,68 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
   files are removed). Declining leaves them alone with a warning that they
   are in the legacy layout.
 
-Sites are **HTTP only** for now. For HTTPS use the Certificates module once it
-exists (a later release); the Nginx module does not touch certificates.
+Sites written by **Add site** are plain HTTP. For HTTPS use the Certificates
+module (below), which can switch an ezvps site to HTTPS; the Nginx menu itself
+never touches certificates.
+
+**Site template.** Every site is one file with a `location /` that proxies to the
+upstream (`proxy_http_version 1.1`, `client_max_body_size 64M`, the `Host`,
+`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Upgrade`
+and `Connection` headers, 60 s connect and 120 s read/send timeouts). `Connection`
+comes from `$connection_upgrade`, not a fixed `"upgrade"`, so WebSocket upgrades
+work and normal requests keep `Connection: close` semantics. Before the first such
+site is written, ezvps makes sure `nginx.conf` has the standard `map $http_upgrade
+$connection_upgrade` exactly once (backup of `nginx.conf` first, config test after,
+rollback on failure; an existing map, even in another `conf.d` file, is never
+duplicated).
+
+### Certificates
+
+`ezvps` -> `6` opens a submenu:
+
+```
+ 1) Install acme.sh
+ 2) Issue certificate
+ 3) List certificates
+ 4) Renew certificates
+ 5) Remove certificate
+ 0) Back
+```
+
+Free Let's Encrypt certificates for **one domain at a time**, validated with
+**HTTP-01 through nginx**. There is no wildcard or DNS-API issuance, and ezvps
+never asks for or stores DNS provider credentials.
+
+* **Install acme.sh** downloads the official
+  [acme.sh](https://github.com/acmesh-official/acme.sh) script at the pinned release
+  tag `3.1.6` from
+  `https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh`, checks its
+  SHA-256, and installs it with its own `--install` (never `curl | sh`). If acme.sh is
+  already installed it is not reinstalled. The install ends by checking that the
+  `acme.sh` command works. Its daily renewal job goes into root's crontab (the old
+  crontab is backed up first).
+* **Issue certificate** asks for a domain, needs nginx installed and running with
+  port 80 listening, and a server block that serves the domain (add the site with
+  Nginx -> Add site first). It tells you that **the domain's DNS must point to this
+  server** and asks for confirmation before it runs acme.sh. The certificate goes to
+  `/etc/ssl/ezvps/<domain>/fullchain.pem` and `privkey.pem` (the key is mode 600,
+  root only, and is never printed); an existing certificate for the domain is backed
+  up to `/var/backups/ezvps/` first. If an **ezvps site** exists for the domain it
+  offers to enable HTTPS: that one `conf.d` file is backed up and rewritten with a
+  `listen 443 ssl` server block (`http2 on`, the stored certificate, the same proxy
+  block) while the HTTP block becomes a `301` redirect to `https://$host$request_uri`;
+  nginx is reloaded only if `nginx -t` passes, otherwise the file is restored. With no
+  ezvps site the certificate is only stored and no site is created.
+* **List certificates** shows each domain, its expiry date and whether it is used by
+  an nginx site.
+* **Renew certificates** runs `acme.sh --renew-all` and reloads nginx only if a
+  certificate actually changed and the config test passes.
+* **Remove certificate** asks for the domain and a confirmation, backs the certificate
+  up, restores the plain HTTP proxy block of its ezvps site (site file backed up first,
+  config test before the reload, rollback on failure) and removes the stored files; a
+  site ezvps did not make that still uses the certificate stops the removal.
+
+The pin, the HTTPS site layout and the details are in [SPEC.md](SPEC.md) section 6.4.
 
 ## Principles
 
@@ -194,7 +257,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui and Nginx against fakes, pending modules, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx and Certificates against fakes, pending modules, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway VPS on each

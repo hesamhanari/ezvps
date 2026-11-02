@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8).
 
 ## 1. What ezvps is
 
@@ -11,7 +11,8 @@ A bash TUI/CLI VPS manager for the **Debian and Ubuntu LTS families**
 script, installed as `/usr/local/bin/ezvps`. It has no dependencies beyond what
 a supported install already has (bash, coreutils, systemd); anything else a
 module needs is checked with `command -v` first and installed only with the
-user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself).
+user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself;
+Certificates: `curl` and the pinned acme.sh script).
 
 ### 1.1 Supported systems
 
@@ -33,6 +34,7 @@ Per module:
 |--------|-----------|-----------|--------------|--------------|--------------|
 | 3x-ui | yes | yes | yes | yes | yes |
 | Nginx | yes: `nginx.org/packages/debian`, suite `bookworm` | yes: `.../debian`, `trixie` | yes: `nginx.org/packages/ubuntu`, suite `jammy` | yes: `.../ubuntu`, `noble` | yes: `.../ubuntu`, `resolute` |
+| Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | L2TP (ezl2tp) | **no** (gate below) | yes | **no** (gate below) | **no** (gate below) | **no** (gate below) |
 
 * **L2TP has its own gate.** ezvps running on a system does not mean ezl2tp
@@ -56,7 +58,8 @@ Per module:
   recognised version with the wrong codename the text
   `(the codename does not match the version; <id> <version> is '<codename>')`
   follows `found '...'`), and the module returns to the menu. The 3x-ui and Nginx
-  installs, L2TP and `install.sh` all use this rule. `install.sh` cannot source
+  installs, the acme.sh install and Issue certificate, L2TP and `install.sh` all use
+  this rule. `install.sh` cannot source
   `ezvps`, so the block between `# BEGIN ezvps-os-allowlist` and `# END
   ezvps-os-allowlist` is a verbatim copy in both files, and `tests/lint.sh`
   fails if the two differ or the list changes.
@@ -80,6 +83,9 @@ Per module:
   | signing key, pin | `nginx.org` key fingerprints, `origin nginx.org` at 900 | identical | one path |
   | apt source file format | `nginx.list` one-line source; the mainline scan reads every file under `sources.list.d`, so deb822 `.sources` files are covered | identical | one path |
   | prerequisites (`curl`, `gnupg`, `ca-certificates`) | same package names | same package names | one path |
+  | acme.sh (PR 8) | the same pinned script, `bash ./acme.sh --install`; needs `openssl` (always present), `curl`, optionally `crontab` | identical | one path |
+  | `http2 on;` in the HTTPS site (PR 8) | needs nginx 1.25.1+; the module only ever installs nginx.org stable 1.30+ | identical | one path |
+  | certificate store `/etc/ssl/ezvps` (PR 8) | no package owns it | no package owns it (Ubuntu's `ssl-cert` group is not used) | one path |
 
 ## 2. Principles (same as easyl2tp)
 
@@ -167,7 +173,7 @@ redraws. EOF on stdin exits 0.
 | 3 | Backpack          | not implemented yet | later      |
 | 4 | ctunnel           | not implemented yet | later      |
 | 5 | Nginx             | **implemented**     | PR 3       |
-| 6 | Certificates      | not implemented yet | later      |
+| 6 | Certificates      | **implemented**     | PR 8       |
 | 7 | Lazyports         | not implemented yet | later      |
 | 8 | SSH and Users     | not implemented yet | later      |
 | 9 | Firewall          | not implemented yet | later      |
@@ -384,10 +390,11 @@ Menu item 5 opens a submenu. Clean labels only:
 continue..."; invalid input prints `Invalid choice: <input>`. Module key
 `nginx` maps to `module_nginx`; its helpers are prefixed `ngx_`.
 
-**HTTP only.** This module never issues, stores or references a certificate
-and writes no `listen 443` / `ssl_*` directives. A site that needs HTTPS is
-told to use the Certificates module (section 6.4) once it exists; until then
-the message says it is not available yet.
+**Add site writes plain HTTP.** The Nginx menu never issues or stores a
+certificate, and the site Add site writes has no `listen 443` / `ssl_*`
+directives. HTTPS is added afterwards by the Certificates module (section 6.4),
+which rewrites that one ezvps-made site file. List sites, Add site and Remove
+site work with such a site like with any other.
 
 #### Where sites live: `conf.d`
 
@@ -409,7 +416,8 @@ that matters here is `conf.d/default.conf` (section 5).
   the file system.
 * **ezvps-made sites** carry a `# Managed by ezvps` header and
   `# ezvps:domain=` / `# ezvps:upstream=` marker lines (the same markers the
-  older sites-available layout used, so old files can be moved unchanged).
+  older sites-available layout used, so old files can be moved unchanged). A
+  site the Certificates module switched to HTTPS also has `# ezvps:https=on`.
 * **nginx.conf must load conf.d** (checked by Add site and by the migration;
   List sites only warns). The check is a small brace-aware scan for an
   `include .../conf.d/*...;` directly inside the `http { }` block, ignoring
@@ -524,11 +532,24 @@ restarts a broken config.
 
 Offers the legacy migration first if there is anything to migrate (see
 Migration), then lists `/etc/nginx/conf.d/*.conf` as a table
-`NAME  DOMAIN  UPSTREAM  CREATED BY`:
+`NAME  DOMAIN  UPSTREAM  CREATED BY`. **Every** `*.conf` file is parsed, ezvps-made
+or not, and its `proxy_pass` upstream is shown when it has one:
 
-* sites created by ezvps: domain and upstream from the markers, `ezvps`;
-* any other `*.conf` file: its first `server_name`, no upstream, `not ezvps`;
+* `DOMAIN`: sites created by ezvps use the `# ezvps:domain=` marker, any other
+  file its first `server_name`;
+* `UPSTREAM`: the first `proxy_pass` target found in the file (comments are
+  ignored; it may sit on a one-line `location / { proxy_pass ...; }`), shown
+  without the leading `http://` (`127.0.0.1:3000`, `backend.internal:9000/api/`);
+  a non-http scheme is kept (`https://192.0.2.9:8443`); with several distinct
+  targets the first one is followed by `(+N more)`; `-` when the file has none
+  (static sites, `return`, a commented-out `proxy_pass`). An ezvps-made file
+  without any `proxy_pass` falls back to its `# ezvps:upstream=` marker, and
+  when both exist the real `proxy_pass` wins;
+* `CREATED BY`: exactly `ezvps` (the file carries the ezvps marker) or
+  `not ezvps`;
 * a dangling symlink or a non-regular file is flagged.
+
+Listing never edits a file, whoever made it.
 
 Files in `conf.d` that do not end in `.conf` are not loaded by nginx and are
 not listed; `sites-available`/`sites-enabled` are not listed. If `nginx.conf`
@@ -560,12 +581,11 @@ Apart from the migration offer it is read-only.
    A symlinked `default.conf` is left alone. Files in `sites-enabled` are
    never deleted.
 5. Checks that `nginx.conf` includes `conf.d` (see above).
-6. Writes `/etc/nginx/conf.d/<domain>.conf` (temp file in `conf.d` + `mv`).
-   The generated file is a plain `listen 80` server (plus `listen [::]:80`
-   only when the kernel has IPv6, i.e. `/proc/net/if_inet6` exists; otherwise
-   `nginx -t` fails on such hosts) with `proxy_pass http://<upstream>`,
-   `proxy_http_version 1.1` and `Host`, `X-Real-IP`, `X-Forwarded-For`,
-   `X-Forwarded-Proto`, `Upgrade`, `Connection` headers.
+6. Makes sure `nginx.conf` defines the `$connection_upgrade` map (see "The
+   connection map"), then writes `/etc/nginx/conf.d/<domain>.conf` (temp file in
+   `conf.d` + `mv`). The generated file is the site template below: a plain
+   `listen 80` server (plus `listen [::]:80` only when the kernel has IPv6, i.e.
+   `/proc/net/if_inet6` exists; otherwise `nginx -t` fails on such hosts).
 7. `nginx -t`: pass => reload; fail => rollback (see above: the new file is
    removed, or the previous file restored, and a disabled default site is
    renamed back). Note that nginx resolves a hostname upstream when it loads the
@@ -573,7 +593,75 @@ Apart from the migration offer it is read-only.
    rolled back; use an IP or a resolvable name.
 8. Reminders: point DNS at the server, port 80 must be open (the firewall is
    not changed here); a warning if nothing listens on a loopback upstream yet;
-   the HTTP-only / Certificates note.
+   a note that the site is HTTP only and that Certificates -> Issue certificate
+   can enable HTTPS for it.
+
+#### The site template (PR 8)
+
+One file per domain, `conf.d/<domain>.conf`. The reverse-proxy part is shared by
+the HTTP form (Add site) and the HTTPS server block (Certificates), so both proxy
+identically. Plain form, exactly as written (IPv6 line only on IPv6 hosts):
+
+```
+# Managed by ezvps (Nginx module). Reverse proxy; edit via ezvps or keep the markers.
+# ezvps:domain=example.com
+# ezvps:upstream=127.0.0.1:3000
+server {
+    listen 80;
+    server_name example.com;
+
+    client_max_body_size 64M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}
+```
+
+`Connection` is **not** hardcoded to `upgrade` (that would turn every request
+into a protocol upgrade request and break keep-alive to the backend): it comes
+from the `$connection_upgrade` map, which is `upgrade` for a request that sent an
+`Upgrade` header (WebSocket) and `close` otherwise. Existing sites written by an
+older ezvps keep their old text until Add site overwrites them or the
+Certificates module rewrites them.
+
+#### The connection map (PR 8)
+
+Before any ezvps site that uses `$connection_upgrade` is written (Add site, and
+the Certificates module when it rewrites a site), `nginx.conf` must define it
+exactly once in the `http` context:
+
+```
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+```
+
+* **Already defined = untouched.** A non-comment `map $http_upgrade
+  $connection_upgrade {` line in `nginx.conf`, in any `conf.d/*.conf` or in a
+  legacy `sites-enabled` file counts, so the map is never duplicated (a second
+  definition would make `nginx -t` fail).
+* Missing: `nginx.conf` is backed up first (`nginx.conf-map.<timestamp>.<pid>`,
+  a different name from the conf.d-include backup so both survive), the map is
+  inserted inside `http`, just before its `include .../conf.d/*.conf;` line (else
+  before the closing brace), and **`nginx -t` must pass**; a failing test restores
+  `nginx.conf` byte for byte, nothing is written or reloaded, and the action
+  stops. No `http` block or a missing `nginx.conf` also stop the action with an
+  explanation.
+* The order of the checks in every writing action is: conf.d include, then map,
+  then the site file.
 
 #### 6) Remove site
 
@@ -611,7 +699,8 @@ them. Hand-written files are never migrated or touched.
 
 Before overwriting, removing, migrating or editing a file, it is copied to
 `/var/backups/ezvps/` (dir mode 700): `nginx-site-<domain>.<timestamp>.<pid>`
-(overwritten or removed site), `nginx.conf.<timestamp>.<pid>`,
+(overwritten or removed site), `nginx.conf.<timestamp>.<pid>`, `nginx.conf-map.<timestamp>.<pid>` (before the
+connection map is added),
 `nginx-default-conf.<timestamp>.<pid>` (the disabled default site),
 `apt-<file>.<timestamp>.<pid>` (a different apt source, pin or keyring that is replaced),
 `nginx-etc.<timestamp>.<pid>` (the whole of `/etc/nginx` before a package is replaced),
@@ -619,11 +708,258 @@ Before overwriting, removing, migrating or editing a file, it is copied to
 backup aborts the action before anything is changed. Adding a brand-new site
 makes no backup (nothing existed).
 
-### 6.4 Certificates (later PR)
+### 6.4 Certificates (PR 8, done)
 
-Issue/renew/list/remove certificates for domains the user enters (ACME
-client chosen in that PR), hook into nginx reload, show expiry. Checks that
-the domain resolves to this server and port 80 is reachable before issuing.
+Menu item 6 opens a submenu. Clean labels only:
+
+```
+ 1) Install acme.sh
+ 2) Issue certificate
+ 3) List certificates
+ 4) Renew certificates
+ 5) Remove certificate
+ 0) Back
+```
+
+`0` or EOF returns to the main menu; after each action "Press Enter to
+continue..."; invalid input prints `Invalid choice: <input>`. Module key `certs`
+maps to `module_certs`; its helpers are prefixed `cert_` / `acme_`.
+
+**Scope: one domain, HTTP-01 through nginx, Let's Encrypt.** Out of scope, and
+refused or absent on purpose: wildcard certificates, DNS API / DNS-01 validation,
+asking for or storing **any** DNS provider credential, several domains in one
+certificate, a certificate shared between sites, `stream` blocks (HTTPS is served
+on 443 by an ordinary `server` block, never behind a `stream` and never on
+4443), Xray, and certbot. Input such as `*.example.com`, `a.com,b.com` or `a.com b.com`
+is rejected with a message that says so.
+
+#### acme.sh: source, pin, install
+
+* Project: <https://github.com/acmesh-official/acme.sh> (public, the official
+  acme.sh).
+* **Exact URL** ezvps downloads (the `acme.sh` script at release tag **3.1.6**,
+  never a branch):
+  `https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh`
+* Expected SHA-256 of that file (294,737 bytes):
+  `c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7`
+* The pin lives in `ezvps` as `ACME_UPSTREAM`, `ACME_PINNED_TAG`,
+  `ACME_SCRIPT_URL` and `ACME_SCRIPT_SHA256`. To bump it: pick a newer release tag,
+  download `acme.sh` at that tag, read it, update the tag and hash together and this
+  section, run the tests. `tests/lint.sh` checks the pin is present and well formed.
+* **Why not `curl https://get.acme.sh | sh`:** that is piped into a shell, not
+  pinned, and installs from a moving branch. ezvps downloads one file to a private
+  temp directory (`curl --proto '=https' --tlsv1.2`, in `acme_fetch_script`, the only
+  place acme.sh is fetched), verifies the SHA-256, **refuses to run it on a
+  mismatch**, and runs it as `bash ./acme.sh --install --home <home> --no-profile`
+  from that directory. Only the script is installed: acme.sh's `dnsapi`, `deploy` and
+  `notify` plug-in folders are not needed for HTTP-01 and are not fetched (its own
+  `--install` copies them only when present, checked in the 3.1.6 source).
+* Home: `$HOME/.acme.sh` (`/root/.acme.sh`). `--no-profile` keeps acme.sh from adding
+  an alias to the shell profile; ezvps always calls it by full path
+  (`<home>/acme.sh --home <home> ...`).
+* **Renewal job.** Unless `--nocron` applies, acme.sh's own `--install` adds its daily
+  `acme.sh --cron` entry to root's crontab. The plan says so; the current crontab
+  (when it is not empty) is first copied to
+  `/var/backups/ezvps/crontab-root.<timestamp>.<pid>` (mode 600). Without a
+  `crontab` command the install runs with `--nocron`, the plan and the install end
+  with a warning, and certificates must be renewed with Renew certificates. ezvps
+  never sets acme.sh's `AUTO_UPGRADE`: the `account.conf` that the 3.1.6 `--install`
+  writes only has it as a commented-out example, and acme.sh's cron job upgrades the
+  script only when `AUTO_UPGRADE="1"` is set there (verified by running the real
+  install), so the pinned script is not replaced behind the pin.
+* **Certificate authority:** every issue passes `--server letsencrypt`. acme.sh 3.x
+  defaults to ZeroSSL, which needs an account with an e-mail address; Let's Encrypt
+  needs neither, so ezvps asks for no e-mail and stores none.
+
+#### Certificate store and backups
+
+* `/etc/ssl/ezvps/<domain>/fullchain.pem` (mode 644) and
+  `/etc/ssl/ezvps/<domain>/privkey.pem` (**mode 600, root only**). `/etc/ssl/ezvps`
+  and `/etc/ssl/ezvps/<domain>` are mode 700. The files are written by
+  `acme.sh --install-cert`, so renewals (cron or Renew certificates) refresh the same
+  paths, and ezvps then sets the modes. nginx's master process (root) reads them.
+* **Never printed.** ezvps never reads or prints `privkey.pem`. acme.sh's own output
+  is shown, but anything between private-key markers is replaced by
+  `(private key material hidden)`.
+* Before a certificate directory is replaced or removed it is copied (`cp -a`,
+  so file modes are kept) to `/var/backups/ezvps/cert-<domain>.<timestamp>.<pid>`
+  (backup dir mode 700). A failed backup aborts before anything is changed.
+* `acme.sh --install-cert` is given `--reloadcmd "nginx -t && systemctl reload nginx"`,
+  so acme.sh's cron renewals reload nginx too, and only with a valid config.
+
+#### 1) Install acme.sh
+
+1. A supported system (`require_supported_os`, section 1.1) or refuse.
+2. **Already installed** (`<home>/acme.sh` executable, else `acme.sh` on `PATH`):
+   print `acme.sh is already installed (<path>). Not reinstalling.`, check that
+   `acme.sh --version` works, done. Nothing is downloaded or changed.
+3. Needs `sha256sum` and `curl` (`curl` is offered via `apt-get` after a yes).
+4. Show the plan (project, tag, exact URL, expected SHA-256, home, what the install
+   does, cron status) and ask. No: nothing is changed.
+5. Back up the crontab, download, verify, run the installer (a failing installer is
+   reported and nothing else is done).
+6. **Verify the command works afterwards:** `acme.sh --version` must print a `vX.Y.Z`
+   line (`Verified: the acme.sh command works (v3.1.6, <path>)`); a different version
+   than the pinned one is warned about.
+
+#### 2) Issue certificate
+
+Prerequisites, each refused with a message and **no change** when missing:
+
+* a supported system; acme.sh installed (else `Choose 'Install acme.sh' first.`);
+* nginx installed **and running**, with something **listening on port 80**
+  (`ss`, else a `/dev/tcp` connect; nginx must answer HTTP-01, so this is checked
+  before anything else; whether the internet can reach port 80 cannot be tested from
+  the server, so the firewall reminder is printed instead);
+* exactly one valid domain (same sanitising as the Nginx module, plus the wildcard
+  and list messages above);
+* an nginx `server_name` that names the domain in a loaded file (`conf.d/*.conf` or
+  the legacy `sites-enabled`). acme.sh's nginx mode answers the challenge through
+  the server block of the domain, so a domain with no server block at all is refused
+  with `Add the site first (Nginx -> Add site)`. ezvps **never creates a site by
+  itself**.
+
+Then ezvps prints that the domain is validated with HTTP-01 through nginx, that no
+DNS provider credentials are asked for or stored, and, as a warning, that **the DNS
+record of the domain must point to this server before issuing** and that port 80
+must be reachable from the internet; it mentions an existing stored certificate
+(which will be backed up) and **asks for confirmation**. No: nothing is changed.
+
+On yes:
+
+1. `acme.sh --issue -d <domain> --nginx --server letsencrypt`. In nginx mode acme.sh
+   (3.1.6, read in its source and run against nginx 1.30 for this PR) finds the first
+   `server` block whose `server_name` names the domain and that has a non-SSL
+   `listen`, saves a backup of that file, **temporarily inserts** a `location ^~
+   /.well-known/acme-challenge/` right after the `server_name` line, tests and
+   reloads nginx, and puts the file back afterwards.
+2. `nginx -t` is run again; if it fails (acme.sh left something behind) ezvps says so,
+   stores nothing and stops. Exit status 2 from acme.sh means the certificate is still
+   valid and was not re-issued: ezvps says so and carries on with the existing one.
+   Any other failure prints acme.sh's message and hints (DNS, port 80, rate limits),
+   stores nothing and changes no site.
+3. The store directory is created (modes above). An **existing certificate for the
+   domain is backed up first** (`cert-<domain>.*`), then
+   `acme.sh --install-cert -d <domain> --fullchain-file <store>/fullchain.pem
+   --key-file <store>/privkey.pem --reloadcmd "nginx -t && systemctl reload nginx"`
+   writes the files; ezvps sets the key to 600 and checks both files exist and are
+   not empty. On failure the previous directory is restored byte for byte from the
+   backup (or the new one removed) and the failure is reported.
+4. Summary: the two paths (the key marked "never shown"), the expiry date and whether
+   acme.sh's renewal job is in root's crontab (a warning when it is not).
+5. **Offer HTTPS** for the site of that domain, by `conf.d/<domain>.conf` only:
+
+| State of `conf.d/<domain>.conf` | What ezvps does |
+|---|---|
+| ezvps-made, plain HTTP | explains the change and **asks**; yes: see "HTTPS for an ezvps site" |
+| ezvps-made, HTTPS already on | nothing to rewrite; `nginx -t`, then reload so nginx serves the new certificate |
+| not made by ezvps, a symlink, broken markers, or no such file (the domain is served from a file with another name) | the certificate is **stored only**: ezvps says there is no ezvps site, creates nothing, edits nothing; how to add a site and run Issue again |
+
+Running Issue certificate again for the same domain is safe: acme.sh skips a
+certificate that is not due, the store is refreshed (with a backup) and the HTTPS
+offer is made again, which is also how HTTPS is enabled for a site added later.
+
+#### HTTPS for an ezvps site
+
+Only an ezvps-made site (valid markers, the domain's own `conf.d/<domain>.conf`) is
+rewritten, and only that file. The order is: `nginx.conf` checks (conf.d include,
+then the connection map, as in 6.3) -> **backup of the site file**
+(`nginx-site-<domain>.<timestamp>.<pid>`) -> write (temp file + `mv`) -> **`nginx -t`**
+-> reload. A failing test **restores the file byte for byte**, does not reload nginx
+and keeps the certificate stored. The file becomes (IPv6 lines only on IPv6 hosts):
+
+```
+# Managed by ezvps (Nginx module). Reverse proxy; edit via ezvps or keep the markers.
+# ezvps:domain=example.com
+# ezvps:upstream=127.0.0.1:3000
+# ezvps:https=on
+server {
+    listen 80;
+    server_name example.com;
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name example.com;
+
+    ssl_certificate /etc/ssl/ezvps/example.com/fullchain.pem;
+    ssl_certificate_key /etc/ssl/ezvps/example.com/privkey.pem;
+
+    client_max_body_size 64M;
+
+    location / {
+        (the same proxy block as the plain template in 6.3)
+    }
+}
+```
+
+* HTTPS listens on **443 ssl directly** (not 4443, no `stream`). `http2 on;` needs
+  nginx 1.25.1+, which holds because ezvps installs nginx.org stable 1.30+ only.
+* The redirect is a 301 to `https://$host$request_uri` and lives **inside**
+  `location /` on purpose: a server-level `return` is executed before locations are
+  matched, which would stop acme.sh's temporary `location ^~
+  /.well-known/acme-challenge/` from answering renewals through the HTTP block.
+  (Checked with the real acme.sh nginx mode against nginx 1.30: the challenge path
+  answers `200`, every other path still gets the 301.)
+* Port 443 must be open; the firewall is not changed here.
+
+#### 3) List certificates
+
+Read-only. For each directory in `/etc/ssl/ezvps` a row `DOMAIN  EXPIRES  NGINX SITE`:
+
+* `EXPIRES`: `YYYY-MM-DD (N days left)` or `YYYY-MM-DD (EXPIRED)`, read from
+  `fullchain.pem` with `openssl x509 -enddate`; `unknown (openssl not installed)`,
+  `no certificate file` or `unreadable certificate` otherwise;
+* `NGINX SITE`: `yes (<file>.conf[, ...])` when a `conf.d/*.conf` file has an
+  `ssl_certificate` pointing at this domain's stored `fullchain.pem` (made by ezvps or
+  not), else `no`.
+
+No certificate: `(none)`. Works without acme.sh and without nginx.
+
+#### 4) Renew certificates
+
+Runs `acme.sh --renew-all` (acme.sh renews what is due and skips the rest; its
+`--install-cert` settings copy the new files into the store). Before and after, every
+`<acme home>/*/fullchain.cer` and `/etc/ssl/ezvps/*/fullchain.pem` is compared by
+content (pure bash). **Nothing changed** -> `No certificate was renewed ... nginx was
+not reloaded.` **Something changed** -> `nginx -t`, and nginx is reloaded only if it
+passes; a failing test prints the nginx error and does **not** reload. An acme.sh
+error is reported but the change check still decides about the reload. Without nginx
+there is nothing to reload.
+
+#### 5) Remove certificate
+
+1. Asks for the domain (sanitised as above). No such directory in the store: nothing
+   is changed.
+2. If nginx is installed, every `conf.d/*.conf` that uses this certificate must be the
+   domain's own ezvps HTTPS site; any other file (hand-written, or the site of another
+   domain) makes ezvps **refuse before changing anything**, because it would break
+   when the files disappear and ezvps does not edit files it did not make.
+3. Shows the plan and **requires a yes**.
+4. Backs up the certificate directory (including the key, mode 600 kept).
+5. For an ezvps HTTPS site: the **HTTPS block is removed and the plain HTTP proxy block
+   restored** by rewriting the file from its markers (same procedure and rollback as
+   "HTTPS for an ezvps site": `nginx.conf` checks, **backup of the site file first**,
+   write, **`nginx -t`**). A failing test restores the HTTPS site, **keeps the
+   certificate** and the acme.sh renewal, and does not reload nginx.
+6. Only after the site is valid: deletes `/etc/ssl/ezvps/<domain>`, runs
+   `acme.sh --remove -d <domain>` (so acme.sh's renewal does not recreate the files;
+   a failure there is a warning), and reloads nginx if the site changed.
+7. acme.sh keeps its own copy of the files in `<acme home>/<domain>`; the message says
+   so and leaves deleting it to the user.
+
+#### Known limits
+
+* The domain must already be served by an nginx `server` block (see Issue).
+* Only ezvps-made sites are switched to HTTPS or back; ezvps rewrites such a file
+  from its markers, so hand edits inside an ezvps-made file are lost (the old file is
+  backed up first, as with Add site's overwrite).
+* A certificate is not removed while a file ezvps did not make uses it.
 
 ### 6.5 Backpack (later PR)
 
@@ -695,12 +1031,12 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
-| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates), install.sh | backup dir (default `/var/backups/ezvps`) |
 | `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
 | `EZVPS_APT_DIR` | ezvps (Nginx) | apt config dir for the nginx.org source and pin (default `/etc/apt`) |
 | `EZVPS_KEYRING_DIR` | ezvps (Nginx) | where `nginx-archive-keyring.gpg` is stored (default `/usr/share/keyrings`) |
@@ -708,13 +1044,16 @@ Defaults are the real paths; none of these relax a check on a real server.
 | `EZVPS_IF_INET6_FILE` | ezvps (Nginx) | file whose existence means "kernel has IPv6" (default `/proc/net/if_inet6`) |
 | `EZVPS_NGINX_WAIT_SECONDS` | ezvps (Nginx) | how long to wait for nginx to answer (default 15) |
 | `EZVPS_XUI_WAIT_SECONDS` | ezvps (3x-ui) | how long to wait for the panel to answer (default 30) |
+| `EZVPS_ACME_HOME` | ezvps (Certificates) | acme.sh home (default `$HOME/.acme.sh`) |
+| `EZVPS_CERT_DIR` | ezvps (Nginx, Certificates) | certificate store, also the path written into HTTPS sites (default `/etc/ssl/ezvps`) |
 | `EZVPS_NO_PAUSE=1` | ezvps | do not wait for Enter |
 
 ## 8. Tests
 
 * `tests/lint.sh`: `bash -n` + `shellcheck` on every script, plus a hygiene
   scan (no non-documentation IPs, key material or token patterns) and the
-  download rules: `curl` only inside `xui_fetch_installer` / `xui_probe`, no
+  download rules: `curl` only inside `xui_fetch_installer` / `xui_probe` /
+  `ngx_fetch_key` / `acme_fetch_script`, no
   download piped into a shell, none in `install.sh`, installer URL pinned to
   a tag (not `master`), pin constants present.
 * `tests/smoke-test.sh`: runs in a temp dir with an empty/stub `PATH`;
@@ -770,14 +1109,68 @@ Defaults are the real paths; none of these relax a check on a real server.
   before reload, failing test restores); migration from `sites-available`
   (accepted, declined, failing test after the copy, failing final test,
   missing include, existing `conf.d` file, disabled and hand-written sites
-  left alone, re-run is a no-op); no certificate/TLS code at all.
+  left alone, re-run is a no-op).
+  The default `nginx.conf` fixture already carries the connection map, so these
+  scenarios see one config test per change; the PR 8 scenarios below use a fixture
+  without it.
+  **Site template and connection map** (PR 8, `== Nginx site template and connection
+  map`): every line of the template (body size, `proxy_http_version`, each header,
+  `Connection $connection_upgrade` and not `"upgrade"`, the three timeouts, no TLS
+  in the plain form); the map added to `nginx.conf` exactly once, inside `http`
+  before the include, with a byte-for-byte backup and a config test that runs before
+  the site exists; a second site does not duplicate it or back up again; a map
+  already defined in another `conf.d` file or in a legacy `sites-enabled` file is
+  not duplicated, a commented-out one is not mistaken for a real one; missing include
+  plus missing map (separate backups); a failing config test after adding the map
+  restores `nginx.conf`, writes no site and does not reload; no `http` block.
+  List sites shows the `proxy_pass` upstream of ezvps and non-ezvps files (plain,
+  with a path and a trailing comment, `https://`, several targets, one-line
+  `location`, none, commented-out, marker fallback, real `proxy_pass` over a stale
+  marker), `CREATED BY` is only `ezvps` / `not ezvps`, and nothing is changed.
+  **Certificates** (`== Certificates module`) runs against a **fake acme.sh** (it is
+  also the "downloaded" script, so the install really runs it; its certificates are
+  text files with a `notAfter=` line, its private key is a marker that must never be
+  printed, and like the real one it writes with the default umask), a fake `openssl`
+  (reads that line), a fake `crontab`, the fake `nginx` with the test switches above,
+  stub `curl`/`sha256sum`/`ss`/`systemctl`, and sandbox `PATH`s that each lack one
+  command. Covered: submenu labels; install (plan with URL, tag and hash, pinned URL
+  downloaded once with `--proto =https --tlsv1.2`, `--install --home ... --no-profile`,
+  version verified, crontab backup, already installed or on `PATH` = no download and
+  no reinstall, a broken existing one reported, declined, SHA-256 mismatch, download
+  failure, installer failure, no `crontab` = `--nocron` and a warning, missing `curl`
+  offered and only installed after a yes, unsupported system); issue (every
+  precondition refuses without running acme.sh; wildcard, list, junk and traversal
+  input; no server block; the DNS and port-80 notice; declined; the exact acme.sh
+  command lines, `--nginx --server letsencrypt`, no DNS mode; certificate-only when
+  no ezvps site exists and a hand-written site is untouched; store paths and modes
+  600/644/700; the key never in the output; expiry and cron shown; **re-issue with a
+  byte-for-byte backup of the old certificate and key**; "not due"; acme.sh failure,
+  nginx test failure after acme.sh, install-cert failure with and without an existing
+  certificate, key block hidden); **HTTPS for an ezvps site** (offer, byte-for-byte site
+  backup, `# ezvps:https=on`, `listen 443 ssl`, `http2 on`, the store's `ssl_certificate`
+  and key, 443 not 4443, no `stream`, the 301 to `https://$host$request_uri` inside
+  `location /`, the proxy block with every header and timeout only in the 443 block,
+  config test before the reload, already-on = reload after a test, declined, hand-written
+  and differently named files untouched, a **failing config test restores the site byte
+  for byte and does not reload**, the map ensured as well); list (empty, expiry dates,
+  site status, expired, sorted, no openssl, a directory without or with an unreadable
+  certificate; read-only); renew (nothing due = no test and no reload, a renewed
+  certificate = test then one reload, a **failing test = no reload**, acme.sh failure, a
+  certificate outside the store, no nginx); remove (unknown domain, bad input, declined,
+  **backup of the certificate and the key**, store entry gone, HTTPS site backed up and
+  **restored to the plain HTTP proxy**, other sites untouched, test before reload,
+  `acme.sh --remove`, a **failing config test restores the HTTPS site, keeps the
+  certificate and does not reload**, refusal while another file or a non-ezvps site uses
+  the certificate, no ezvps site, `--remove` failure, no nginx).
   It touches nothing outside its temp dir and uses no network.
   `tests/lint.sh` additionally checks that the OS allowlist block is identical
   in `ezvps` and `install.sh` and lists exactly the five supported systems, that
   the nginx.org suite is not hardcoded, that the repository URL is the stable
   one (never mainline), the key URL, the fingerprint pins and the priority-900
-  pin are present, and that `curl` is used only in the 3x-ui download/probe
-  functions and `ngx_fetch_key`.
+  pin are present, that `curl` is used only in the 3x-ui download/probe
+  functions, `ngx_fetch_key` and `acme_fetch_script`, that the acme.sh pin (tag,
+  exact tag-based URL, SHA-256) is present and well formed, and that the script has
+  no `get.acme.sh`, DNS-validation, DNS-credential or certbot code.
 * **Operating systems** (`== operating systems` in the smoke test, always with
   fake os-release files in a temp dir and the check switched ON): Debian 12
   (bookworm), Debian 13 (trixie), Ubuntu 22.04 (jammy), Ubuntu 24.04 (noble, also
@@ -807,4 +1200,5 @@ Defaults are the real paths; none of these relax a check on a real server.
   present and shows no install instructions. A default 3x-ui install runs on all
   five systems.
 * `tests/fresh-vps-test.md`: manual checklist on a throwaway VPS of each
-  supported release (Debian 12, 13; Ubuntu 22.04, 24.04, 26.04).
+  supported release (Debian 12, 13; Ubuntu 22.04, 24.04, 26.04), including the
+  Certificates module, which needs a real domain pointing at the VPS.

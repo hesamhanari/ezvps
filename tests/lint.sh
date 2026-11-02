@@ -55,15 +55,16 @@ done
 
 # 3. Download rules.
 #    - ezvps may call curl only from the 3x-ui download/probe functions
-#      (xui_fetch_installer, xui_probe) and the Nginx signing-key download
-#      (ngx_fetch_key); never from L2TP or anywhere else.
+#      (xui_fetch_installer, xui_probe), the Nginx signing-key download
+#      (ngx_fetch_key) and the pinned acme.sh download (acme_fetch_script);
+#      never from L2TP or anywhere else.
 #    - Nothing is ever piped or process-substituted from the network into a shell.
 #    - install.sh downloads nothing.
 bad_curl="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
     !/^[[:space:]]*#/ && /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/ {
-        if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()") print NR": "$0 }' ezvps)"
+        if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()" && fn != "acme_fetch_script()") print NR": "$0 }' ezvps)"
 if [[ -n "$bad_curl" ]]; then
-    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe/ngx_fetch_key:"
+    bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe/ngx_fetch_key/acme_fetch_script:"
     printf '%s\n' "$bad_curl" >&2
 fi
 for f in ezvps install.sh; do
@@ -80,6 +81,23 @@ if grep -nE 'raw\.githubusercontent\.com/[^"]*/(master|main|HEAD)/' ezvps | grep
 fi
 if ! grep -qE '^XUI_INSTALLER_SHA256="[0-9a-f]{64}"' ezvps || ! grep -qE '^XUI_PINNED_TAG="v[0-9]+\.[0-9]+\.[0-9]+"' ezvps; then
     bad "ezvps: XUI_PINNED_TAG / XUI_INSTALLER_SHA256 pin missing or malformed"
+fi
+# acme.sh is installed from its official project at a pinned release tag, checked
+# against a pinned SHA-256 (the tag is part of the URL, never a branch).
+# shellcheck disable=SC2016 # the literal ${...} text of the URL line in ezvps
+if ! grep -qE '^ACME_PINNED_TAG="[0-9]+\.[0-9]+\.[0-9]+"$' ezvps ||
+    ! grep -qE '^ACME_SCRIPT_SHA256="[0-9a-f]{64}"$' ezvps ||
+    ! grep -qE '^ACME_UPSTREAM="acmesh-official/acme\.sh"$' ezvps ||
+    ! grep -qF 'ACME_SCRIPT_URL="https://raw.githubusercontent.com/${ACME_UPSTREAM}/${ACME_PINNED_TAG}/acme.sh"' ezvps; then
+    bad "ezvps: the acme.sh pin (ACME_UPSTREAM, ACME_PINNED_TAG, ACME_SCRIPT_URL, ACME_SCRIPT_SHA256) is missing or malformed"
+fi
+if grep -vE '^[[:space:]]*#' ezvps | grep -qE 'get\.acme\.sh'; then
+    bad "ezvps: never use get.acme.sh (it is piped into a shell and not pinned)"
+fi
+# Certificates validate with HTTP-01 through nginx only: no DNS API mode, no
+# provider credentials, no certbot.
+if grep -vE '^[[:space:]]*#' ezvps | grep -qiE -- '--dns|dns_[a-z]+|CF_Token|api_?key|certbot'; then
+    bad "ezvps: DNS validation, DNS provider credentials and certbot are out of scope for the Certificates module"
 fi
 # Nginx must come from the nginx.org STABLE repository: the repo URL has no
 # "mainline", the key URL is https, the pin is priority 900, and the key
