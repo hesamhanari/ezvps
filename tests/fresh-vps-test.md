@@ -1,7 +1,9 @@
 # Fresh VPS test (manual)
 
-Run on a **throwaway Debian 13 VPS**, as root, before merging changes that
-touch the installer or a module. Use fake data only; do not paste real IPs,
+Run on a **throwaway Debian 13 VPS** and again on a **throwaway Ubuntu 24.04
+LTS VPS**, as root, before merging changes that touch the installer or a
+module. Where the two differ the steps say so (Ubuntu: `noble`,
+`nginx.org/packages/ubuntu`, L2TP is Debian-only). Use fake data only; do not paste real IPs,
 tokens or usernames into notes or issues. Placeholders: `<owner>`,
 `192.0.2.10`, `example.com`, `testuser`.
 
@@ -9,7 +11,9 @@ Tick each box; note failures with the exact output.
 
 ## 0. Prerequisites
 
-- [ ] `cat /etc/os-release` shows Debian 13
+- [ ] `cat /etc/os-release` shows Debian 13 (`ID=debian`, `VERSION_ID="13"`,
+      `trixie`) or Ubuntu 24.04 (`ID=ubuntu`, `VERSION_ID="24.04"`, `noble`);
+      note which one this run is
 - [ ] `id -u` prints `0`
 - [ ] `git` is available (`git --version`); if not, `apt-get install -y git`
 - [ ] `command -v ezvps` prints nothing (clean start)
@@ -45,6 +49,16 @@ ls /var/backups/ezvps/
 - [ ] `cmp ezvps /usr/local/bin/ezvps` reports no difference
 
 ## 3. L2TP
+
+**3-ubuntu. Ubuntu 24.04 LTS only** (L2TP via ezl2tp is Debian 13 only for now;
+do the Debian steps below on Debian 13 and only this block on Ubuntu)
+
+- [ ] `ezvps` -> `1` prints `L2TP via ezl2tp is Debian 13 only for now (found
+      Ubuntu 24.04).` and `Nothing was changed.`, then the menu returns
+- [ ] no `Launching ezl2tp...` and no git clone instructions, even if an
+      `ezl2tp` command exists; nothing was installed (`command -v ezl2tp`
+      unchanged)
+- [ ] `ezvps l2tp` prints the same message and exits 0
 
 **3a. ezl2tp NOT installed**
 
@@ -87,8 +101,9 @@ credentials; the default password is a known value and the VPS is throwaway.
 - [ ] `Status`, `Restart`, `Panel info`, `Change password` before any install
       print `3x-ui is not installed.` and return to the submenu
 - [ ] `0` returns to the main menu; invalid input prints `Invalid choice`
-- [ ] on a non-Debian-13 host the install options refuse and change nothing
-      (optional; only on a second throwaway VPS)
+- [ ] on an unsupported host (for example Ubuntu 22.04 or Debian 12; optional,
+      only on another throwaway VPS) the install options refuse with
+      `needs Debian 13 or Ubuntu 24.04 LTS` and change nothing
 - [ ] with port 3389 occupied (`python3 -m http.server 3389 &`) `Install 3x-ui`
       says `Port 3389 is already in use` and changes nothing; stop the listener
 - [ ] on an image without curl (`command -v curl` empty) the install asks
@@ -164,7 +179,7 @@ credentials; the default password is a known value and the VPS is throwaway.
 
 ## 6. Nginx
 
-Needs outbound HTTPS to the Debian mirrors (apt) and to `nginx.org`. Start from an image where
+Needs outbound HTTPS to the Debian/Ubuntu mirrors (apt) and to `nginx.org`. Start from an image where
 `command -v nginx` prints nothing and nothing listens on port 80
 (`ss -ltn | grep ':80 '` prints nothing). Use `example.com`-style placeholder
 domains and a throwaway backend such as `python3 -m http.server 3000
@@ -185,7 +200,8 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 **6b. Install (nginx.org stable only)**
 
 - [ ] `1) Install Nginx`: the plan names the `https://nginx.org/packages/debian`
-      repository line for `trixie`, the key URL, the pin (`origin nginx.org,
+      repository line for `trixie` (Debian 13) or the
+      `https://nginx.org/packages/ubuntu` line for `noble` (Ubuntu 24.04), the key URL, the pin (`origin nginx.org,
       priority 900`) and says stable 1.30 or newer; answer `n` first: nothing
       is changed (`ls /etc/apt/sources.list.d/nginx.list` fails), then repeat
       with `y`
@@ -195,14 +211,16 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       the same fingerprints)
 - [ ] `cat /etc/apt/sources.list.d/nginx.list` is exactly `deb
       [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg]
-      https://nginx.org/packages/debian trixie nginx` (no `mainline`);
+      https://nginx.org/packages/debian trixie nginx` on Debian, or `...
+      https://nginx.org/packages/ubuntu noble nginx` on Ubuntu (no `mainline`);
       `cat /etc/apt/preferences.d/99nginx` has `Package: *`, `Pin: origin
       nginx.org`, `Pin-Priority: 900`
-- [ ] `apt-cache policy nginx` shows candidate `1.30.x-1~trixie` or newer
-      stable (even minor), with the nginx.org source above Debian's
+- [ ] `apt-cache policy nginx` shows candidate `1.30.x-1~trixie` (Debian) or
+      `1.30.x-1~noble` (Ubuntu) or newer stable (even minor), with the nginx.org
+      source above the distribution's own
 - [ ] output shows `Version check passes: nginx/1.30.x (nginx.org stable)`;
       `nginx -v` agrees; `dpkg-query -W -f='${Version}\n' nginx` ends in
-      `~trixie`; `systemctl is-enabled nginx` is `enabled`, `systemctl
+      `~trixie` (`~noble` on Ubuntu); `systemctl is-enabled nginx` is `enabled`, `systemctl
       is-active nginx` is `active`
 - [ ] output shows `Config test passes.` and `Verified: nginx answers on
       127.0.0.1:80 (HTTP 200)`, then the HTTP-only / Certificates note
@@ -213,17 +231,17 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       reinstalling`, shows the status, downloads no key and runs no `apt`
       (`grep -c 'Commandline: apt-get install' /var/log/apt/history.log`
       did not grow)
-- [ ] `apt-get upgrade` never offers a Debian `nginx` (`apt-cache policy
+- [ ] `apt-get upgrade` never offers a Debian/Ubuntu `nginx` (`apt-cache policy
       nginx`: nginx.org stays the candidate)
 - [ ] mainline refusal: add `deb https://nginx.org/packages/mainline/debian
-      trixie nginx` to a file in `/etc/apt/sources.list.d/` on a *fresh*
+      trixie nginx` (Ubuntu: `.../mainline/ubuntu noble nginx`) to a file in `/etc/apt/sources.list.d/` on a *fresh*
       image: `1) Install Nginx` says `MAINLINE source is configured in ...` and
       changes nothing; remove the file
 
-**6b2. Replacing a Debian nginx** (use a throwaway image: this removes a package)
+**6b2. Replacing a Debian or Ubuntu nginx** (use a throwaway image: this removes a package)
 
-- [ ] on a fresh image `apt-get install -y nginx` (Debian's package, version
-      `1.26.x-...+deb13...`); create an old-layout ezvps site and a hand-written
+- [ ] on a fresh image `apt-get install -y nginx` (the distribution's package,
+      version `1.26.x-...+deb13...` on Debian, `1.24.x-...ubuntu...` on Ubuntu); create an old-layout ezvps site and a hand-written
       one: write `/etc/nginx/sites-available/old.example.com` with the `# Managed by ezvps`
       / `# ezvps:domain=old.example.com` / `# ezvps:upstream=127.0.0.1:3000`
       header and a `server { listen 80; server_name old.example.com; ... }`,

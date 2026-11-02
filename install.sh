@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ezvps installer for Debian 13 (run as root from a checkout of this repo).
+# ezvps installer for Debian 13 and Ubuntu 24.04 LTS (run as root from a checkout
+# of this repo). Any other system is refused.
 #
 #   git clone <repo-url> && cd ezvps && bash install.sh
 #
@@ -14,7 +15,8 @@
 #   EZVPS_BIN_DIR       install directory      (default /usr/local/bin)
 #   EZVPS_BACKUP_DIR    backup directory       (default /var/backups/ezvps)
 #   EZVPS_ALLOW_NONROOT=1  skip the root check
-#   EZVPS_SKIP_OS_CHECK=1  skip the Debian 13 check
+#   EZVPS_SKIP_OS_CHECK=1  skip the OS check (Debian 13 / Ubuntu 24.04 LTS only)
+#   EZVPS_OS_RELEASE    os-release file to read (default /etc/os-release)
 
 set -uo pipefail
 
@@ -37,18 +39,26 @@ check_root() {
     fi
 }
 
+# Same rule as require_supported_os in ezvps: Debian 13 or Ubuntu 24.04 LTS,
+# nothing else. os-release is read, never sourced.
 check_os() {
     [[ "${EZVPS_SKIP_OS_CHECK:-0}" == "1" ]] && return 0
-    local id="" version_id=""
-    if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        id="$(. /etc/os-release && printf '%s' "${ID:-}")"
-        # shellcheck disable=SC1091
-        version_id="$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")"
+    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line v id="" version_id=""
+    if [[ -r "$f" ]]; then
+        while IFS= read -r line; do
+            v="${line#*=}"
+            v="${v//\"/}"
+            v="${v//\'/}"
+            case "$line" in
+                ID=*) id="${v,,}" ;;
+                VERSION_ID=*) version_id="$v" ;;
+            esac
+        done <"$f"
     fi
-    if [[ "$id" != "debian" || "$version_id" != "13" ]]; then
-        warn "ezvps targets Debian 13; found '${id:-unknown} ${version_id:-unknown}'. Continuing anyway."
-    fi
+    case "${id} ${version_id}" in
+        "debian 13" | "ubuntu 24.04") ;;
+        *) die "ezvps supports Debian 13 and Ubuntu 24.04 LTS only; found '${id:-unknown} ${version_id:-unknown}'. Nothing was installed." ;;
+    esac
 }
 
 check_source() {

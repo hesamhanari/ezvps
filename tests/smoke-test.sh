@@ -46,6 +46,18 @@ dir_empty_or_missing() { [[ ! -d "$1" || -z "$(ls -A "$1")" ]]; }
 
 export EZVPS_ALLOW_NONROOT=1 EZVPS_SKIP_OS_CHECK=1 NO_COLOR=1 TERM=dumb
 
+# Fake os-release files (never the real /etc/os-release of the machine running the
+# tests). Every run defaults to Debian 13; the "operating systems" section and a few
+# precheck tests point EZVPS_OS_RELEASE at the others.
+OSD="$WORK/os"
+mkdir -p "$OSD"
+printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"' 'NAME="Debian GNU/Linux"' 'VERSION_ID="13"' 'VERSION="13 (trixie)"' 'VERSION_CODENAME=trixie' 'ID=debian' >"$OSD/debian13"
+printf '%s\n' 'PRETTY_NAME="Ubuntu 24.04.2 LTS"' 'NAME="Ubuntu"' 'VERSION_ID="24.04"' 'VERSION="24.04.2 LTS (Noble Numbat)"' 'VERSION_CODENAME=noble' 'ID=ubuntu' 'ID_LIKE=debian' 'UBUNTU_CODENAME=noble' >"$OSD/ubuntu2404"
+printf '%s\n' 'PRETTY_NAME="Ubuntu 22.04.5 LTS"' 'NAME="Ubuntu"' 'VERSION_ID="22.04"' 'VERSION="22.04.5 LTS (Jammy Jellyfish)"' 'VERSION_CODENAME=jammy' 'ID=ubuntu' 'ID_LIKE=debian' 'UBUNTU_CODENAME=jammy' >"$OSD/ubuntu2204"
+printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"' 'NAME="Debian GNU/Linux"' 'VERSION_ID="12"' 'VERSION="12 (bookworm)"' 'VERSION_CODENAME=bookworm' 'ID=debian' >"$OSD/debian12"
+printf '%s\n' 'NAME="Fedora Linux"' 'VERSION_ID=40' 'VERSION_CODENAME=""' 'ID=fedora' 'ID_LIKE="rhel centos"' >"$OSD/unknown"
+export EZVPS_OS_RELEASE="$OSD/debian13"
+
 # Sandbox PATHs. ezvps only needs bash builtins, so an empty dir is a PATH
 # with no ezl2tp even if the host has one installed.
 EMPTY_BIN="$WORK/empty-bin"
@@ -378,9 +390,12 @@ EOF
 # fake `apt-cache policy nginx`: the nginx.org package only when BOTH the apt source and
 # the pin exist (that is what the real pin guarantees), unless FAKE_APT_IGNORE_PIN=1
 mkstub "$STUBS/apt-cache" <<'EOF'
-pinned=0
-[[ -f "$EZVPS_APT_DIR/preferences.d/99nginx" && -f "$EZVPS_APT_DIR/sources.list.d/nginx.list" ]] && pinned=1
-cand="1.26.3-3+deb13u1"
+# the pin only helps when the source line names the right repository for the distro and codename
+pinned=0 want="https://nginx.org/packages/${FAKE_DISTRO:-debian} ${FAKE_CODENAME:-trixie} nginx"
+if [[ -f "$EZVPS_APT_DIR/preferences.d/99nginx" && -f "$EZVPS_APT_DIR/sources.list.d/nginx.list" ]]; then
+    while IFS= read -r l; do [[ "$l" == *"] $want" ]] && pinned=1; done <"$EZVPS_APT_DIR/sources.list.d/nginx.list"
+fi
+cand="${FAKE_DISTRO_NGX_VERSION:-1.26.3-3+deb13u1}"
 [[ "$pinned" == 1 && "${FAKE_APT_IGNORE_PIN:-0}" != 1 ]] && cand="${FAKE_ORG_VERSION:-1.30.2-1~trixie}"
 [[ "${FAKE_APT_NOCAND:-0}" == 1 ]] && cand="(none)"
 printf 'nginx:\n  Installed: (none)\n  Candidate: %s\n  Version table:\n' "$cand"
@@ -513,9 +528,11 @@ fi
 if [[ "$verb" == install && "$*" == *"nginx"* ]]; then
     [[ "${FAKE_APT_FAIL:-0}" == "1" ]] && exit 100
     # without the repository + pin apt would choose Debian's package
-    ver="1.26.3-3+deb13u1"
-    pinned=0
-    [[ -f "$EZVPS_APT_DIR/preferences.d/99nginx" && -f "$EZVPS_APT_DIR/sources.list.d/nginx.list" ]] && pinned=1
+    ver="${FAKE_DISTRO_NGX_VERSION:-1.26.3-3+deb13u1}"
+    pinned=0 want="https://nginx.org/packages/${FAKE_DISTRO:-debian} ${FAKE_CODENAME:-trixie} nginx"
+    if [[ -f "$EZVPS_APT_DIR/preferences.d/99nginx" && -f "$EZVPS_APT_DIR/sources.list.d/nginx.list" ]]; then
+        while IFS= read -r l; do [[ "$l" == *"] $want" ]] && pinned=1; done <"$EZVPS_APT_DIR/sources.list.d/nginx.list"
+    fi
     [[ "$pinned" == 1 && "${FAKE_APT_IGNORE_PIN:-0}" != 1 ]] && ver="${FAKE_ORG_VERSION:-1.30.2-1~trixie}"
     [[ -n "${FAKE_APT_INSTALL_VERSION:-}" ]] && ver="$FAKE_APT_INSTALL_VERSION"
     : >"$FAKE_DPKG.new"
@@ -619,15 +636,15 @@ check "3x-ui is no longer reported as not implemented" not_contains "$OUT" "not 
 
 echo "-- prechecks"
 new_scn pre
-printf 'ID=ubuntu\nVERSION_ID="24.04"\n' >"$SCN/os-ubuntu"
-printf 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nID=debian\nVERSION_ID="13"\n' >"$SCN/os-debian13"
-OUT="$(printf '2\n1\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$SCN/os-ubuntu" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
+OUT="$(printf '2\n1\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2204" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
 RC=$?
-check "non-Debian-13 is refused" contains "$OUT" "needs Debian 13"
-check "non-Debian-13: nothing downloaded" no_download
-check "non-Debian-13: menu survives" equals "$RC" 0
-OUT="$(printf '2\n1\nn\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$SCN/os-debian13" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
+check "unsupported system (Ubuntu 22.04) is refused" contains "$OUT" "3x-ui install needs Debian 13 or Ubuntu 24.04 LTS; found 'ubuntu 22.04'"
+check "unsupported system: nothing downloaded" no_download
+check "unsupported system: menu survives" equals "$RC" 0
+OUT="$(printf '2\n1\nn\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/debian13" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
 check "Debian 13 passes the OS check" contains "$OUT" "will download the official 3x-ui installer"
+OUT="$(printf '2\n1\nn\n\n0\n\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2404" PATH="$SBOX" "$BASH_BIN" "$EZVPS" 2>&1)"
+check "Ubuntu 24.04 passes the OS check" contains "$OUT" "will download the official 3x-ui installer"
 FAKE_LISTEN="3389"
 run_ezvps "$SBOX" "2\n1\n\n0\n\n0\n"
 check "busy port 3389 is refused" contains "$OUT" "Port 3389 is already in use"
@@ -977,10 +994,9 @@ check_py() { # like check, but skipped when no local HTTP server could be starte
 file_sum() { cksum <"$1"; }
 
 # Fixtures: the primary-key fingerprints nginx.org publishes (as the fake gpg reads them),
-# and a Debian 13 os-release (codename trixie) for the nginx.org repository line.
+# and the Debian 13 os-release (codename trixie) for the nginx.org repository line.
 printf 'fpr=%s\n' 8540A6F18833A80E9C1653A42FD21310B49F6B46 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3 >"$WORK/nginx-key"
-printf '%s\n' 'ID=debian' 'VERSION_ID="13"' 'VERSION_CODENAME=trixie' >"$WORK/os-debian13"
-export EZVPS_OS_RELEASE="$WORK/os-debian13"
+export EZVPS_OS_RELEASE="$OSD/debian13"
 
 # new_ngx <name>: a fresh fake machine without nginx
 new_ngx() {
@@ -993,6 +1009,7 @@ new_ngx() {
     export FAKE_DPKG="$SCN/dpkg" FAKE_KEY_FILE="$WORK/nginx-key" FAKE_KEY_FAIL=0
     export EZVPS_APT_DIR="$SCN/apt" EZVPS_KEYRING_DIR="$SCN/keyrings"
     export FAKE_ORG_VERSION="1.30.2-1~trixie" FAKE_APT_INSTALL_VERSION="" FAKE_APT_IGNORE_PIN=0
+    export FAKE_DISTRO=debian FAKE_CODENAME=trixie FAKE_DISTRO_NGX_VERSION="1.26.3-3+deb13u1"
     export FAKE_APT_NOCAND=0 FAKE_APT_UPDATE_FAIL=0 FAKE_PURGE_WIPES_SITES=0 FAKE_PURGE_WIPES_CONFD=0
     export FAKE_NGX_VERSION="1.30.2" FAKE_TOOLS_DIR="$NGX_BOX" NGX_BOX_DIR="$NGX_BOX"
     rm -f "$NGX_BOX/nginx" "$NGX_BOX_NOTOOLS/nginx" "$NGX_BOX_NOTOOLS/curl" "$NGX_BOX_NOTOOLS/gpg"
@@ -1264,7 +1281,7 @@ check "version below 1.30: nginx is not started" no_mutation
 new_ngx inst_v_deb
 FAKE_APT_INSTALL_VERSION="1.26.3-3+deb13u1"
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "a Debian package version after install aborts" contains "$OUT" "still a Debian package version (1.26.3-3+deb13u1)"
+check "a Debian package version after install aborts" contains "$OUT" "still the Debian package version (1.26.3-3+deb13u1)"
 check "Debian package version: nginx is not started" no_mutation
 new_ngx inst_v_even
 FAKE_ORG_VERSION="1.32.0-1~trixie"
@@ -1284,12 +1301,11 @@ FAKE_NGX_NOSTART=1
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
 check "a package that does not auto-start is started by enable --now" equals "$(<"$FAKE_NGX_SVC")" active
 new_ngx inst_deb
-printf 'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n' >"$SCN/os-ubuntu"
-OUT="$(printf '%b' "${N}1\ny\n\n0\n\n0\n" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$SCN/os-ubuntu" PATH="$NGX_BOX" "$BASH_BIN" "$EZVPS" 2>&1)"
+OUT="$(printf '%b' "${N}1\ny\n\n0\n\n0\n" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2204" PATH="$NGX_BOX" "$BASH_BIN" "$EZVPS" 2>&1)"
 RC=$?
-check "non-Debian-13 is refused" contains "$OUT" "Nginx install needs Debian 13"
-check "non-Debian-13: apt-get never called" no_apt
-check "non-Debian-13: menu survives" equals "$RC" 0
+check "unsupported system (Ubuntu 22.04) is refused" contains "$OUT" "Nginx install needs Debian 13 or Ubuntu 24.04 LTS"
+check "unsupported system: apt-get never called" no_apt
+check "unsupported system: menu survives" equals "$RC" 0
 new_ngx inst_nocodename
 printf 'ID=debian\nVERSION_ID="13"\n' >"$SCN/os-nocodename"
 EZVPS_OS_RELEASE="$SCN/os-nocodename" run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
@@ -1398,7 +1414,7 @@ check "mainline candidate: dpkg unchanged" file_has "$FAKE_DPKG" "ii nginx 1.26.
 new_deb rep_verify
 FAKE_APT_INSTALL_VERSION="1.26.3-3+deb13u1" FAKE_PURGE_WIPES_CONFD=1
 run_ezvps "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
-check "replace, wrong version installed: aborts" contains "$OUT" "still a Debian package version"
+check "replace, wrong version installed: aborts" contains "$OUT" "still the Debian package version"
 check "replace, wrong version installed: tells where the old /etc/nginx is" contains "$OUT" "previous /etc/nginx is backed up in $(etc_backup)"
 check "replace, wrong version installed: nginx not started, no site restored" test ! -e "$(CF example.com)"
 check "replace, wrong version installed: nginx not started" no_mutation
@@ -1932,6 +1948,237 @@ check "migration then remove: the moved site can be removed" test ! -e "$(CF a.e
 check "migration then remove: ...with a backup" equals "$(ngx_backups a.example.com)" 1
 check "migration then remove: the other moved site stays" test -f "$(CF b.example.com)"
 
+echo "== operating systems (fake os-release files, EZVPS_SKIP_OS_CHECK off)"
+# run_os <os-release file> <path-dir> <stdin-text> [args...]  -> OUT and RC, with the OS check ON
+run_os() {
+    local osf="$1" pathdir="$2" input="$3"
+    shift 3
+    OUT="$(printf '%b' "$input" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$osf" PATH="$pathdir" "$BASH_BIN" "$EZVPS" "$@" 2>&1)"
+    RC=$?
+}
+printf '%s\n' 'NAME="Linux Mint"' 'VERSION_ID="22"' 'VERSION_CODENAME=wilma' 'ID=linuxmint' 'ID_LIKE="ubuntu debian"' 'UBUNTU_CODENAME=noble' >"$OSD/mint"
+printf '%s\n' 'NAME="Ubuntu"' 'VERSION_ID="24.04"' 'VERSION_CODENAME=noble' 'ID="ubuntu"' >"$OSD/ubuntu2404-quoted"
+printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux trixie/sid"' 'ID=debian' 'VERSION_CODENAME=trixie' >"$OSD/debian-sid" # no VERSION_ID
+# name:accepted:what the refusal message must say it found
+OS_CASES=(
+    "debian13:yes:"
+    "ubuntu2404:yes:"
+    "ubuntu2404-quoted:yes:"
+    "ubuntu2204:no:ubuntu 22.04"
+    "debian12:no:debian 12"
+    "unknown:no:fedora 40"
+    "mint:no:linuxmint 22"
+    "debian-sid:no:debian unknown"
+    "missing-file:no:unknown unknown"
+)
+for c in "${OS_CASES[@]}"; do
+    f="${c%%:*}"
+    rest="${c#*:}"
+    ok="${rest%%:*}"
+    found="${rest#*:}"
+    osf="$OSD/$f"
+    echo "-- os-release: ${f}"
+    new_scn "os-xui-$f"
+    run_os "$osf" "$SBOX" "2\n1\nn\n\n0\n\n0\n"
+    if [[ "$ok" == yes ]]; then
+        check "${f}: 3x-ui is accepted" contains "$OUT" "will download the official 3x-ui installer"
+        check "${f}: 3x-ui shows no OS refusal" not_contains "$OUT" "needs Debian 13 or Ubuntu 24.04 LTS"
+    else
+        check "${f}: 3x-ui is rejected with a clear message" contains "$OUT" "3x-ui install needs Debian 13 or Ubuntu 24.04 LTS; found '${found}'. Nothing was changed."
+        check "${f}: 3x-ui rejected: nothing downloaded or installed" no_download
+        check "${f}: 3x-ui rejected: no panel" no_panel_installed
+        check "${f}: 3x-ui rejected: menu survives" equals "$RC" 0
+    fi
+    new_ngx "os-$f"
+    run_os "$osf" "$NGX_BOX" "${N}1\nn\n\n0\n\n0\n"
+    if [[ "$ok" == yes ]]; then
+        check "${f}: Nginx is accepted" contains "$OUT" "ONLY from the official nginx.org STABLE repository"
+        check "${f}: Nginx accepted, declined at the prompt: apt untouched" no_apt
+    else
+        check "${f}: Nginx is rejected with a clear message" contains "$OUT" "Nginx install needs Debian 13 or Ubuntu 24.04 LTS; found '${found}'. Nothing was changed."
+        check "${f}: Nginx rejected: apt never called, no repository files" no_apt
+        check "${f}: Nginx rejected: no key download" no_key_download
+        check "${f}: Nginx rejected: no repository files" repo_absent
+        check "${f}: Nginx rejected: menu survives" equals "$RC" 0
+    fi
+done
+
+echo "-- the switch that skips the check still never picks a repository for an unknown distro"
+new_ngx os_skip_unknown
+EZVPS_OS_RELEASE="$OSD/unknown" run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "skip + unknown distro: no nginx.org repository is chosen" contains "$OUT" "nginx.org packages are only set up for Debian and Ubuntu; found 'fedora'"
+check "skip + unknown distro: apt never called, nothing written" no_apt
+check "skip + unknown distro: repository files absent" repo_absent
+
+echo "-- L2TP is Debian 13 only"
+run_os "$OSD/debian13" "$STUB_BIN" "1\n\n0\n"
+check "L2TP on Debian 13: ezl2tp is launched" contains "$OUT" "FAKE-EZL2TP-RAN"
+check "L2TP on Debian 13: no Debian-only message" not_contains "$OUT" "Debian 13 only"
+run_os "$OSD/debian13" "$EMPTY_BIN" "1\n\n0\n"
+check "L2TP on Debian 13 without ezl2tp: git clone help as before" contains "$OUT" "git clone"
+for stub in "$STUB_BIN" "$EMPTY_BIN"; do
+    kind="ezl2tp present"
+    [[ "$stub" == "$EMPTY_BIN" ]] && kind="ezl2tp absent"
+    run_os "$OSD/ubuntu2404" "$stub" "1\n\n0\n"
+    check "L2TP on Ubuntu 24.04 (${kind}): says Debian 13 only for now" contains "$OUT" "L2TP via ezl2tp is Debian 13 only for now (found Ubuntu 24.04)"
+    check "L2TP on Ubuntu 24.04 (${kind}): ezl2tp is not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
+    check "L2TP on Ubuntu 24.04 (${kind}): no install instructions" not_contains "$OUT" "git clone"
+    check "L2TP on Ubuntu 24.04 (${kind}): nothing changed, said so" contains "$OUT" "Nothing was changed."
+    check "L2TP on Ubuntu 24.04 (${kind}): back to the menu" at_least_menus "$OUT" 2
+    check "L2TP on Ubuntu 24.04 (${kind}): exit 0" equals "$RC" 0
+done
+run_os "$OSD/ubuntu2404" "$STUB_BIN" "" l2tp
+check "'ezvps l2tp' on Ubuntu 24.04: message, nothing launched, exit 0" contains "$OUT" "Debian 13 only for now"
+check "'ezvps l2tp' on Ubuntu 24.04: ezl2tp not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
+check "'ezvps l2tp' on Ubuntu 24.04: exit 0" equals "$RC" 0
+EZVPS_OS_RELEASE="$OSD/ubuntu2404" run_ezvps "$STUB_BIN" "" l2tp
+check "L2TP stays Debian-only even with the OS-check switch on (tests)" not_contains "$OUT" "FAKE-EZL2TP-RAN"
+for f in ubuntu2204 debian12 unknown; do
+    run_os "$OSD/$f" "$STUB_BIN" "1\n\n0\n"
+    check "L2TP on ${f}: rejected as an unsupported system" contains "$OUT" "L2TP needs Debian 13 or Ubuntu 24.04 LTS"
+    check "L2TP on ${f}: ezl2tp is not launched" not_contains "$OUT" "FAKE-EZL2TP-RAN"
+    check "L2TP on ${f}: menu survives" equals "$RC" 0
+done
+
+echo "-- nginx.org repository per system, fake install flow"
+# ngx_flow <tag> <os file> <Label> <distro> <codename> <the distribution's own nginx version> <other distro>
+ngx_flow() {
+    local tag="$1" osf="$2" label="$3" distro="$4" cn="$5" dver="$6" other="$7"
+    local url="https://nginx.org/packages/${distro}" org="1.30.2-1~${5}"
+    new_ngx "flow-$tag"
+    FAKE_DISTRO="$distro" FAKE_CODENAME="$cn" FAKE_DISTRO_NGX_VERSION="$dver" FAKE_ORG_VERSION="$org"
+    run_os "$osf" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+    check "${label}: plan shows the ${distro} repository for ${cn}" contains "$OUT" "deb [signed-by=$(KR)] ${url} ${cn} nginx"
+    check "${label}: plan says it is not the ${label} package" contains "$OUT" "not ${label}'s package, not the mainline branch"
+    check "${label}: apt source is exactly the ${distro}/${cn} stable line" file_has "$(LST)" "deb [signed-by=$(KR)] ${url} ${cn} nginx"
+    check "${label}: apt source has no ${other} repository" file_lacks "$(LST)" "packages/${other}"
+    check "${label}: apt source is never mainline" file_lacks "$(LST)" "mainline"
+    check "${label}: key downloaded over https/TLS1.2 from nginx.org" has_line "$(log)" "curl KEY https://nginx.org/keys/nginx_signing.key"
+    check "${label}: key download is secure" equals "$(nlog_count 'KEY-INSECURE')" 0
+    check "${label}: all three pinned fingerprints verified" equals "$(count_lines "$OUT" "matches the pinned nginx.org key")" 3
+    check "${label}: keyring stored" file_has "$(KR)" "fpr=${FPR_B}"
+    check "${label}: pin is origin nginx.org, priority 900" file_has "$(PRF)" "Pin-Priority: 900"
+    check "${label}: pin names origin nginx.org" file_has "$(PRF)" "Pin: origin nginx.org"
+    check "${label}: key -> update -> install order" runs_before '^curl KEY ' '^apt-get update'
+    check "${label}: update before install" runs_before '^apt-get update' '^apt-get install .*nginx$'
+    check "${label}: candidate is the nginx.org stable package" contains "$OUT" "apt will install nginx ${org} from nginx.org (stable)"
+    check "${label}: dpkg ends up with the nginx.org package" file_has "$FAKE_DPKG" "ii nginx ${org}"
+    check "${label}: the ${label} package is never installed" file_lacks "$FAKE_DPKG" "$dver"
+    check "${label}: nothing purged on a fresh machine" equals "$(nlog_count '^apt-get purge')" 0
+    check "${label}: version check passes" contains "$OUT" "Version check passes: nginx/1.30.2 (nginx.org stable)"
+    check "${label}: enable --now" has_line "$(log)" "systemctl enable --now nginx"
+    check "${label}: config test runs" contains "$(log)" "nginx -t"
+    check "${label}: service ends up running" equals "$(<"$FAKE_NGX_SVC")" active
+    check "${label}: install exits 0" equals "$RC" 0
+    run_os "$osf" "$NGX_BOX_INST" "${N}1\n\n0\n\n0\n"
+    check "${label}: re-run is a no-op (already installed)" contains "$OUT" "nginx.org stable package ${org}). Not reinstalling"
+    check "${label}: re-run: exactly one install" equals "$(nlog_count '^apt-get install .*nginx$')" 1
+
+    # replacing the distribution's own nginx
+    new_ngx "flowrep-$tag"
+    FAKE_DISTRO="$distro" FAKE_CODENAME="$cn" FAKE_DISTRO_NGX_VERSION="$dver" FAKE_ORG_VERSION="$org" FAKE_PURGE_WIPES_CONFD=1
+    ngx_up
+    ngx_dpkg "$dver"
+    printf 'ii nginx-common %s\nii libnginx-mod-http-geoip2 %s\nii unrelated-pkg 1.0\n' "$dver" "$dver" >>"$FAKE_DPKG"
+    mk_ezvps_site example.com 127.0.0.1:3000
+    mk_foreign_site handmade hand.example.com
+    cp "$(CF example.com)" "$SCN/example-original"
+    run_os "$osf" "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+    check "${label} replace: the ${label} package is called out" contains "$OUT" "not from nginx.org is installed (${dver}; for example ${label}'s). It will be REPLACED"
+    check "${label} replace: /etc/nginx backed up exactly once" equals "$(etc_backups)" 1
+    check "${label} replace: the backup holds the old config and the sites" test -f "$(etc_backup)/nginx.conf" -a -f "$(etc_backup)/conf.d/example.com.conf"
+    check "${label} replace: backup was taken BEFORE the purge" has_line "$(log)" "purge-state etc-backup=1"
+    check "${label} replace: the old packages are purged" has_line "$(log)" "apt-get purge -y -q nginx nginx-common libnginx-mod-http-geoip2"
+    check "${label} replace: unrelated packages untouched" file_has "$FAKE_DPKG" "ii unrelated-pkg 1.0"
+    check "${label} replace: repository (${distro}/${cn}) set up before the purge" runs_before '^apt-get update' '^apt-get purge'
+    check "${label} replace: purge before the nginx.org install" runs_before '^apt-get purge' '^apt-get install .*nginx$'
+    check "${label} replace: only the nginx.org package is left" file_has "$FAKE_DPKG" "ii nginx ${org}"
+    check "${label} replace: ${label}'s nginx-common is gone" file_lacks "$FAKE_DPKG" "nginx-common"
+    check "${label} replace: apt source is the ${distro}/${cn} line" file_has "$(LST)" "deb [signed-by=$(KR)] ${url} ${cn} nginx"
+    check "${label} replace: the purge removed conf.d, the ezvps site is restored from the backup unchanged" cmp -s "$SCN/example-original" "$(CF example.com)"
+    check "${label} replace: the hand-written site is not restored automatically, it stays in the backup" test ! -e "$(CF handmade)" -a -f "$(etc_backup)/conf.d/handmade.conf"
+    check "${label} replace: config test before any reload" runs_before '^nginx-t-state' '^systemctl reload nginx$'
+    check "${label} replace: exit 0" equals "$RC" 0
+}
+ngx_flow debian "$OSD/debian13" Debian debian trixie 1.26.3-3+deb13u1 ubuntu
+ngx_flow ubuntu "$OSD/ubuntu2404" Ubuntu ubuntu noble 1.24.0-2ubuntu7.1 debian
+ngx_flow ubuntu_quoted "$OSD/ubuntu2404-quoted" Ubuntu ubuntu noble 1.24.0-2ubuntu7.1 debian
+
+echo "-- Ubuntu 24.04: refusals keep the system untouched"
+UB="$OSD/ubuntu2404"
+new_ngx ub_nopin
+FAKE_DISTRO=ubuntu FAKE_CODENAME=noble FAKE_DISTRO_NGX_VERSION=1.24.0-2ubuntu7.1 FAKE_ORG_VERSION="1.30.2-1~noble" FAKE_APT_IGNORE_PIN=1
+ngx_up
+ngx_dpkg 1.24.0-2ubuntu7.1
+SUM_ETC="$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")"
+run_os "$UB" "$NGX_BOX_INST" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu, pin not working: refused" contains "$OUT" "pin is not taking effect"
+check "Ubuntu, pin not working: Ubuntu's nginx is not purged or replaced" no_apt_install_or_purge
+check "Ubuntu, pin not working: dpkg still has Ubuntu's nginx" file_has "$FAKE_DPKG" "ii nginx 1.24.0-2ubuntu7.1"
+check "Ubuntu, pin not working: /etc/nginx untouched" equals "$(file_sum "$EZVPS_NGINX_DIR/nginx.conf")" "$SUM_ETC"
+check "Ubuntu, pin not working: repository files rolled back" repo_absent
+new_ngx ub_wrongrepo
+FAKE_DISTRO=debian FAKE_CODENAME=noble FAKE_ORG_VERSION="1.30.2-1~noble" # apt would only trust the Debian repository path
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu uses the ubuntu repository path, not debian (apt would reject it)" contains "$OUT" "pin is not taking effect"
+check "Ubuntu wrong repository path: nothing installed" no_apt_install_or_purge
+new_ngx ub_mainline_src
+mkdir -p "$EZVPS_APT_DIR/sources.list.d"
+echo "deb https://nginx.org/packages/mainline/ubuntu noble nginx" >"$EZVPS_APT_DIR/sources.list.d/other.list"
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu: a configured mainline source is refused" contains "$OUT" "MAINLINE source is configured in ${EZVPS_APT_DIR}/sources.list.d/other.list"
+check "Ubuntu mainline source: apt never called, no key download" no_apt
+check "Ubuntu mainline source: no key download" no_key_download
+new_ngx ub_cand_main
+FAKE_DISTRO=ubuntu FAKE_CODENAME=noble FAKE_ORG_VERSION="1.31.0-1~noble"
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu: a mainline 1.31 candidate is refused" contains "$OUT" "a MAINLINE build"
+check "Ubuntu mainline candidate: nothing installed, files rolled back" nothing_installed
+new_ngx ub_cand_old
+FAKE_DISTRO=ubuntu FAKE_CODENAME=noble FAKE_ORG_VERSION="1.28.3-1~noble"
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu: a candidate below 1.30 is refused" contains "$OUT" "older than 1.30"
+check "Ubuntu old candidate: nothing installed" no_apt_install_or_purge
+new_ngx ub_cand_trixie
+FAKE_DISTRO=ubuntu FAKE_CODENAME=noble FAKE_ORG_VERSION="1.30.2-1~trixie"
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu: a candidate built for another codename is refused" contains "$OUT" "expected a version ending in ~noble"
+check "Ubuntu other-codename candidate: nothing installed" no_apt_install_or_purge
+new_ngx ub_v_ubuntu
+FAKE_DISTRO=ubuntu FAKE_CODENAME=noble FAKE_ORG_VERSION="1.30.2-1~noble" FAKE_APT_INSTALL_VERSION="1.24.0-2ubuntu7.1"
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu: an Ubuntu package version after install aborts" contains "$OUT" "still the Ubuntu package version (1.24.0-2ubuntu7.1)"
+check "Ubuntu Ubuntu-version abort: nginx not started" no_mutation
+new_ngx ub_v_main
+FAKE_DISTRO=ubuntu FAKE_CODENAME=noble FAKE_ORG_VERSION="1.30.2-1~noble" FAKE_APT_INSTALL_VERSION="1.31.0-1~noble"
+run_os "$UB" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu: a mainline build after install aborts" contains "$OUT" "VERSION CHECK FAILED: nginx/1.31.0 is a mainline build"
+check "Ubuntu mainline build: nginx not started" no_mutation
+new_ngx ub_badcodename
+printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' 'VERSION_CODENAME=jammy' >"$SCN/os-badcodename"
+run_os "$SCN/os-badcodename" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu 24.04 with another codename in os-release is refused" contains "$OUT" "the codename 'jammy' (expected 'noble')"
+check "Ubuntu wrong codename: nothing changed" nothing_installed
+new_ngx ub_nocodename
+printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' >"$SCN/os-nocodename"
+run_os "$SCN/os-nocodename" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Ubuntu without a codename is refused" contains "$OUT" "Could not read the Ubuntu codename"
+check "Ubuntu without a codename: nothing changed" nothing_installed
+new_ngx deb_badcodename
+printf '%s\n' 'ID=debian' 'VERSION_ID="13"' 'VERSION_CODENAME=noble' >"$SCN/os-debbad"
+run_os "$SCN/os-debbad" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
+check "Debian 13 with the Ubuntu codename is refused" contains "$OUT" "the codename 'noble' (expected 'trixie')"
+check "Debian 13 wrong codename: nothing changed" nothing_installed
+
+echo "-- 3x-ui default install on Ubuntu 24.04 (check on)"
+new_scn xui_ubuntu
+run_os "$OSD/ubuntu2404" "$SBOX" "2\n1\ny\n\n0\n\n0\n"
+check "Ubuntu 24.04: 3x-ui installer ran with the pinned tag" contains "$(log)" "FAKE-INSTALLER-RAN args=${PINNED_TAG} noninteractive=1 ssl=none port=3389"
+check "Ubuntu 24.04: panel settings applied" db_has "port=3389"
+check "Ubuntu 24.04: panel verified" contains "$OUT" "Verified: the panel answers on http://127.0.0.1:3389/xuipanel/"
+check "Ubuntu 24.04: change-password warning shown" contains "$OUT" "WARNING: CHANGE THE PANEL PASSWORD NOW"
+check "Ubuntu 24.04: exit 0" equals "$RC" 0
+
 echo "-- Nginx stays HTTP only"
 no_tls_code() { ! grep -vE '^[[:space:]]*#' "$1" | grep -qiE 'ssl_certificate|certbot|acme\.sh|letsencrypt|listen 443|443 ssl'; }
 check "ezvps contains no certificate/TLS configuration code" no_tls_code "$EZVPS"
@@ -1956,8 +2203,8 @@ only_pinned_urls() {
         # shellcheck disable=SC2016 # literal text from the script, not expansions
         case "$u" in
             https://github.com/\$\{XUI_UPSTREAM\}* | https://raw.githubusercontent.com/\$\{XUI_UPSTREAM\}/\$\{XUI_PINNED_TAG\}/install.sh | 'http://127.0.0.1'* | 'http://<server-ip>'* | 'https://github.com/<owner>/'* | 'https://www.shellcheck.net'*) ;;
-            # Nginx module: the nginx.org stable repository and its signing key
-            'https://nginx.org/packages/debian' | 'https://nginx.org/keys/nginx_signing.key') ;;
+            # Nginx module: the nginx.org stable repositories (Debian, Ubuntu) and the signing key
+            'https://nginx.org/packages/debian' | 'https://nginx.org/packages/ubuntu' | 'https://nginx.org/keys/nginx_signing.key') ;;
             # Nginx module: upstream parsing/rendering, not network access
             'https://*' | 'http://}' | 'http://${2};') ;;
             *) echo "unexpected URL: $u" >&2; bad=1 ;;
@@ -2034,6 +2281,27 @@ OUT="$(EZVPS_SOURCE="$BROKEN" EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" "$B
 RC=$?
 check "syntax-broken source is refused" test "$RC" -ne 0
 check "installed file untouched after refused install" equals "$(file_sum "$IBIN/ezvps")" "$BEFORE"
+
+# The installer applies the same rule as ezvps: Debian 13 or Ubuntu 24.04 LTS, nothing else.
+echo "-- install.sh: operating systems (fake os-release, check on)"
+os_install() { # os_install <os-release file> -> OUT / RC; installs into a fresh dir
+    OSBIN="$WORK/inst-os/$(basename "$1")/bin"
+    rm -rf "$WORK/inst-os/$(basename "$1")"
+    OUT="$(env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$1" EZVPS_BIN_DIR="$OSBIN" EZVPS_BACKUP_DIR="$WORK/inst-os/$(basename "$1")/backup" "$BASH_BIN" "$INSTALL" 2>&1)"
+    RC=$?
+}
+for f in debian13 ubuntu2404 ubuntu2404-quoted; do
+    os_install "$OSD/$f"
+    check "install.sh accepts ${f}" equals "$RC" 0
+    check "install.sh on ${f}: ezvps is installed" test -x "$OSBIN/ezvps"
+done
+for c in "ubuntu2204:ubuntu 22.04" "debian12:debian 12" "unknown:fedora 40" "mint:linuxmint 22" "missing-file:unknown unknown"; do
+    f="${c%%:*}"
+    os_install "$OSD/$f"
+    check "install.sh refuses ${f}" test "$RC" -ne 0
+    check "install.sh refusal on ${f} is clear" contains "$OUT" "supports Debian 13 and Ubuntu 24.04 LTS only; found '${c#*:}'. Nothing was installed."
+    check "install.sh on ${f}: nothing installed" test ! -e "$OSBIN/ezvps"
+done
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAILS"
