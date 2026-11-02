@@ -61,7 +61,9 @@ SPEC.md  README.md  AGENTS.md
   backup) and `ss`; Backpack, ctunnel and Lazyports: `uname`, `bash`, `sha256sum`,
   `curl` (installer download), `git`/`make`/`gcc` (ctunnel build), `go` (Lazyports,
   never installed by ezvps), `apt-get` (offered packages) and optionally `systemctl`
-  (Backpack's `backpack-*.service` units)). Shared
+  (Backpack's `backpack-*.service` units); SSH and Users: `useradd`, `usermod`,
+  `userdel`, `passwd`, `chown`, `sshd` (`-t`/`-T`), `systemctl`, optionally `ss` and `apt-get`;
+  no `sed`/`awk`/`grep`/`ssh-keygen`: passwd, group and sshd_config are parsed in bash). Shared
   helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_supported_os`,
   `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
@@ -86,6 +88,15 @@ SPEC.md  README.md  AGENTS.md
   documented reinstall (backup first). Upstream installer scripts are pinned (tag or full
   commit plus SHA-256), shown, confirmed and run with `</dev/null`. Adding a tool means a
   new `lc_load` entry, not a new submenu.
+* SSH and Users (SPEC 6.8): never read `/etc/shadow`, never print, store or log a password,
+  a password hash or a private key (a pasted private key is refused and discarded). A
+  password is only ever asked for by the system's own `passwd` prompt. Delete user refuses
+  root, UID 0, the current user, system accounts and users with running processes with no
+  override prompt; a home directory is removed only with `userdel -r` after its own second
+  confirmation. sshd changes: only Port, PermitRootLogin and PasswordAuthentication, backup
+  first, `sshd -t` before any restart, and a rollback to the backup on any failure; verify
+  with `sshd -T`/the listening port, never trust the file alone (drop-ins and socket
+  activation can make a written line ineffective).
 * Certificates: HTTP-01 through nginx, one domain, Let's Encrypt only. No
   wildcard, DNS API, DNS provider credentials, `stream` or certbot. A private
   key is never printed or read by ezvps; certificates live in `/etc/ssl/ezvps`
@@ -115,7 +126,8 @@ SPEC.md  README.md  AGENTS.md
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
   section 7a (`EZVPS_ALLOW_NONROOT`, `EZVPS_XUI_DIR`, `EZVPS_ACME_HOME`,
-  `EZVPS_CERT_DIR`, `EZVPS_TOOL_PREFIX`, `EZVPS_BACKPACK_CONF_DIR`, ...). Do not add switches that weaken real behaviour.
+  `EZVPS_CERT_DIR`, `EZVPS_TOOL_PREFIX`, `EZVPS_BACKPACK_CONF_DIR`, `EZVPS_PASSWD_FILE`,
+  `EZVPS_SSHD_CONFIG`, ...). Do not add switches that weaken real behaviour.
 
 ## Adding a module
 

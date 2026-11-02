@@ -83,12 +83,13 @@ script it from ezvps)
 - [ ] menu lines match exactly (no description text):
       `L2TP, 3x-ui, Backpack, ctunnel, Nginx, Certificates, Lazyports,
       SSH and Users, Firewall, Backup, Check For Updates, Uninstall`, then `0) Exit`
-- [ ] each of `8` to `12` prints `<Label> is not implemented yet.` and returns to
+- [ ] each of `9` to `12` prints `<Label> is not implemented yet.` and returns to
       the menu after Enter (`2` opens the 3x-ui submenu, section 5; `3`, `4` and `7`
       open the Backpack, ctunnel and Lazyports submenus, section 8; `5` opens the
-      Nginx submenu, section 6; `6` opens the Certificates submenu, section 7)
+      Nginx submenu, section 6; `6` opens the Certificates submenu, section 7; `8`
+      opens the SSH and Users submenu, section 9)
 - [ ] `abc`, `13`, empty input -> `Invalid choice`, menu continues
-- [ ] `ezvps ssh` (and the other pending keys) print the same message, exit 0
+- [ ] `ezvps firewall` (and the other pending keys) print the same message, exit 0
 - [ ] `ezvps bogus` prints usage, exit 2
 - [ ] Ctrl-D at the prompt exits cleanly
 
@@ -548,12 +549,88 @@ tunnel setup in this section happens inside each tool's own interface.
 - [ ] `Uninstall`: `y` removes `/usr/local/bin/lazyports` and `~/go/bin/lazyports`,
       verifies they are gone, leaves `~/.bashrc` (and its PATH line) alone
 
-## 9. Non-root
+## 9. SSH and Users
+
+Do this on a throwaway VPS **with a second terminal already logged in as root or a sudo
+user**, so a mistake cannot lock you out. Use throwaway names (`testuser`, `testadmin`) and
+a throwaway key pair made for this test (`ssh-keygen -t ed25519 -f /tmp/ezvps-test-key`);
+never paste a real private key anywhere. Run it **once per supported release**.
+
+**9a. Submenu and List users**
+- [ ] `ezvps` -> `8` shows exactly `1) List users`, `2) Add user`, `3) Delete user`,
+      `4) SSH settings`, `5) Add SSH key`, `0) Back`; `abc` prints `Invalid choice: abc`
+- [ ] `List users`: `root` and your login accounts appear with UID and sudo (`yes`/`no`/`n/a`);
+      `www-data`, `daemon`, `sshd`, `sync` do not; compare with
+      `awk -F: '$7 !~ /(nologin|false)$/ {print $1, $3, $7}' /etc/passwd`; answering `y` to the
+      full-list question shows the service accounts; no password hash anywhere in the output
+
+**9b. Add user**
+- [ ] `Add user` with `Bad Name`, `1abc`, `UPPER`, `a;b`, `../x`, an existing user such as
+      `root` and an existing group name: each refused, `getent passwd` unchanged
+- [ ] `testuser`, sudo `n`, create `y`, password `n`: `Created user: testuser (UID ...)`,
+      `sudo : no`, `password : not set (password login is locked)`; `id testuser` shows no `sudo`
+      group; `ls -ld /home/testuser` exists; `ls /var/backups/ezvps` has no new file
+- [ ] `testadmin`, sudo `y`, password `y`: the **system's own** `New password:` prompt appears (ezvps
+      prints nothing about the password); `id testadmin` lists `sudo`; `su - testadmin -c 'sudo -n true'`
+      or `sudo -l -U testadmin` confirms sudo; the summary says `sudo : yes`
+- [ ] on a Debian image without the `sudo` package: asking for sudo says the package is not
+      installed and offers `apt-get install -y -q sudo`; `n` offers to create the user without sudo
+
+**9c. Add SSH key**
+- [ ] `Add SSH key` for `testuser` with the throwaway public key (`cat /tmp/ezvps-test-key.pub`): the
+      key is typed without echo, only the type and comment are shown, `ls -ld ~testuser/.ssh` is
+      `drwx------ testuser testuser` and `authorized_keys` is `-rw------- testuser testuser`
+- [ ] the same key again: `already in ... Nothing to do`, no backup; a second, different key: appended,
+      the old file is in `/var/backups/ezvps/authorized_keys-testuser.*` (`diff` against the original)
+- [ ] paste the **private** throwaway key file (`cat /tmp/ezvps-test-key`, first line only is read):
+      `looks like a PRIVATE key`, nothing written, the key text never printed back
+- [ ] garbage text, `ssh-rsa notbase64`, a key with `command="..."` in front: refused, nothing written
+- [ ] from a second terminal: `ssh -i /tmp/ezvps-test-key testuser@<server>` works
+- [ ] replace `~testuser/.ssh` with a symlink to another directory: `Add SSH key` refuses and writes nothing
+      through it (restore the directory afterwards)
+
+**9d. SSH settings** (keep the second terminal open the whole time)
+- [ ] the screen shows the effective Port, PermitRootLogin, PasswordAuthentication; compare with
+      `sshd -T | grep -Ei '^(port|permitrootlogin|passwordauthentication) '`
+- [ ] `SSH port`: `abc`, `80`, `65536` and a port that `ss -ltn` shows in use are refused; `2222`: warnings
+      (firewall, second terminal), `y`; a backup `/var/backups/ezvps/sshd_config.*` equals the previous file
+      (`diff`); `sshd -T | grep ^port` and `ss -ltn` show only 2222; **a new connection on 2222 works**
+      (allow the port in your firewall first); then change it back to `22`
+- [ ] on Ubuntu 22.10+ (`systemctl is-active ssh.socket` is `active`): the port change also restarts
+      `ssh.socket` and is verified; if sshd keeps the old port the module says so, restores the backup
+      and names `ssh.socket`
+- [ ] with a drop-in such as `/etc/ssh/sshd_config.d/50-cloud-init.conf` that has `PasswordAuthentication
+      yes`: `PasswordAuthentication` -> `no` writes the line at the **top** of `sshd_config`, the effective
+      value becomes `no` (`sshd -T`), and the drop-in is untouched
+- [ ] `PasswordAuthentication` -> `no` on a server with no key installed: the stronger warning and the second
+      question appear; `n` changes nothing. With a key: the warning to test a key login; after `y`,
+      `ssh -o PreferredAuthentications=password testuser@<server>` is refused and the key login still works
+- [ ] `PermitRootLogin` -> `no`: the lock-out warning; `ssh root@<server>` is refused afterwards, your open
+      sessions stay alive; set it back to `prohibit-password`
+- [ ] a deliberately broken config (`echo 'BROKEN_DIRECTIVE yes' >> /etc/ssh/sshd_config`): every setting
+      refuses with the `sshd -t` error and changes nothing; remove the line afterwards
+- [ ] repeat each change twice: the second run says it is already set, makes no backup and does not restart
+      sshd; `grep -c 'ezvps:managed' /etc/ssh/sshd_config` shows one block per setting
+- [ ] `sshd -t` still passes and `systemctl is-active ssh` is `active` at the end
+
+**9e. Delete user**
+- [ ] `root`, `toor` (a UID 0 account if you made one), the account you are logged in as (also after
+      `sudo -i`/`su`), `www-data`, an unknown name: each refused, nothing changed
+- [ ] `sudo -u testuser sleep 300 &` then `Delete user` -> `testuser`: refused with the PID list, **no
+      override prompt**; after `pkill -u testuser` the delete is accepted
+- [ ] `n` at the first confirmation changes nothing; `y` then `n` at the home question: `getent passwd
+      testuser` is empty, `/home/testuser` still exists, `/var/backups/ezvps/users-passwd.*` and
+      `users-group.*` exist
+- [ ] a second throwaway user with `y` and `y`: the home directory is gone
+- [ ] an account whose home is outside `/home` (for example `useradd -d /srv/x -m shared1`): the home
+      question is not asked and the directory is kept
+
+## 10. Non-root
 
 - [ ] as a normal user: `ezvps` prints `ezvps must be run as root.`, exit 1
 - [ ] as a normal user: `ezvps --version` still works
 
-## 10. Cleanup (no uninstall module yet)
+## 11. Cleanup (no uninstall module yet)
 
 ```bash
 x-ui uninstall            # 3x-ui's own uninstaller, if you installed it
@@ -562,6 +639,8 @@ apt-get purge -y nginx    # if you installed nginx for this test
 rm -f /usr/local/bin/ezvps
 rm -rf /var/backups/ezvps /var/lib/ezvps
 rm -rf /root/.acme.sh /etc/ssl/ezvps   # if you installed acme.sh / issued certificates
+userdel testuser; userdel testadmin    # the throwaway accounts from section 9 (add -r to drop their homes)
+rm -f /tmp/ezvps-test-key /tmp/ezvps-test-key.pub
 ```
 
 - [ ] ezl2tp (if present) still works after cleanup

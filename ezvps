@@ -2,7 +2,8 @@
 # ezvps - bash TUI/CLI VPS manager for Debian 12/13 and Ubuntu 22.04/24.04/26.04 LTS (run as root).
 #
 # Implemented modules: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3), Certificates
-# (PR 8) and the Backpack, ctunnel and Lazyports lifecycle modules (PR 9).
+# (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9) and SSH
+# and Users (PR 10).
 # Every other module prints a clean "not implemented yet" message and returns
 # without failing.
 #
@@ -13,8 +14,10 @@
 # (expiry dates only). The Backpack, ctunnel and Lazyports modules need
 # coreutils, uname, bash, sha256sum and curl (installer download), git, make and
 # gcc (ctunnel build), go (Lazyports) and optionally systemctl (Backpack
-# services) and apt-get. Each is checked with `command -v` before use and the
-# module degrades with a clear message.
+# services) and apt-get. The SSH and Users module needs coreutils, useradd,
+# usermod, userdel, passwd, chown, sshd, systemctl and optionally ss and
+# apt-get (to offer the sudo package). Each is checked with `command -v` before
+# use and the module degrades with a clear message.
 
 set -uo pipefail
 
@@ -4138,6 +4141,1005 @@ module_backpack() { lc_module backpack; }
 module_ctunnel() { lc_module ctunnel; }
 module_lazyports() { lc_module lazyports; }
 
+# ---------------------------------------------------------------------------
+# SSH and Users module (PR 10)
+#
+# Users: list, add, delete. SSH: three sshd settings (port, PermitRootLogin,
+# PasswordAuthentication) and authorized_keys. Everything is checked before it
+# is changed, nothing is changed without a yes, and a password, private key or
+# password hash is never read, printed, stored or logged (SPEC 6.8).
+#
+# Users come from the passwd and group files only (never /etc/shadow); the
+# state of running processes comes from /proc (pure bash). Helpers are prefixed
+# usr_ (accounts) and ssh_ (sshd and keys).
+# ---------------------------------------------------------------------------
+
+USR_PASSWD_FILE="${EZVPS_PASSWD_FILE:-/etc/passwd}"
+USR_GROUP_FILE="${EZVPS_GROUP_FILE:-/etc/group}"
+USR_SHELLS_FILE="${EZVPS_SHELLS_FILE:-/etc/shells}"
+USR_PROC_DIR="${EZVPS_PROC_DIR:-/proc}"
+USR_HOME_BASE="${EZVPS_HOME_BASE:-/home}"
+SSH_CONFIG_FILE="${EZVPS_SSHD_CONFIG:-/etc/ssh/sshd_config}"
+SSH_SERVICE="ssh"
+# Regular accounts start at UID 1000 on Debian and Ubuntu (UID_MIN); 65534 is "nobody".
+USR_MIN_UID=1000
+
+# Filled by usr_lookup / usr_group_get.
+USR_UID="" USR_GID="" USR_HOME=""
+GRP_GID="" GRP_MEMBERS=""
+USR_PIDS=()
+USR_WHY=""
+
+usr_trim() { # usr_trim <text>
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Strict: starts with a lower-case letter, then lower-case letters, digits, "_" or
+# "-"; at most 31 characters. No dots, no "$", no upper case, no spaces.
+usr_valid_name() { [[ "$1" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
+
+# usr_lookup <name>: fills USR_UID / USR_GID / USR_HOME / USR_SHELL from the passwd
+# file. Field 2 (which may hold a password hash on an old system) is never kept.
+usr_lookup() {
+    local n _pw uid gid _gecos home _shell
+    USR_UID="" USR_GID="" USR_HOME=""
+    [[ -r "$USR_PASSWD_FILE" ]] || return 1
+    while IFS=: read -r n _pw uid gid _gecos home _shell; do
+        if [[ "$n" == "$1" ]]; then
+            USR_UID="$uid" USR_GID="$gid" USR_HOME="$home"
+            return 0
+        fi
+    done <"$USR_PASSWD_FILE"
+    return 1
+}
+
+# usr_group_get <group>: fills GRP_GID / GRP_MEMBERS (comma separated) from the group file.
+usr_group_get() {
+    local n _pw gid members
+    GRP_GID="" GRP_MEMBERS=""
+    [[ -r "$USR_GROUP_FILE" ]] || return 1
+    while IFS=: read -r n _pw gid members; do
+        if [[ "$n" == "$1" ]]; then
+            GRP_GID="$gid" GRP_MEMBERS="$members"
+            return 0
+        fi
+    done <"$USR_GROUP_FILE"
+    return 1
+}
+
+usr_in_group() { # usr_in_group <group> <user> [primary gid]
+    local m
+    usr_group_get "$1" || return 1
+    [[ -n "${3:-}" && "$GRP_GID" == "$3" ]] && return 0
+    for m in ${GRP_MEMBERS//,/ }; do
+        [[ "$m" == "$2" ]] && return 0
+    done
+    return 1
+}
+
+# A login shell is a real shell: not empty, not nologin/false, and (when the
+# shells file can be read) listed in it, which is what shells(5) defines as a
+# valid login shell. That keeps pseudo accounts such as "sync" out of the list.
+usr_login_shell() { # usr_login_shell <shell>
+    local s="$1" l
+    [[ -n "$s" ]] || return 1
+    case "${s##*/}" in nologin | false) return 1 ;; esac
+    if [[ -r "$USR_SHELLS_FILE" ]]; then
+        while IFS= read -r l; do
+            [[ "$l" == "$s" ]] && return 0
+        done <"$USR_SHELLS_FILE"
+        return 1
+    fi
+    return 0
+}
+
+# --- List users --------------------------------------------------------------
+
+usr_print_users() { # usr_print_users <login|all>
+    local mode="$1" n _pw uid gid _gecos home shell sudo count=0
+    printf '%-24s %-8s %-6s' "USER" "UID" "SUDO"
+    [[ "$mode" == all ]] && printf ' %s' "SHELL"
+    printf '\n'
+    while IFS=: read -r n _pw uid gid _gecos home shell; do
+        [[ -z "$n" || "$n" == \#* || "$n" == [+-]* ]] && continue
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        if [[ "$mode" == login ]]; then
+            usr_login_shell "$shell" || continue
+            [[ -n "$home" && -d "$home" ]] || continue
+        fi
+        if [[ "$uid" == 0 ]]; then
+            sudo="n/a"
+        elif usr_in_group sudo "$n" "$gid"; then
+            sudo="yes"
+        else
+            sudo="no"
+        fi
+        printf '%-24s %-8s %-6s' "$n" "$uid" "$sudo"
+        [[ "$mode" == all ]] && printf ' %s' "${shell:-(none)}"
+        printf '\n'
+        count=$((count + 1))
+    done <"$USR_PASSWD_FILE"
+    ((count == 0)) && info "(none)"
+    return 0
+}
+
+usr_list() {
+    if [[ ! -r "$USR_PASSWD_FILE" ]]; then
+        err "Cannot read ${USR_PASSWD_FILE}."
+        return 0
+    fi
+    info ""
+    info "Users with a login shell and a home directory:"
+    usr_print_users login
+    info ""
+    info "SUDO = member of the 'sudo' group (rules in /etc/sudoers are not inspected). Password hashes are never read or shown."
+    if ask_yes_no "Also show system service accounts (nologin/false shells)?"; then
+        info ""
+        info "All accounts:"
+        usr_print_users all
+    fi
+    return 0
+}
+
+# --- shared checks -------------------------------------------------------------
+
+ssh_preflight() { # ssh_preflight  (root and a supported system, before any change)
+    require_root || return 1
+    require_supported_os "SSH and Users" || return 1
+    return 0
+}
+
+# usr_is_current <name> <uid>: the account running this session: sudo's caller, the
+# audit login uid (the account that logged in, even after su), or the effective user.
+usr_is_current() {
+    local lu=""
+    [[ -n "${SUDO_USER:-}" && "$SUDO_USER" == "$1" ]] && return 0
+    [[ -n "${SUDO_UID:-}" && "$SUDO_UID" == "$2" ]] && return 0
+    [[ "$EUID" == "$2" ]] && return 0
+    if [[ -r "${USR_PROC_DIR}/self/loginuid" ]]; then
+        read -r lu <"${USR_PROC_DIR}/self/loginuid" || true
+        [[ "$lu" =~ ^[0-9]+$ && "$lu" != 4294967295 && "$lu" == "$2" ]] && return 0
+    fi
+    return 1
+}
+
+# usr_user_pids <uid>: fills USR_PIDS with processes whose real or effective uid
+# matches. Returns 2 when no process could be read at all (/proc missing).
+usr_user_pids() {
+    local d line ruid euid scanned=0
+    USR_PIDS=()
+    for d in "${USR_PROC_DIR}"/[0-9]*; do
+        [[ -r "$d/status" ]] || continue
+        scanned=$((scanned + 1))
+        while IFS= read -r line; do
+            if [[ "$line" == Uid:* ]]; then
+                read -r _ ruid euid _ <<<"$line"
+                [[ "$ruid" == "$1" || "$euid" == "$1" ]] && USR_PIDS+=("${d##*/}")
+                break
+            fi
+        done <"$d/status"
+    done
+    ((scanned == 0)) && return 2
+    return 0
+}
+
+# --- Add user ------------------------------------------------------------------
+
+usr_ensure_sudo_group() {
+    usr_group_get sudo && return 0
+    warn "There is no 'sudo' group: the sudo package is not installed on this system."
+    if have_cmd apt-get && ask_yes_no "Install the sudo package with apt-get now?"; then
+        apt-get update -q && apt-get install -y -q sudo
+    fi
+    usr_group_get sudo
+}
+
+usr_add() {
+    local name want_sudo=0 sudo_state="no" pw_state rc home
+    ssh_preflight || return 0
+    require_cmds useradd usermod || {
+        err "Run ezvps with root's full PATH (for example 'sudo -i'). Nothing was changed."
+        return 0
+    }
+    if ! read -r -p "New username: " name; then
+        info ""
+        return 0
+    fi
+    name="$(usr_trim "$name")"
+    if [[ -z "$name" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    if ! usr_valid_name "$name"; then
+        err "Invalid username. Use 1 to 31 characters: a lower-case letter first, then lower-case letters, digits, '_' or '-'. Nothing was changed."
+        return 0
+    fi
+    if usr_lookup "$name"; then
+        err "User '${name}' already exists. Nothing was changed."
+        return 0
+    fi
+    if usr_group_get "$name"; then
+        err "A group named '${name}' already exists; choose another username. Nothing was changed."
+        return 0
+    fi
+    if ask_yes_no "Grant '${name}' sudo access (adds the user to the 'sudo' group)?"; then
+        want_sudo=1
+        if ! usr_ensure_sudo_group; then
+            warn "The 'sudo' group is not available, so sudo access cannot be granted."
+            if ! ask_yes_no "Create '${name}' without sudo access?"; then
+                info "Cancelled. Nothing was changed."
+                return 0
+            fi
+            want_sudo=0
+        fi
+    fi
+    info ""
+    info "About to create:"
+    info "  username : ${name}"
+    info "  home     : created by useradd with the default skeleton files (normally ${USR_HOME_BASE}/${name})"
+    info "  shell    : /bin/bash"
+    info "  groups   : a private group '${name}'$( ((want_sudo)) && printf " and the 'sudo' group")"
+    info "  password : not set by this step (asked separately below)"
+    ask_yes_no "Create user '${name}' now?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    useradd --create-home --shell /bin/bash -- "$name"
+    rc=$?
+    if ! usr_lookup "$name"; then
+        err "useradd did not create '${name}' (exit ${rc}). Nothing else was changed."
+        return 0
+    fi
+    ((rc != 0)) && warn "useradd exited with status ${rc}, but the user exists; check the output above."
+    home="$USR_HOME"
+    if ((want_sudo)); then
+        # Debian and Ubuntu use the same group name and the same documented command
+        # (usermod -aG sudo <user>); the group is called "sudo" on both, not "wheel".
+        usermod -aG sudo -- "$name"
+        if usr_lookup "$name" && usr_in_group sudo "$name" "$USR_GID"; then
+            sudo_state="yes"
+        else
+            err "Could not add '${name}' to the 'sudo' group (the group file does not list the user). Sudo access was NOT granted."
+        fi
+    fi
+    pw_state="not set (password login is locked)"
+    if ask_yes_no "Set a password for '${name}' now? (the system's own passwd prompt asks for it; ezvps never sees it)"; then
+        if passwd -- "$name"; then
+            pw_state="set with passwd"
+        else
+            warn "passwd did not finish. Set the password later with: passwd ${name}"
+        fi
+    fi
+    info ""
+    info "Created user: ${name} (UID ${USR_UID})"
+    info "  home     : ${home}"
+    info "  sudo     : ${sudo_state}"
+    info "  password : ${pw_state}"
+    [[ "$pw_state" == not* ]] && info "Add an SSH key with 'Add SSH key', or set a password with: passwd ${name}"
+    return 0
+}
+
+# --- Delete user ---------------------------------------------------------------
+
+# usr_home_removable <name> <home>: only a plain directory under the home base, not
+# shared with any other account. Sets USR_WHY when not.
+usr_home_removable() {
+    local name="$1" home="$2" n _pw _uid _gid _g h _s
+    USR_WHY=""
+    if [[ "$home" != "$USR_HOME_BASE"/* || "$home" == */ || "$home" == *..* || -z "${home#"$USR_HOME_BASE"/}" ]]; then
+        USR_WHY="its home (${home:-none}) is not a directory directly under ${USR_HOME_BASE}/"
+        return 1
+    fi
+    if [[ -L "$home" ]]; then
+        USR_WHY="${home} is a symbolic link"
+        return 1
+    fi
+    if [[ ! -d "$home" ]]; then
+        USR_WHY="${home} does not exist"
+        return 1
+    fi
+    while IFS=: read -r n _pw _uid _gid _g h _s; do
+        [[ "$n" == "$name" || -z "$h" ]] && continue
+        if [[ "$h" == "$home" || "$h" == "$home"/* || "$home" == "$h"/* ]]; then
+            USR_WHY="${home} is shared with the account '${n}'"
+            return 1
+        fi
+    done <"$USR_PASSWD_FILE"
+    return 0
+}
+
+usr_delete() {
+    local name rm_home=0 rc shown
+    ssh_preflight || return 0
+    require_cmds userdel || {
+        err "Run ezvps with root's full PATH (for example 'sudo -i'). Nothing was changed."
+        return 0
+    }
+    if ! read -r -p "Username to delete: " name; then
+        info ""
+        return 0
+    fi
+    name="$(usr_trim "$name")"
+    if [[ -z "$name" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    if [[ "$name" == root ]]; then
+        err "Refusing to delete root. Nothing was changed."
+        return 0
+    fi
+    if ! usr_valid_name "$name"; then
+        err "Invalid username. Nothing was changed."
+        return 0
+    fi
+    if ! usr_lookup "$name"; then
+        err "User '${name}' does not exist. Nothing was changed."
+        return 0
+    fi
+    if [[ "$USR_UID" == 0 ]]; then
+        err "Refusing to delete '${name}': UID 0 is a root account. Nothing was changed."
+        return 0
+    fi
+    if usr_is_current "$name" "$USR_UID"; then
+        err "Refusing to delete '${name}': that is the account you are logged in with. Nothing was changed."
+        return 0
+    fi
+    if [[ ! "$USR_UID" =~ ^[0-9]+$ ]] || ((USR_UID < USR_MIN_UID || USR_UID == 65534)); then
+        err "Refusing to delete '${name}' (UID ${USR_UID}): it is a system account, not a regular user. Nothing was changed."
+        return 0
+    fi
+    usr_user_pids "$USR_UID"
+    rc=$?
+    if ((rc == 2)); then
+        err "Cannot check running processes (${USR_PROC_DIR} is not readable). Refusing to delete. Nothing was changed."
+        return 0
+    fi
+    if ((${#USR_PIDS[@]} > 0)); then
+        shown="${USR_PIDS[*]:0:5}"
+        err "Refusing to delete '${name}': ${#USR_PIDS[@]} process(es) are running as this user (PIDs: ${shown}$( ((${#USR_PIDS[@]} > 5)) && printf ' ...'))."
+        info "Log the user out or stop the processes yourself, then try again. ezvps does not stop them and does not offer to override. Nothing was changed."
+        return 0
+    fi
+    info ""
+    info "About to delete the account '${name}' (UID ${USR_UID}):"
+    info "  The login entry is removed. The home directory ${USR_HOME:-(none)} is kept unless you say otherwise below."
+    ask_yes_no "Delete the user '${name}'?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    if usr_home_removable "$name" "$USR_HOME"; then
+        warn "The home directory ${USR_HOME} and everything in it can be deleted too. This cannot be undone."
+        ask_yes_no "Also DELETE the home directory ${USR_HOME}?" && rm_home=1
+    else
+        info "The home directory will be kept: ${USR_WHY}."
+    fi
+    backup_file "$USR_PASSWD_FILE" users-passwd || return 0
+    backup_file "$USR_GROUP_FILE" users-group || return 0
+    if ((rm_home)); then
+        userdel -r -- "$name"
+    else
+        userdel -- "$name"
+    fi
+    rc=$?
+    if usr_lookup "$name"; then
+        err "userdel did not remove '${name}' (exit ${rc}). Check the output above."
+        return 0
+    fi
+    ((rc != 0)) && warn "userdel exited with status ${rc}, but the account is gone; check the output above."
+    info ""
+    info "Deleted user: ${name}"
+    if ((rm_home)); then
+        info "  home directory: removed"
+    else
+        info "  home directory: kept (${USR_HOME:-none})"
+    fi
+    info "  backups of the passwd and group files are in ${NGX_BACKUP_BASE}/"
+    return 0
+}
+
+# --- sshd settings ---------------------------------------------------------------
+
+# ssh_eff_load: reads the effective configuration with `sshd -T` into SSH_EFF.
+SSH_EFF=()
+ssh_eff_load() {
+    local l
+    SSH_EFF=()
+    while IFS= read -r l; do
+        SSH_EFF+=("$l")
+    done < <(sshd -T -f "$SSH_CONFIG_FILE" 2>/dev/null)
+    ((${#SSH_EFF[@]} > 0))
+}
+
+# ssh_eff_get <keyword>: prints the effective value(s), one per line (normalised).
+ssh_eff_get() {
+    local l v
+    for l in "${SSH_EFF[@]}"; do
+        if [[ "${l%% *}" == "$1" ]]; then
+            v="${l#* }"
+            [[ "$v" == without-password ]] && v="prohibit-password"
+            printf '%s\n' "$v"
+        fi
+    done
+}
+
+ssh_eff_one() { # first effective value of a keyword, joined on one line for several
+    local out
+    out="$(ssh_eff_get "$1")"
+    printf '%s' "${out//$'\n'/, }"
+}
+
+ssh_test_config() { # runs sshd -t; output in SSH_TEST_OUT
+    SSH_TEST_OUT="$(sshd -t -f "$SSH_CONFIG_FILE" 2>&1)"
+}
+
+# Pure-bash rewrite of the sshd config for one setting. The managed line goes to the
+# very top of the file: sshd uses the FIRST value it sees for PermitRootLogin and
+# PasswordAuthentication, and Debian/Ubuntu start sshd_config with an Include of
+# sshd_config.d/*.conf, so a line placed lower down could be silently overridden by
+# a drop-in such as cloud-init's. Earlier active lines for the same keyword in the
+# global section are commented out (Port is cumulative, so an old Port line would
+# keep listening); Match blocks and every other line are copied unchanged. A block
+# written by an earlier run is replaced, so a re-run never duplicates anything.
+ssh_rewrite_config() { # ssh_rewrite_config <in> <out> <Key> <value>
+    local in="$1" out="$2" key="$3" value="$4" lk line t kw m skip=0 inmatch=0
+    lk="${key,,}"
+    {
+        printf '# ezvps:managed %s\n%s %s\n' "$key" "$key" "$value"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if ((skip)); then
+                skip=0
+                continue
+            fi
+            t="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$t" == "# ezvps:managed "* ]]; then
+                m="${t#"# ezvps:managed "}"
+                if [[ "${m,,}" == "$lk" ]]; then
+                    skip=1
+                    continue
+                fi
+                printf '%s\n' "$line"
+                continue
+            fi
+            if [[ -z "$t" || "$t" == \#* ]]; then
+                printf '%s\n' "$line"
+                continue
+            fi
+            kw="${t%%[[:space:]=]*}"
+            kw="${kw,,}"
+            [[ "$kw" == match ]] && inmatch=1
+            if ((inmatch == 0)) && [[ "$kw" == "$lk" ]]; then
+                printf '# ezvps disabled: %s\n' "$line"
+                continue
+            fi
+            printf '%s\n' "$line"
+        done <"$in"
+    } >"$out"
+}
+
+# ssh_match_mentions <keyword>: true when a Match block of the main file sets it
+# (such a line overrides the global value for the matching connections).
+ssh_match_mentions() {
+    local line t kw inmatch=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        t="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$t" || "$t" == \#* ]] && continue
+        kw="${t%%[[:space:]=]*}"
+        kw="${kw,,}"
+        [[ "$kw" == match ]] && inmatch=1
+        ((inmatch)) && [[ "$kw" == "$1" ]] && return 0
+    done <"$SSH_CONFIG_FILE"
+    return 1
+}
+
+ssh_restore_config() { # ssh_restore_config <backup>: put the backup back byte for byte
+    local tmp
+    tmp="$(mktemp "${SSH_CONFIG_FILE}.ezvps.XXXXXX")" || return 1
+    if ! { cp -p "$1" "$tmp" && mv -f "$tmp" "$SSH_CONFIG_FILE"; }; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+ssh_socket_active() { have_cmd systemctl && systemctl is-active --quiet ssh.socket 2>/dev/null; }
+
+# ssh_restart <port-change 0|1>: restart sshd. With socket activation (ssh.socket,
+# Ubuntu) the socket unit owns the port, so a port change also reloads systemd's
+# units (Ubuntu's generator rebuilds the socket from sshd_config) and restarts it.
+ssh_restart() {
+    local rc=0
+    if [[ "$1" == 1 ]] && ssh_socket_active; then
+        systemctl daemon-reload || rc=1
+        systemctl restart ssh.socket || rc=1
+    fi
+    systemctl restart "$SSH_SERVICE" || rc=1
+    return "$rc"
+}
+
+# ssh_wait_listening <port>: true once something listens on the port.
+ssh_wait_listening() {
+    local i max="${EZVPS_SSH_WAIT_SECONDS:-10}"
+    for ((i = 0; i <= max; i++)); do
+        port_in_use "$1" && return 0
+        ((i < max)) && sleep_s 1
+    done
+    return 1
+}
+
+ssh_rollback() { # ssh_rollback <backup> <port-change 0|1> <why>
+    err "$3"
+    if ssh_restore_config "$1"; then
+        info "Rolled back: ${SSH_CONFIG_FILE} is restored from ${1}"
+        if ssh_restart "$2"; then
+            info "sshd was restarted with the previous configuration."
+        else
+            err "sshd could not be restarted after the rollback. Check: systemctl status ${SSH_SERVICE}   (backup: ${1})"
+        fi
+    else
+        err "Could not restore ${SSH_CONFIG_FILE}. Restore it by hand: cp -p ${1} ${SSH_CONFIG_FILE}"
+    fi
+}
+
+# ssh_apply <Key> <value> <kind: port|auth>
+# backup -> rewrite -> sshd -t -> effective check (sshd -T) -> restart -> verify.
+# Any failure puts the backup back; sshd is restarted only after a passing sshd -t.
+ssh_apply() {
+    local key="$1" value="$2" kind="$3" tmp bk lk="${1,,}" got ok=1 pc=0 lines
+    [[ "$kind" == port ]] && pc=1
+    backup_file "$SSH_CONFIG_FILE" sshd_config || return 0
+    bk="$BACKUP_FILE_PATH"
+    tmp="$(mktemp "${SSH_CONFIG_FILE}.ezvps.XXXXXX")" || {
+        err "Cannot create a temporary file next to ${SSH_CONFIG_FILE}. Nothing was changed."
+        return 0
+    }
+    if ! { cp -p "$SSH_CONFIG_FILE" "$tmp" && ssh_rewrite_config "$SSH_CONFIG_FILE" "$tmp" "$key" "$value" && mv -f "$tmp" "$SSH_CONFIG_FILE"; }; then
+        rm -f "$tmp"
+        err "Could not write the new configuration. ${SSH_CONFIG_FILE} was not changed."
+        return 0
+    fi
+    info "Written: ${key} ${value}  (previous lines for it are commented out)"
+    if ! ssh_test_config; then
+        err "sshd -t rejected the new configuration:"
+        printf '%s\n' "$SSH_TEST_OUT" >&2
+        ssh_restore_config "$bk" && info "Rolled back: ${SSH_CONFIG_FILE} is restored from ${bk}"
+        info "sshd was NOT restarted."
+        return 0
+    fi
+    info "sshd -t: the new configuration is valid."
+    if ssh_eff_load; then
+        got="$(ssh_eff_get "$lk")"
+        [[ "$got" == "$value" ]] || ok=0
+        if ((ok == 0)); then
+            lines="${got//$'\n'/, }"
+            ssh_restore_config "$bk" && info "Rolled back: ${SSH_CONFIG_FILE} is restored from ${bk}"
+            err "The change would not take effect: sshd -T reports ${key} = ${lines:-nothing}, not ${value}. Another file (for example a Match block or a drop-in) still sets it. sshd was NOT restarted."
+            return 0
+        fi
+    fi
+    if ! ssh_restart "$pc"; then
+        ssh_rollback "$bk" "$pc" "Restarting sshd failed."
+        return 0
+    fi
+    if [[ "$kind" == port ]]; then
+        if ! ssh_wait_listening "$value"; then
+            ssh_rollback "$bk" 1 "sshd is not listening on port ${value} after the restart (with systemd socket activation the port is set in ssh.socket; see 'systemctl cat ssh.socket')."
+            return 0
+        fi
+        info "Verified: sshd listens on port ${value}."
+    else
+        if ! systemctl is-active --quiet "$SSH_SERVICE"; then
+            ssh_rollback "$bk" 0 "sshd is not running after the restart."
+            return 0
+        fi
+        info "Verified: sshd is running with ${key} ${value}."
+    fi
+    info "Backup of the previous configuration: ${bk}"
+    return 0
+}
+
+ssh_current_session_note() {
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        warn "You appear to be connected over SSH right now. Restarting sshd keeps existing sessions open; the change applies to NEW connections. Keep this session open until a new one works."
+    fi
+}
+
+# ssh_users_with_keys: logins whose authorized_keys file exists and is not empty.
+ssh_users_with_keys() {
+    local n _pw uid _gid _g home shell c=0
+    while IFS=: read -r n _pw uid _gid _g home shell; do
+        [[ -z "$n" || "$n" == \#* || -z "$home" ]] && continue
+        usr_login_shell "$shell" || continue
+        [[ -s "$home/.ssh/authorized_keys" ]] && c=$((c + 1))
+    done <"$USR_PASSWD_FILE"
+    printf '%s' "$c"
+}
+
+# ssh_other_sudo_users: non-root login accounts in the sudo group.
+ssh_other_sudo_users() {
+    local n _pw uid gid _g home shell c=0
+    while IFS=: read -r n _pw uid gid _g home shell; do
+        [[ -z "$n" || "$n" == \#* || "$uid" == 0 ]] && continue
+        usr_login_shell "$shell" || continue
+        usr_in_group sudo "$n" "$gid" && c=$((c + 1))
+    done <"$USR_PASSWD_FILE"
+    printf '%s' "$c"
+}
+
+ssh_ready() { # sshd present, config readable and valid right now; else a message
+    if ! have_cmd sshd; then
+        err "sshd is not installed (OpenSSH server). ezvps does not install it. Nothing was changed."
+        return 1
+    fi
+    if [[ ! -r "$SSH_CONFIG_FILE" || ! -f "$SSH_CONFIG_FILE" ]]; then
+        err "Cannot read ${SSH_CONFIG_FILE}. Nothing was changed."
+        return 1
+    fi
+    if ! ssh_test_config; then
+        err "sshd -t already fails on the current configuration; fix it first. ezvps will not change a broken file:"
+        printf '%s\n' "$SSH_TEST_OUT" >&2
+        return 1
+    fi
+    return 0
+}
+
+ssh_change_port() {
+    local cur new
+    ssh_preflight || return 0
+    ssh_ready || return 0
+    ssh_eff_load || {
+        err "sshd -T failed; cannot read the effective configuration. Nothing was changed."
+        return 0
+    }
+    cur="$(ssh_eff_one port)"
+    info "Current SSH port: ${cur:-unknown}"
+    if ! read -r -p "New SSH port (22 or 1024-65535): " new; then
+        info ""
+        return 0
+    fi
+    new="$(usr_trim "$new")"
+    if [[ -z "$new" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    if [[ ! "$new" =~ ^[0-9]{1,5}$ ]] || { new=$((10#$new)); ((new != 22 && (new < 1024 || new > 65535))); }; then
+        err "Invalid port. Use 22 or a number from 1024 to 65535. Nothing was changed."
+        return 0
+    fi
+    if [[ "$cur" == "$new" ]]; then
+        info "SSH already listens only on port ${new}. Nothing to do."
+        return 0
+    fi
+    if port_in_use "$new"; then
+        err "Something already listens on port ${new}. Choose another port. Nothing was changed."
+        return 0
+    fi
+    if ssh_match_mentions port; then
+        warn "A Match block in ${SSH_CONFIG_FILE} mentions Port; it is left as it is."
+    fi
+    info ""
+    warn "Changing the SSH port can lock you out of this server."
+    info "  - New connections must use port ${new}; port ${cur:-22} stops accepting them."
+    info "  - If a firewall (ufw, nftables, your provider's panel) is active, allow port ${new} BEFORE you close the old one. ezvps does not change firewall rules."
+    info "  - Keep this session open and test 'ssh -p ${new} <user>@<server>' from a second terminal before you log out."
+    ssh_current_session_note
+    ask_yes_no "Change the SSH port from ${cur:-22} to ${new}?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    ssh_apply Port "$new" port
+}
+
+ssh_change_choice() { # ssh_change_choice <Key> <values...> (menu of fixed values)
+    local key="$1" cur choice i vals=("${@:2}") new
+    ssh_preflight || return 0
+    ssh_ready || return 0
+    ssh_eff_load || {
+        err "sshd -T failed; cannot read the effective configuration. Nothing was changed."
+        return 0
+    }
+    cur="$(ssh_eff_one "${key,,}")"
+    info "${key} is currently: ${cur:-unknown}"
+    for i in "${!vals[@]}"; do
+        printf '%2d) %s\n' "$((i + 1))" "${vals[$i]}"
+    done
+    printf '%2d) %s\n' 0 "Cancel"
+    if ! read -r -p "Select: " choice; then
+        info ""
+        return 0
+    fi
+    choice="${choice//[[:space:]]/}"
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || ((10#$choice < 1 || 10#$choice > ${#vals[@]})); then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    new="${vals[$((10#$choice - 1))]}"
+    if [[ "$cur" == "$new" ]]; then
+        info "${key} is already ${new}. Nothing to do."
+        return 0
+    fi
+    ssh_match_mentions "${key,,}" && warn "A Match block in ${SSH_CONFIG_FILE} also sets ${key}; it overrides this global value for the connections it matches."
+    info ""
+    case "$key:$new" in
+        PermitRootLogin:no)
+            warn "Disabling root login over SSH can lock you out if root is how you log in."
+            if (($(ssh_other_sudo_users) == 0)); then
+                warn "No other account with sudo access was found. After this, nobody could administer the server over SSH."
+                ask_yes_no "Continue anyway?" || {
+                    info "Cancelled. Nothing was changed."
+                    return 0
+                }
+            else
+                info "Another account with sudo access exists. Log in as it in a second terminal first."
+            fi
+            ;;
+        PermitRootLogin:yes)
+            warn "PermitRootLogin yes allows root to log in with a password. This is not recommended."
+            ;;
+        PasswordAuthentication:no)
+            warn "Disabling password authentication means ONLY SSH keys work. A missing or wrong key locks you out."
+            if (($(ssh_users_with_keys) == 0)); then
+                warn "No account has an authorized_keys file yet. Use 'Add SSH key' and test a key login first."
+                ask_yes_no "Continue anyway?" || {
+                    info "Cancelled. Nothing was changed."
+                    return 0
+                }
+            else
+                info "Test a key login in a second terminal before you close this session."
+            fi
+            ;;
+        PasswordAuthentication:yes)
+            warn "Enabling password authentication exposes the server to password guessing."
+            ;;
+    esac
+    ssh_current_session_note
+    ask_yes_no "Set ${key} to ${new}?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    ssh_apply "$key" "$new" auth
+    if [[ "$key" == PasswordAuthentication && "$new" == no ]] && ssh_eff_load; then
+        [[ "$(ssh_eff_get kbdinteractiveauthentication)" == yes ]] &&
+            warn "KbdInteractiveAuthentication is enabled; with PAM it can still offer a password prompt. ezvps does not change that setting."
+    fi
+    return 0
+}
+
+ssh_settings() {
+    local choice
+    if have_cmd sshd && [[ -r "$SSH_CONFIG_FILE" ]] && ssh_eff_load; then
+        info ""
+        info "Effective sshd settings (sshd -T, from ${SSH_CONFIG_FILE}):"
+        info "  Port                   : $(ssh_eff_one port)"
+        info "  PermitRootLogin        : $(ssh_eff_one permitrootlogin)"
+        info "  PasswordAuthentication : $(ssh_eff_one passwordauthentication)"
+    fi
+    info ""
+    printf '%2d) %s\n' 1 "SSH port"
+    printf '%2d) %s\n' 2 "PermitRootLogin"
+    printf '%2d) %s\n' 3 "PasswordAuthentication"
+    printf '%2d) %s\n' 0 "Back"
+    info ""
+    if ! read -r -p "Select: " choice; then
+        info ""
+        return 0
+    fi
+    choice="${choice//[[:space:]]/}"
+    case "$choice" in
+        0) return 0 ;;
+        1) ssh_change_port || true ;;
+        2) ssh_change_choice PermitRootLogin no prohibit-password yes || true ;;
+        3) ssh_change_choice PasswordAuthentication no yes || true ;;
+        *) warn "Invalid choice: ${choice:-<empty>}" ;;
+    esac
+    return 0
+}
+
+# --- Add SSH key -----------------------------------------------------------------
+
+SSH_KEY_TYPE="" SSH_KEY_BLOB="" SSH_KEY_COMMENT="" SSH_KEY_ERR=""
+
+# The base64 text every public key blob of a type starts with (a length field followed by
+# the type name), so a blob that does not match its declared type is refused.
+ssh_key_prefix() {
+    case "$1" in
+        ssh-ed25519) printf 'AAAAC3NzaC1lZDI1NTE5' ;;
+        ssh-rsa) printf 'AAAAB3NzaC1y' ;;
+        ecdsa-sha2-nistp256) printf 'AAAAE2VjZHNhLXNoYTItbmlzdHAy' ;;
+        ecdsa-sha2-nistp384) printf 'AAAAE2VjZHNhLXNoYTItbmlzdHAz' ;;
+        ecdsa-sha2-nistp521) printf 'AAAAE2VjZHNhLXNoYTItbmlzdHA1' ;;
+        sk-ssh-ed25519@openssh.com) printf 'AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29t' ;;
+        sk-ecdsa-sha2-nistp256@openssh.com) printf 'AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5j' ;;
+        *) return 1 ;;
+    esac
+}
+
+# ssh_key_validate <line>: one line, "<type> <base64> [comment]". Fills SSH_KEY_TYPE,
+# SSH_KEY_BLOB, SSH_KEY_COMMENT; on failure SSH_KEY_ERR (the key text is never echoed).
+ssh_key_validate() {
+    local line="$1" type blob comment pre
+    SSH_KEY_TYPE="" SSH_KEY_BLOB="" SSH_KEY_COMMENT="" SSH_KEY_ERR=""
+    if [[ "$line" == *"PRIVATE KEY"* || "$line" == -----* || "$line" == PuTTY-User-Key-File* ]]; then
+        SSH_KEY_ERR="That looks like a PRIVATE key. Never paste a private key; ezvps did not keep it. Paste the public key (the one-line .pub file) instead."
+        return 1
+    fi
+    if [[ "$line" == *[[:cntrl:]]* ]]; then
+        SSH_KEY_ERR="The key contains control characters; it must be one plain line."
+        return 1
+    fi
+    if ((${#line} > 8192)); then
+        SSH_KEY_ERR="The line is too long to be a public key."
+        return 1
+    fi
+    read -r type blob comment <<<"$line"
+    if ! pre="$(ssh_key_prefix "$type")" || [[ -z "$blob" ]]; then
+        SSH_KEY_ERR="That does not look like an OpenSSH public key. Expected one line: <type> <base64> [comment], for example 'ssh-ed25519 AAAA... name'. Options in front of the key are not accepted."
+        return 1
+    fi
+    if [[ ! "$blob" =~ ^[A-Za-z0-9+/]+={0,2}$ || $((${#blob} % 4)) -ne 0 || ${#blob} -lt $((${#pre} + 8)) || "$blob" != "$pre"* ]]; then
+        SSH_KEY_ERR="The key data is not valid for type ${type}."
+        return 1
+    fi
+    SSH_KEY_TYPE="$type" SSH_KEY_BLOB="$blob" SSH_KEY_COMMENT="$comment"
+    return 0
+}
+
+# ssh_key_present <file> <type> <blob>: the key is already in the file.
+ssh_key_present() {
+    local t b _r
+    [[ -f "$1" ]] || return 1
+    while read -r t b _r || [[ -n "$t" ]]; do
+        [[ "$t" == "$2" && "$b" == "$3" ]] && return 0
+    done <"$1"
+    return 1
+}
+
+ssh_add_key() {
+    local name key home sshdir ak tmp l existing=0 made_dir=0 bk
+    ssh_preflight || return 0
+    if ! read -r -p "Add the key to which user: " name; then
+        info ""
+        return 0
+    fi
+    name="$(usr_trim "$name")"
+    if [[ -z "$name" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    if [[ "$name" != root ]] && ! usr_valid_name "$name"; then
+        err "Invalid username. Nothing was changed."
+        return 0
+    fi
+    if ! usr_lookup "$name"; then
+        err "User '${name}' does not exist. Nothing was changed."
+        return 0
+    fi
+    home="$USR_HOME"
+    if [[ "$home" != /* || "$home" == *..* || ! -d "$home" ]]; then
+        err "The home directory of '${name}' (${home:-none}) is not an existing absolute directory. Nothing was changed."
+        return 0
+    fi
+    sshdir="${home%/}/.ssh"
+    ak="${sshdir}/authorized_keys"
+    if [[ -L "$sshdir" || -L "$ak" ]]; then
+        err "${sshdir} or its authorized_keys is a symbolic link; ezvps will not follow it. Nothing was changed."
+        return 0
+    fi
+    if [[ -e "$sshdir" && ! -d "$sshdir" ]] || [[ -e "$ak" && ! -f "$ak" ]]; then
+        err "${sshdir} or ${ak} is not a regular directory/file. Nothing was changed."
+        return 0
+    fi
+    info "Paste the PUBLIC key as a single line (nothing is shown while you paste)."
+    if ! read -r -s -p "Public key: " key; then
+        info ""
+        return 0
+    fi
+    info ""
+    # Anything still pending from a multi-line paste must not reach the next prompts.
+    if [[ -t 0 ]]; then
+        while read -r -s -t 0.1 _; do :; done
+    fi
+    key="$(usr_trim "$key")"
+    if [[ -z "$key" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    if ! ssh_key_validate "$key"; then
+        err "$SSH_KEY_ERR"
+        info "Nothing was changed."
+        return 0
+    fi
+    [[ -f "$ak" ]] && existing=1
+    if ((existing)) && ssh_key_present "$ak" "$SSH_KEY_TYPE" "$SSH_KEY_BLOB"; then
+        info "This key is already in ${ak}. Nothing to do."
+        return 0
+    fi
+    info ""
+    info "About to add a key to ${ak}:"
+    info "  user    : ${name} (UID ${USR_UID})"
+    info "  type    : ${SSH_KEY_TYPE}"
+    info "  comment : ${SSH_KEY_COMMENT:-(none)}"
+    ask_yes_no "Add this key for '${name}'?" || {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    if [[ ! -d "$sshdir" ]]; then
+        mkdir -p "$sshdir" || {
+            err "Cannot create ${sshdir}. Nothing was changed."
+            return 0
+        }
+        made_dir=1
+    fi
+    if ((existing)); then
+        backup_file "$ak" "authorized_keys-${name}" || return 0
+        bk="$BACKUP_FILE_PATH"
+    fi
+    tmp="$(mktemp "${sshdir}/.ezvps-ak.XXXXXX")" || {
+        err "Cannot create a temporary file in ${sshdir}. Nothing was changed."
+        return 0
+    }
+    {
+        if ((existing)); then
+            while IFS= read -r l || [[ -n "$l" ]]; do
+                printf '%s\n' "$l"
+            done <"$ak"
+        fi
+        printf '%s\n' "$key"
+    } >"$tmp"
+    if ! { chmod 700 "$sshdir" && chmod 600 "$tmp" && mv -f "$tmp" "$ak" && chown "${USR_UID}:${USR_GID}" "$sshdir" "$ak"; }; then
+        rm -f "$tmp"
+        err "Could not set up ${ak} with the right owner and permissions. Check it by hand; sshd ignores keys files with wrong ownership."
+        return 0
+    fi
+    if ! ssh_key_present "$ak" "$SSH_KEY_TYPE" "$SSH_KEY_BLOB"; then
+        err "The key is not in ${ak} after writing. Check the file."
+        return 0
+    fi
+    info ""
+    info "Key added for ${name}: ${ak}"
+    info "  ${sshdir} is mode 700 and ${ak} is mode 600, owned by ${name}."
+    ((made_dir)) && info "  ${sshdir} was created."
+    [[ -n "${bk:-}" ]] && info "  previous file backed up: ${bk}"
+    info "Test a key login in a second terminal before you disable password login."
+    return 0
+}
+
+# --- submenu ---------------------------------------------------------------------
+
+SSH_MENU_LABELS=("List users" "Add user" "Delete user" "SSH settings" "Add SSH key")
+
+module_ssh() {
+    local choice i
+    while true; do
+        info ""
+        info "${C_BOLD}SSH and Users${C_RESET}"
+        info ""
+        for i in "${!SSH_MENU_LABELS[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${SSH_MENU_LABELS[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) usr_list || true ;;
+            2) usr_add || true ;;
+            3) usr_delete || true ;;
+            4) ssh_settings || true ;;
+            5) ssh_add_key || true ;;
+            *)
+                warn "Invalid choice: ${choice:-<empty>}"
+                ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
@@ -4149,7 +5151,8 @@ run_module() {
         backpack) module_backpack ;;
         ctunnel) module_ctunnel ;;
         lazyports) module_lazyports ;;
-        ssh | firewall | backup | update | uninstall)
+        ssh) module_ssh ;;
+        firewall | backup | update | uninstall)
             module_not_implemented "$1"
             ;;
         *)
@@ -4213,7 +5216,7 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp, 3x-ui, backpack, ctunnel, nginx, certs and lazyports are implemented
+Only l2tp, 3x-ui, backpack, ctunnel, nginx, certs, lazyports and ssh are implemented
 in this release; the others report that they are not implemented yet."
 }
 

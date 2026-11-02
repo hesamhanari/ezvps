@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10).
 
 ## 1. What ezvps is
 
@@ -14,7 +14,8 @@ module needs is checked with `command -v` first and installed only with the
 user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself;
 Certificates: `curl` and the pinned acme.sh script; Backpack and Lazyports: `curl`;
 ctunnel: `git`, `make`, `gcc` and the OpenSSL and zlib development packages. Lazyports needs
-Go, which ezvps never installs).
+Go, which ezvps never installs; SSH and Users: `sudo`, only when you ask for sudo access on a
+system without it. It never installs the OpenSSH server).
 
 ### 1.1 Supported systems
 
@@ -38,6 +39,7 @@ Per module:
 | Nginx | yes: `nginx.org/packages/debian`, suite `bookworm` | yes: `.../debian`, `trixie` | yes: `nginx.org/packages/ubuntu`, suite `jammy` | yes: `.../ubuntu`, `noble` | yes: `.../ubuntu`, `resolute` |
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | Backpack, ctunnel, Lazyports (`x86_64` and `aarch64` only) | yes | yes | yes | yes | yes |
+| SSH and Users | yes | yes | yes | yes | yes |
 | L2TP (ezl2tp) | **no** (gate below) | yes | **no** (gate below) | **no** (gate below) | **no** (gate below) |
 
 * **L2TP has its own gate.** ezvps running on a system does not mean ezl2tp
@@ -90,6 +92,7 @@ Per module:
   | `http2 on;` in the HTTPS site (PR 8) | needs nginx 1.25.1+; the module only ever installs nginx.org stable 1.30+ | identical | one path |
   | certificate store `/etc/ssl/ezvps` (PR 8) | no package owns it | no package owns it (Ubuntu's `ssl-cert` group is not used) | one path |
   | Backpack, ctunnel, Lazyports (PR 9) | upstream installers branch on nothing distro-specific (Backpack's `install.sh` keys on `uname -m` only; ctunnel is `make`; Lazyports is `go install`); apt package names `git make gcc libssl-dev zlib1g-dev curl` are identical | identical | one path (Go is not installed by ezvps, so the distro's Go version only matters to Lazyports, see 6.7) |
+  | SSH and Users (PR 10) | `useradd`/`usermod`/`userdel`/`passwd` (shadow-utils), group `sudo` (only when the `sudo` package is installed, which a minimal Debian image may lack), `ssh.service` | same commands; group `sudo`; sudo is preinstalled; **Ubuntu 22.10+ starts sshd through `ssh.socket`**, whose port is not always taken from `sshd_config` | one code path. The group name (`sudo`, not `wheel`) and the documented command (`usermod -aG sudo <user>`) are the same on both. The socket difference is handled by *verifying* that sshd listens on the new port after a port change and rolling back if it does not (6.8); ezvps does not branch on the distro for it |
 
 ## 2. Principles (same as easyl2tp)
 
@@ -179,7 +182,7 @@ redraws. EOF on stdin exits 0.
 | 5 | Nginx             | **implemented**     | PR 3       |
 | 6 | Certificates      | **implemented**     | PR 8       |
 | 7 | Lazyports         | **implemented**     | PR 9       |
-| 8 | SSH and Users     | not implemented yet | later      |
+| 8 | SSH and Users     | **implemented**     | PR 10      |
 | 9 | Firewall          | not implemented yet | later      |
 | 10| Backup            | not implemented yet | later      |
 | 11| Check For Updates | not implemented yet | later      |
@@ -1196,13 +1199,171 @@ printed.
   shell startup files stay as they are.
 * Everything the TUI does (filter, sort, kill): Lazyports itself.
 
-### 6.8 SSH and Users (later PR)
+### 6.8 SSH and Users (PR 10, done)
 
-SSH: show effective sshd settings, change port / root login / password
-auth, with `sshd -t` before reload and backup of `sshd_config`; guard
-against locking the user out (confirm, keep the current session working).
-VPS users: list, add, lock, unlock, delete users; add/remove authorized
-keys; sudo membership.
+Menu item 8 opens a submenu. Clean labels only:
+
+```
+ 1) List users
+ 2) Add user
+ 3) Delete user
+ 4) SSH settings
+ 5) Add SSH key
+ 0) Back
+```
+
+`0` or EOF returns to the main menu; after each action "Press Enter to continue...";
+invalid input prints `Invalid choice: <input>`. Module key `ssh` maps to `module_ssh`; its helpers
+are prefixed `usr_` (accounts) and `ssh_` (sshd settings and keys). **Scope:** list, add and delete
+ordinary accounts, three sshd settings, and authorized keys. Locking or unlocking accounts, changing
+a password, sudoers files, other sshd directives, firewall rules and host keys are out of scope.
+
+**Checks before any change** (Add user, Delete user, each SSH setting, Add SSH key): root
+(`require_root`), a supported system (`require_supported_os "SSH and Users"`, section 1.1), a valid
+username, and for SSH changes a passing `sshd -t`. A refusal says why and changes nothing. List users
+and the read-only view of the current sshd settings need no OS check. Nothing is ever changed without
+a yes: a username, a key, a port or a choice are *inputs*, and each change is then shown and confirmed
+(default no). **Never read, printed, stored or logged:** a password, a password hash (only the passwd
+and group files are read, never `/etc/shadow`, and field 2 of passwd is discarded), or a private key.
+
+**Files and commands.** Reads `/etc/passwd`, `/etc/group`, `/etc/shells`, `/proc/<pid>/status` and
+`/proc/self/loginuid`, and the sshd config, in pure bash. Commands: `useradd`, `usermod`, `userdel`,
+`passwd`, `chown`, `sshd` (`-t`, `-T`), `systemctl`, optionally `ss` (through `port_in_use`) and
+`apt-get` (to offer the `sudo` package). All are checked with `command -v`; a missing one gives a
+message and no change. Paths can be redirected for tests (section 7a); the defaults are the real ones.
+
+#### 1) List users
+
+Read-only. A table `USER  UID  SUDO`, one account per row, for accounts with a **login shell** (not
+empty, not `nologin`/`false`, and listed in `/etc/shells`, which is what shells(5) defines as a valid
+login shell, so pseudo accounts such as `sync` are excluded; without a readable shells file only the
+`nologin`/`false` rule applies) **and an existing home directory**. `SUDO` is `yes` when the account is
+a member of the `sudo` group (listed in it, or with it as the primary group), `no` otherwise, `n/a` for
+UID 0. Rules in `/etc/sudoers*` are not inspected, and the output says so. System service accounts
+with a `nologin`/`false` shell are hidden; the module then asks `Also show system service accounts
+(nologin/false shells)?` and, on yes, prints every account with its shell. A password hash is never
+shown (field 2 is not read into any variable that is printed).
+
+#### 2) Add user
+
+1. Asks for a username. **Strict validation:** `^[a-z][a-z0-9_-]{0,30}$` (a lower-case letter first, at
+   most 31 characters; no upper case, dots, `$`, spaces, slashes or leading `-`). Empty input
+   cancels.
+2. **Refuses** an existing user (any entry in passwd, including `root`) and a name that is already a
+   group.
+3. Asks `Grant '<name>' sudo access (adds the user to the 'sudo' group)?` If yes and the `sudo` group
+   does not exist (the package is not installed, as on a minimal Debian image) it says so and offers
+   `apt-get install -y -q sudo` (only after a yes); if the group is still missing it asks whether to
+   create the user without sudo, and cancels on no.
+4. Shows the plan and asks `Create user '<name>' now?`.
+5. `useradd --create-home --shell /bin/bash -- <name>`; the account is read back from passwd
+   (otherwise the failure is reported and nothing else is done). **No backup is made for a new user.**
+6. If sudo was chosen: `usermod -aG sudo -- <name>`, the **only** group added. The documented method is
+   the same on Debian and Ubuntu (the group is `sudo`, not `wheel`). It is **verified** by reading the
+   group file again; a failed or ineffective `usermod` is reported as `Sudo access was NOT granted`
+   and the summary says `sudo : no`.
+7. Asks `Set a password for '<name>' now?` Yes: runs `passwd -- <name>` with the terminal attached, so
+   the **system's own prompt** asks for it; ezvps never reads, stores, prints or logs it. No (or a failed
+   `passwd`): the account has no password, so password login is locked, and the message says how to set
+   one or to use Add SSH key.
+8. Summary: `Created user: <name> (UID n)`, the home directory, `sudo : yes|no`, `password : set with
+   passwd|not set (password login is locked)`.
+
+#### 3) Delete user
+
+Refusals, each before anything is asked or changed:
+
+| Case | Message |
+|------|---------|
+| `root` | `Refusing to delete root.` |
+| any account with UID 0 | `UID 0 is a root account` |
+| the current user: `SUDO_USER`/`SUDO_UID`, the effective user, or the audit login uid in `/proc/self/loginuid` (the account that logged in, even after `su`) | `that is the account you are logged in with` |
+| a system account (UID below 1000, or 65534) | `it is a system account, not a regular user` |
+| unknown or invalid name | message |
+| **running processes**: any process whose real or effective UID matches (read from `/proc/*/status`) | `N process(es) are running as this user (PIDs: ...)`. **Final: ezvps neither kills them nor offers an override or a second prompt**; log the user out and try again |
+| `/proc` not readable | `Cannot check running processes` |
+
+Then: `Delete the user '<name>'?` (default no); then, as a **separate second confirmation**,
+`Also DELETE the home directory <path>?` (default no, so **a home directory is never deleted by
+default**). The second question is only asked when the home directory is removable: a plain directory
+directly under `/home` (`EZVPS_HOME_BASE`), not a symbolic link, existing, and not shared with or
+nested in another account's home. Otherwise the home is kept and the reason is printed. `passwd` and
+`group` are copied to `/var/backups/ezvps/users-passwd.<timestamp>.<pid>` and `users-group...` first
+(not `/etc/shadow`: it holds hashes, and userdel keeps its own `shadow-`). Then `userdel -- <name>`, or
+`userdel -r -- <name>` only after the second yes (shadow-utils' own checks apply on top). The account
+is read back from passwd to verify it is gone, and the summary says whether the home was removed or
+kept.
+
+#### 4) SSH settings
+
+Shows the effective values from `sshd -T` (Port, PermitRootLogin, PasswordAuthentication) and a
+submenu with exactly `1) SSH port`, `2) PermitRootLogin`, `3) PasswordAuthentication`, `0) Back`: **one
+setting at a time, and no other**. Needs `sshd` (never installed by ezvps), a readable
+`/etc/ssh/sshd_config`, and a configuration for which `sshd -t` **already passes** (a broken file is
+not touched). Choosing a value that is already effective is a no-op: no backup, no restart.
+
+Every change follows the same sequence, and **any failure puts the backup back**:
+
+1. Warnings and a confirmation (below).
+2. **Backup** of `sshd_config` to `/var/backups/ezvps/sshd_config.<timestamp>.<pid>` (byte for byte,
+   dir mode 700). A failed backup aborts.
+3. **Rewrite**, pure bash, into a temp file next to the config (mode and owner kept) and `mv`:
+   a managed block `# ezvps:managed <Key>` + `<Key> <value>` is written at the **very top** of the
+   file, active lines for the same keyword in the global section are commented out as
+   `# ezvps disabled: <line>`, a block from an earlier run is replaced (no duplicates), Match blocks
+   and every other line are copied unchanged. At the top because sshd uses the **first** value it sees
+   and Debian 12+/Ubuntu 22.04+ start `sshd_config` with `Include sshd_config.d/*.conf` (cloud-init
+   ships `PasswordAuthentication yes` there). `Port` is cumulative, so older `Port` lines are disabled.
+4. **`sshd -t`**. Failure: the output is shown, the backup is restored, **sshd is not restarted**.
+5. **`sshd -T` must report exactly the requested value** (for Port: exactly that one port). If a
+   drop-in still sets it, the change is rolled back with `The change would not take effect`; a change
+   that would silently do nothing is never reported as done. A Match block that also sets the keyword
+   is warned about (it overrides the global value for the connections it matches).
+6. **Restart** (`systemctl restart ssh`) only after steps 4 and 5 passed. For a port change, when
+   `ssh.socket` is active (systemd socket activation) the units are reloaded and `ssh.socket` is
+   restarted too. A failing restart restores the backup and restarts again.
+7. **Verify:** a port change must find something **listening on the new port** (`port_in_use`, up to
+   `EZVPS_SSH_WAIT_SECONDS`, default 10); otherwise the backup is restored, sshd is restarted again
+   and the message names `ssh.socket` (Ubuntu's socket unit may own the port). The other two settings
+   check that the service is active. Last, the backup path is printed.
+
+*SSH port:* 22 or 1024-65535 only; refused when something already listens on it; warns that new
+connections must use the new port, that the firewall is not changed by ezvps (open the new port before
+closing the old), and to test from a second terminal first.
+*PermitRootLogin:* `no`, `prohibit-password` or `yes`. `no` warns that it can lock you out and, when
+no other non-root account with sudo exists, asks a stronger `Continue anyway?`. `yes` warns it is not
+recommended.
+*PasswordAuthentication:* `no` or `yes`. `no` warns that only keys will work, tells you to test a key
+login first and, when no account has a non-empty `authorized_keys`, asks a stronger `Continue
+anyway?`; afterwards it warns if `KbdInteractiveAuthentication` is still enabled (PAM may still offer
+a password prompt; ezvps does not change that setting). `yes` warns about password guessing.
+**The current session:** when `SSH_CONNECTION` is set, every change prints that you appear to be
+connected over SSH, that restarting sshd keeps existing sessions open, that the change applies to new
+connections, and to keep the session until a new one works.
+
+#### 5) Add SSH key
+
+1. Asks for a username (must exist in passwd; `root` is allowed) and checks its home directory: an
+   existing absolute directory without `..`. `~/.ssh` or `~/.ssh/authorized_keys` that is a **symbolic
+   link**, or not a regular directory/file, is refused (ezvps runs as root and does not follow links
+   planted in a user's home); a missing home is not created.
+2. Asks for the public key **without echo** (`read -s`), as one line; a multi-line paste's leftover
+   lines are drained on a terminal so they cannot answer later prompts.
+3. **Validation** (the key is never echoed back, even on failure): a line that contains `PRIVATE KEY`,
+   starts with `-----` or `PuTTY-User-Key-File` is **refused as a private key** and discarded;
+   control characters or more than 8192 characters are refused; otherwise it must be exactly
+   `<type> <base64> [comment]` with a type in `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256|384|521`,
+   `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, a base64 blob (length a multiple
+   of 4, `=` padding only at the end) that **starts with the base64 of the key's own type string** (so a
+   blob that does not match its type is refused), and no options in front. Pure bash, no `ssh-keygen`.
+4. Shows user, type and comment (not the key data) and asks for confirmation.
+5. Creates `~/.ssh` if missing, **backs up** an existing `authorized_keys` to
+   `/var/backups/ezvps/authorized_keys-<user>.<timestamp>.<pid>`, writes the old lines plus the new one
+   to a temp file in `~/.ssh` (a missing final newline is repaired), sets `~/.ssh` to **700** and the file
+   to **600**, `mv`s it in place and `chown <uid>:<gid>` both from passwd. A failing chmod/chown is
+   reported (never silently a root-owned file) and the success message is not printed.
+6. A key that is already present (same type and data) is a no-op: no write, no backup.
+7. Reminds you to test a key login in a second terminal before disabling passwords.
 
 ### 6.9 Firewall (later PR; v0.0.1 = show only)
 
@@ -1251,12 +1412,12 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
-| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users), install.sh | backup dir (default `/var/backups/ezvps`) |
 | `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
 | `EZVPS_APT_DIR` | ezvps (Nginx) | apt config dir for the nginx.org source and pin (default `/etc/apt`) |
 | `EZVPS_KEYRING_DIR` | ezvps (Nginx) | where `nginx-archive-keyring.gpg` is stored (default `/usr/share/keyrings`) |
@@ -1266,6 +1427,11 @@ Defaults are the real paths; none of these relax a check on a real server.
 | `EZVPS_XUI_WAIT_SECONDS` | ezvps (3x-ui) | how long to wait for the panel to answer (default 30) |
 | `EZVPS_ACME_HOME` | ezvps (Certificates) | acme.sh home (default `$HOME/.acme.sh`) |
 | `EZVPS_CERT_DIR` | ezvps (Nginx, Certificates) | certificate store, also the path written into HTTPS sites (default `/etc/ssl/ezvps`) |
+| `EZVPS_PASSWD_FILE` / `EZVPS_GROUP_FILE` / `EZVPS_SHELLS_FILE` | ezvps (SSH and Users) | passwd, group and shells files that are read (defaults `/etc/passwd`, `/etc/group`, `/etc/shells`); the `useradd`/`usermod`/`userdel` stubs of the tests edit fake copies |
+| `EZVPS_PROC_DIR` | ezvps (SSH and Users) | where `<pid>/status` and `self/loginuid` are read (default `/proc`) |
+| `EZVPS_HOME_BASE` | ezvps (SSH and Users) | the only directory under which a home directory may be offered for removal (default `/home`) |
+| `EZVPS_SSHD_CONFIG` | ezvps (SSH and Users) | sshd configuration file that is read, backed up and rewritten (default `/etc/ssh/sshd_config`) |
+| `EZVPS_SSH_WAIT_SECONDS` | ezvps (SSH and Users) | how long to wait for sshd to listen on a new port (default 10) |
 | `EZVPS_TOOL_PREFIX` | ezvps (Backpack, ctunnel, Lazyports) | install prefix of the tools (default `/usr/local`: binaries in `<prefix>/bin`, ctunnel's man page in `<prefix>/share/man/man1`; also passed to `make` as `PREFIX`) |
 | `EZVPS_BACKPACK_CONF_DIR` | ezvps (Backpack) | Backpack's config directory, backed up before changes (default `/etc/backpack`) |
 | `EZVPS_NO_PAUSE=1` | ezvps | do not wait for Enter |
@@ -1427,7 +1593,44 @@ Defaults are the real paths; none of these relax a check on a real server.
   Each assertion was checked to fail when the behaviour it covers is broken (for example
   removing the `</dev/null`, the hash comparison, the backup, the architecture or OS check, the
   confirmations or the post-uninstall verification).
+  **SSH and Users** (`== SSH and Users module`) runs against a **fake system** per scenario in a temp
+  dir: fake `passwd` (system accounts, `nologin`/`false`/pseudo shells, an account with no home, a
+  password hash in field 2, a primary group of `sudo`), `group`, `shells`, a fake `/proc`
+  (`<pid>/status`, `self/loginuid`), a Debian-style `sshd_config` with an `Include` and a cloud-init
+  style drop-in, and stubs that edit those files: `useradd`, `usermod`, `userdel`, `passwd` (prints a
+  marker, reads nothing), `chown` (logs), `apt-get`, `systemctl`, `ss`, and an `sshd` whose `-t` fails on
+  a bad directive (or only after ezvps has written its line) and whose `-T` prints a small effective
+  configuration (Include, first value wins, `Port` cumulative). Sandbox `PATH`s each lack one command.
+  Covered: the exact submenu and its reachability; **list** (login shell and home filter, pseudo shells,
+  missing home, UID and sudo columns, sudo by group or primary group, root `n/a`, full list on request,
+  a password hash never shown, no shells file, no OS check); **add** (with and without sudo, the exact
+  `useradd`/`usermod -aG sudo` calls, sudo verified against the group file, `usermod` that does nothing or
+  fails, password only after a yes and only through `passwd`, declined plan, nine invalid names, existing
+  user, existing group, `useradd` failure, a missing sudo group with `apt-get` only after a yes, missing
+  `useradd`, unsupported systems, all five supported systems, no backup for a new user); **delete**
+  (root, another UID 0, the current user by `SUDO_USER` and by login uid, system accounts, unknown and
+  invalid names, running processes by real or effective UID, no `/proc`, declined confirmation, no `-r` by
+  default, `-r` only after the second yes, passwd and group backed up byte for byte, a home outside the
+  home base, shared or symlinked, `userdel` failure); **SSH settings** (effective values shown, port change
+  with the byte-for-byte backup, the line above the `Include`, mode kept, `sshd -t` before the restart,
+  old `Port` lines disabled, one managed block after repeated changes, no-op re-run, invalid, busy and
+  declined ports, a failing `sshd -t` after the change rolls back without a restart, an already broken
+  config refused, a failing or repeatedly failing restart, a port that is not listening, socket
+  activation, a drop-in that still adds a port, PermitRootLogin and PasswordAuthentication warnings and the
+  stronger confirmations, the cloud-init drop-in beaten, a Match block left alone and warned about, the
+  keyboard-interactive note, no `sshd`, no config file, unsupported systems, all five supported
+  systems); **Add SSH key** (new file with modes 700/600 and `chown uid:gid`, append with a repaired
+  newline and a byte-for-byte backup, duplicates, a private key refused (assembled at run time) and never
+  echoed, PuTTY keys, ten kinds of invalid key, every accepted key type, unknown user, missing home,
+  symlinked `.ssh` and `authorized_keys`, failing `chown`, root, unsupported systems). Source rules: no
+  `/etc/shadow`, no download, no home removal other than `userdel -r`, `passwd` only as
+  `passwd -- <name>`, no `read -s` besides the key prompt and the drain, no `sed`/`awk`/`grep`/`ssh-keygen`.
+  Each assertion was checked to fail when the behaviour it covers is broken (a scripted mutation run
+  removed, one at a time, each refusal, confirmation, backup, `sshd -t`, verification, rollback, `chown`,
+  `chmod` and private-key check).
   It touches nothing outside its temp dir and uses no network.
+  `tests/lint.sh` additionally checks that the SSH and Users code never touches `/etc/shadow`, stores no key
+  material and downloads nothing.
   `tests/lint.sh` additionally checks that the OS allowlist block is identical
   in `ezvps` and `install.sh` and lists exactly the five supported systems, that
   the nginx.org suite is not hardcoded, that the repository URL is the stable
