@@ -30,6 +30,7 @@ rejected.
 | Nginx (nginx.org stable 1.30+) | yes (`packages/debian`, `bookworm`) | yes (`packages/debian`, `trixie`) | yes (`packages/ubuntu`, `jammy`) | yes (`packages/ubuntu`, `noble`) | yes (`packages/ubuntu`, `resolute`) |
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | Backpack, ctunnel, Lazyports (x86_64 and aarch64 only) | yes | yes | yes | yes | yes |
+| Firewall (whichever of ufw, firewalld, nftables, iptables is present) | yes | yes | yes | yes | yes |
 | L2TP | see below | yes | see below | see below | see below |
 
 **L2TP is gated separately.** The L2TP menu item launches the separate ezl2tp
@@ -39,8 +40,8 @@ system in the table the L2TP item prints a clear message, installs and
 launches nothing, and returns to the menu.
 
 > **Status: v0.0.1 in development.** **L2TP**, **3x-ui**, **Backpack**,
-> **ctunnel**, **Nginx**, **Certificates**, **Lazyports** and **SSH and Users** work so far. The other
-> menu items (Firewall, Backup, Check For Updates, Uninstall) are still pending:
+> **ctunnel**, **Nginx**, **Certificates**, **Lazyports**, **SSH and Users** and **Firewall** work so far. The other
+> menu items (Backup, Check For Updates, Uninstall) are still pending:
 > they print "not implemented yet" and return to the menu. They arrive in
 > later releases, one module per PR. See [SPEC.md](SPEC.md).
 
@@ -332,6 +333,51 @@ The pin, the HTTPS site layout and the details are in [SPEC.md](SPEC.md) section
 
 Details, the exact refusals and the limits are in [SPEC.md](SPEC.md) section 6.8.
 
+### Firewall
+
+`ezvps` -> `9` opens a submenu:
+
+```
+ 1) Show firewall status
+ 2) List rules
+ 3) Allow port
+ 4) Remove rule
+ 0) Back
+```
+
+ezvps uses the firewall that is **already on the server** and never installs one. The backend is the
+first of these whose command exists, in this fixed order:
+
+1. **ufw** (`ufw`)
+2. **firewalld** (`firewall-cmd`)
+3. **nftables** (`nft`)
+4. **iptables** (`iptables`)
+
+Only that backend's own documented commands are used. If none of the four exists, ezvps says so and
+returns to the menu without changing anything.
+
+* **Show firewall status** shows whether the backend is enabled or disabled and the default policy it
+  reports. (nftables and iptables have no on/off switch: "enabled" means filtering rules or a restrictive
+  default policy are loaded.)
+* **List rules** is read-only. One rule per row in the backend's own order: ID, action, protocol, port or
+  service, source, and the rule as the backend reports it. iptables shows the IPv4 `INPUT` chain and
+  nftables its input chains; firewalld shows the ports, services and rich rules of the active zones.
+* **Allow port** asks for a port (1-65535, digits only) and `tcp` or `udp`, refuses a port that is
+  already allowed (also when a range, a service or an application profile covers it), warns before a port
+  that something is already listening on (and still lets you continue after a yes), shows the exact
+  command, asks, adds the rule through the backend, then **reads the rules back** and shows the result.
+* **Remove rule** lists the rules with their IDs, asks for **one** ID, asks for confirmation and removes
+  only that rule, then reads the rules back. It never removes all rules and never disables the firewall.
+  A rule that keeps **SSH** reachable (the SSH port from `sshd`, or the port of your current SSH session)
+  gets a separate warning and a second confirmation, because removing it can lock you out.
+
+Changes need root and a supported system. A disabled ufw or a firewalld that is not running is not
+changed (ezvps never enables or disables a firewall). Before a change, a text copy of the current rule
+listing is saved to `/var/backups/ezvps/`. nftables and iptables changes apply to the running firewall
+only: ezvps does not rewrite their saved configuration, so save them the way you usually do.
+
+Details and limits are in [SPEC.md](SPEC.md) section 6.9.
+
 ## Principles
 
 Check before installing. Back up before overwriting. Idempotent re-runs. No
@@ -342,7 +388,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports, SSH and Users against fakes, pending modules, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports, SSH and Users, Firewall against fakes, pending modules, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway VPS on each
