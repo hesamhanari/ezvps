@@ -3,9 +3,10 @@
 #
 # Implemented modules: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3), Certificates
 # (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH
-# and Users (PR 10) and Firewall (PR 11).
-# Every other module prints a clean "not implemented yet" message and returns
-# without failing.
+# and Users (PR 10), Firewall (PR 11) and Backup, Check For Updates and
+# Uninstall (PR 12): the panel is complete. A module that is ever added to the
+# registry before it is built prints a clean "not implemented yet" message and
+# returns without failing (module_not_implemented).
 #
 # Menu, L2TP and the rest of the script use bash builtins only. The 3x-ui
 # module also needs coreutils, systemctl and curl, the Nginx module needs
@@ -18,8 +19,11 @@
 # usermod, userdel, passwd, chown, sshd, systemctl and optionally ss and
 # apt-get (to offer the sudo package). The Firewall module needs coreutils and
 # the one backend it finds (ufw, firewall-cmd, nft or iptables), plus ss and
-# sshd when present. Each is checked with `command -v` before use and the
-# module degrades with a clear message.
+# sshd when present. Backup, Check For Updates and Uninstall need coreutils
+# (cp, mv, rm, mkdir, mktemp, date, chmod, stat, du), cmp, sha256sum, bash and,
+# for updates only, git; restoring nginx sites also uses nginx and systemctl.
+# Each is checked with `command -v` before use and the module degrades with a
+# clear message.
 
 set -uo pipefail
 
@@ -6269,6 +6273,1187 @@ module_firewall() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Backup, Check For Updates and Uninstall (ezvps itself; PR 12)
+#
+# These three items manage ezvps and nothing else. They never install, update
+# or remove nginx, 3x-ui, Backpack, ctunnel, Lazyports, ezl2tp, users or any
+# tool's own config. A backup is a directory
+#   /var/backups/ezvps/ezvps-backup.<UTC timestamp>-<NN>/   (mode 700)
+# holding a MANIFEST and some of:
+#   bin/ezvps       the ezvps script
+#   state/          the ezvps state files (/var/lib/ezvps)
+#   nginx-sites/    ezvps-made sites from nginx conf.d        (full backups)
+#   certs/          the certificate store /etc/ssl/ezvps      (full backups)
+# Every result is verified on the file system (byte compare, modes), never
+# taken from the success of the copy alone.
+# ---------------------------------------------------------------------------
+
+EZB_BACKUP_BASE="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
+EZB_STATE_DIR="${EZVPS_STATE_DIR:-/var/lib/ezvps}"
+EZB_BIN="${EZVPS_BIN_DIR:-/usr/local/bin}/ezvps"
+EZB_INSTALL_STATE="${EZB_STATE_DIR}/install.state"
+EZB_PREFIX="ezvps-backup"
+EZB_UPDATE_BRANCH="main"
+EZB_NAME_RE='^ezvps-backup\.[0-9]{8}-[0-9]{6}-[0-9]{2}$'
+
+EZB_LAST_PATH="" EZB_UNINSTALLED=0
+EZB_L_DIRS=() EZB_L_SKIPPED=0
+EZB_SITES=() EZB_NEW=()
+EZB_V_SCRIPT=0 EZB_V_STATE=() EZB_V_SITES=() EZB_V_CERTS=()
+UPD_INST_VERSION="" UPD_INST_COMMIT="" UPD_INST_WHY="" UPD_SOURCE=""
+UPD_LATEST_VERSION="" UPD_LATEST_COMMIT="" UPD_VERIFY_VERSION="" UPD_VERIFY_OUT=""
+UPD_TMP=""
+
+# --- checks that come before any of the three items --------------------------
+
+# The backup directory exists, is mode 700 and can be written to.
+ezb_backup_dir_ready() {
+    local probe
+    if ! { mkdir -p -- "$EZB_BACKUP_BASE" && chmod 700 -- "$EZB_BACKUP_BASE"; } 2>/dev/null; then
+        err "The backup directory ${EZB_BACKUP_BASE} cannot be created or set to mode 700. Nothing was changed."
+        return 1
+    fi
+    if ! probe="$(mktemp "${EZB_BACKUP_BASE}/.probe.XXXXXX" 2>/dev/null)"; then
+        err "The backup directory ${EZB_BACKUP_BASE} is not writable. Nothing was changed."
+        return 1
+    fi
+    rm -f -- "$probe"
+    return 0
+}
+
+# ezb_preflight <action> <read|write>: root, a supported system and, for anything
+# that writes, a writable backup directory. Read-only actions (list, check) must
+# not create the backup directory.
+ezb_preflight() {
+    require_root || return 1
+    require_supported_os "$1" || return 1
+    require_cmds cp mkdir mv rm rmdir mktemp date chmod cmp stat du || return 1
+    [[ "${2:-read}" == "write" ]] || return 0
+    ezb_backup_dir_ready
+}
+
+# --- small helpers -----------------------------------------------------------
+
+ezb_fmt_size() { # ezb_fmt_size <bytes>
+    local b="$1" t
+    if ((b < 1024)); then
+        printf '%d B' "$b"
+    elif ((b < 1048576)); then
+        t=$((b * 10 / 1024))
+        printf '%d.%d KiB' "$((t / 10))" "$((t % 10))"
+    else
+        t=$((b * 10 / 1048576))
+        printf '%d.%d MiB' "$((t / 10))" "$((t % 10))"
+    fi
+}
+
+ezb_plural() { # ezb_plural <n> <singular> [plural]
+    if (($1 == 1)); then printf '%d %s' "$1" "$2"; else printf '%d %s' "$1" "${3:-${2}s}"; fi
+}
+
+# ezb_count_files <dir>: regular files below it (recursive), dotfiles included.
+ezb_count_files() {
+    local e n=0 sub
+    for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        [[ -e "$e" || -L "$e" ]] || continue
+        if [[ -d "$e" && ! -L "$e" ]]; then
+            sub="$(ezb_count_files "$e")"
+            n=$((n + sub))
+        elif [[ -f "$e" ]]; then
+            n=$((n + 1))
+        fi
+    done
+    printf '%d' "$n"
+}
+
+# ezb_same_tree <src> <dst>: everything below src exists below dst, files byte for byte.
+ezb_same_tree() {
+    local e rel
+    for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        [[ -e "$e" || -L "$e" ]] || continue
+        rel="${e##*/}"
+        if [[ -L "$e" ]]; then
+            [[ -L "$2/$rel" ]] || return 1
+        elif [[ -d "$e" ]]; then
+            [[ -d "$2/$rel" ]] || return 1
+            ezb_same_tree "$e" "$2/$rel" || return 1
+        else
+            [[ -f "$2/$rel" ]] || return 1
+            cmp -s -- "$e" "$2/$rel" || return 1
+        fi
+    done
+    return 0
+}
+
+# ezb_put_file <src> <dst>: temp file next to the target + mv (atomic), mode and
+# owner kept. A target that did not exist is remembered in EZB_NEW for a rollback.
+ezb_put_file() {
+    local tmp
+    [[ -e "$2" || -L "$2" ]] || EZB_NEW+=("$2")
+    tmp="$(mktemp "${2%/*}/.ezb.XXXXXX")" || return 1
+    if cp -p -- "$1" "$tmp" && mv -f -- "$tmp" "$2"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# An ezvps-made nginx site: a regular file named <domain>.conf that carries the ezvps
+# marker for that same domain. Hand-written files are never read as ezvps's.
+ezb_site_managed() {
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    ngx_read_site "$1" || return 1
+    ((NGX_SITE_MANAGED == 1)) || return 1
+    ngx_valid_domain "$NGX_SITE_DOMAIN" || return 1
+    [[ "${1##*/}" == "${NGX_SITE_DOMAIN}.conf" ]]
+}
+
+ezb_find_sites() { # fills EZB_SITES with the paths of the ezvps-made sites in conf.d
+    local f
+    EZB_SITES=()
+    [[ -d "$NGX_CONFD" ]] || return 0
+    for f in "$NGX_CONFD"/*.conf; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        ezb_site_managed "$f" && EZB_SITES+=("$f")
+    done
+    return 0
+}
+
+# --- what is installed, and from where ---------------------------------------
+
+# install.state: written by install.sh and by Update ezvps (plain key=value,
+# read without sourcing): version, commit, source, sha256, installed.
+upd_state_get() { # upd_state_get <key>
+    local k v
+    [[ -r "$EZB_INSTALL_STATE" ]] || return 0
+    while IFS='=' read -r k v; do
+        if [[ "$k" == "$1" ]]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    done <"$EZB_INSTALL_STATE"
+    return 0
+}
+
+upd_file_version() { # upd_file_version <script>: its EZVPS_VERSION, read as text (never executed)
+    local line v
+    [[ -r "$1" ]] || return 0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^EZVPS_VERSION=\"([A-Za-z0-9._+-]+)\"$ ]]; then
+            v="${BASH_REMATCH[1]}"
+            printf '%s' "$v"
+            return 0
+        fi
+    done <"$1"
+    return 0
+}
+
+# The installed version comes from the installed file. The commit is trusted only when
+# install.state records one AND the installed file still has the recorded sha256;
+# otherwise it is unknown, never guessed.
+upd_installed_info() {
+    local sha st_commit st_sha
+    UPD_INST_VERSION="" UPD_INST_COMMIT="" UPD_INST_WHY="" UPD_SOURCE="$(upd_state_get source)"
+    if [[ -f "$EZB_BIN" ]]; then
+        UPD_INST_VERSION="$(upd_file_version "$EZB_BIN")"
+    fi
+    st_commit="$(upd_state_get commit)"
+    st_sha="$(upd_state_get sha256)"
+    if [[ ! -f "$EZB_BIN" ]]; then
+        UPD_INST_WHY="ezvps is not installed at ${EZB_BIN}"
+    elif [[ ! -f "$EZB_INSTALL_STATE" ]]; then
+        UPD_INST_WHY="no install record in ${EZB_STATE_DIR}: this ezvps was installed before versions were recorded"
+    elif [[ ! "$st_commit" =~ ^[0-9a-f]{40}$ ]]; then
+        UPD_INST_WHY="the install record has no commit (installed from a copy that is not a git checkout, or an unclean one)"
+    elif [[ ! "$st_sha" =~ ^[0-9a-f]{64}$ ]] || ! have_cmd sha256sum; then
+        UPD_INST_WHY="the install record cannot be checked against the installed script"
+    else
+        sha="$(sha256sum "$EZB_BIN" 2>/dev/null)"
+        sha="${sha%% *}"
+        if [[ "$sha" != "$st_sha" ]]; then
+            UPD_INST_WHY="the installed script differs from the one the install record describes"
+        else
+            UPD_INST_COMMIT="$st_commit"
+        fi
+    fi
+    return 0
+}
+
+# --- backup: create ----------------------------------------------------------
+
+# A fresh mode-700 directory ezvps-backup.<UTC time>-<NN> (NN counts backups made in the same second).
+ezb_new_dir() {
+    local stamp n=1 d
+    EZB_LAST_PATH=""
+    stamp="$(date -u +%Y%m%d-%H%M%S)"
+    while ((n <= 99)); do
+        printf -v d '%s/%s.%s-%02d' "$EZB_BACKUP_BASE" "$EZB_PREFIX" "$stamp" "$n"
+        if mkdir -m 700 -- "$d" 2>/dev/null; then
+            EZB_LAST_PATH="$d"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+    return 1
+}
+
+# ezb_fill <dir> <reason> <full|core>: copy and verify. Sets EZB_C_SCRIPT, EZB_C_STATE,
+# EZB_C_SITES (names), EZB_C_CERTS (domains).
+EZB_C_SCRIPT=0 EZB_C_STATE=0 EZB_C_SITES=() EZB_C_CERTS=()
+ezb_fill() {
+    local d="$1" reason="$2" scope="$3" f e name mode
+    EZB_C_SCRIPT=0 EZB_C_STATE=0 EZB_C_SITES=() EZB_C_CERTS=()
+    if [[ -f "$EZB_BIN" ]]; then
+        mkdir -m 700 -- "$d/bin" && cp -p -- "$EZB_BIN" "$d/bin/ezvps" || return 1
+        cmp -s -- "$EZB_BIN" "$d/bin/ezvps" || return 1
+        EZB_C_SCRIPT=1
+    fi
+    if [[ -d "$EZB_STATE_DIR" ]]; then
+        EZB_C_STATE="$(ezb_count_files "$EZB_STATE_DIR")"
+        if ((EZB_C_STATE > 0)); then
+            mkdir -m 700 -- "$d/state" && cp -a -- "$EZB_STATE_DIR/." "$d/state/" && chmod 700 -- "$d/state" || return 1
+            ezb_same_tree "$EZB_STATE_DIR" "$d/state" || return 1
+        fi
+    fi
+    if [[ "$scope" == "full" ]]; then
+        ezb_find_sites
+        if ((${#EZB_SITES[@]} > 0)); then
+            mkdir -m 700 -- "$d/nginx-sites" || return 1
+            for f in "${EZB_SITES[@]}"; do
+                name="${f##*/}"
+                cp -p -- "$f" "$d/nginx-sites/$name" || return 1
+                cmp -s -- "$f" "$d/nginx-sites/$name" || return 1
+                EZB_C_SITES+=("$name")
+            done
+        fi
+        if [[ -d "$CERT_DIR" && ! -L "$CERT_DIR" ]] && (($(ezb_count_files "$CERT_DIR") > 0)); then
+            mkdir -m 700 -- "$d/certs" && cp -a -- "$CERT_DIR/." "$d/certs/" || return 1
+            chmod 700 -- "$d/certs" || return 1
+            ezb_same_tree "$CERT_DIR" "$d/certs" || return 1
+            for e in "$d/certs"/*; do
+                [[ -d "$e" && ! -L "$e" ]] && EZB_C_CERTS+=("${e##*/}")
+            done
+        fi
+    fi
+    upd_installed_info
+    {
+        printf 'format=1\n'
+        printf 'created=%s\n' "${d##*/"${EZB_PREFIX}".}"
+        printf 'reason=%s\n' "$reason"
+        printf 'scope=%s\n' "$scope"
+        printf 'ezvps_version=%s\n' "${UPD_INST_VERSION:-unknown}"
+        printf 'ezvps_commit=%s\n' "${UPD_INST_COMMIT:-unknown}"
+    } >"$d/MANIFEST" || return 1
+    chmod 600 -- "$d/MANIFEST" || return 1
+    mode="$(stat -c %a -- "$d" 2>/dev/null)"
+    [[ "$mode" == "700" ]] || return 1
+    return 0
+}
+
+# ezb_create <reason> <full|core>: a verified backup of the current state. Sets
+# EZB_LAST_PATH. Prints what went in. Non-zero (and a message) when anything failed,
+# in which case this run's own incomplete directory is removed and nothing else is.
+ezb_create() {
+    local d s
+    ezb_backup_dir_ready || return 1
+    if ! ezb_new_dir; then
+        err "Cannot create a new backup directory in ${EZB_BACKUP_BASE}."
+        return 1
+    fi
+    d="$EZB_LAST_PATH"
+    if ! ezb_fill "$d" "$1" "$2"; then
+        err "The backup to ${d} could not be completed and verified; it was discarded. Nothing was changed."
+        rm -rf -- "$d"
+        EZB_LAST_PATH=""
+        return 1
+    fi
+    info "Backup created and verified: ${d}"
+    info "Included:"
+    if ((EZB_C_SCRIPT == 1)); then info "  ezvps script:   ${EZB_BIN}"; else info "  ezvps script:   not present at ${EZB_BIN}"; fi
+    if ((EZB_C_STATE > 0)); then
+        info "  ezvps state:    $(ezb_plural "$EZB_C_STATE" file) from ${EZB_STATE_DIR}"
+    else
+        info "  ezvps state:    none found in ${EZB_STATE_DIR}"
+    fi
+    if [[ "$2" == "full" ]]; then
+        if ((${#EZB_C_SITES[@]} > 0)); then
+            info "  nginx sites:    $(ezb_plural "${#EZB_C_SITES[@]}" "ezvps-made site") from ${NGX_CONFD}: ${EZB_C_SITES[*]}"
+        else
+            info "  nginx sites:    no ezvps-made sites in ${NGX_CONFD}"
+        fi
+        if ((${#EZB_C_CERTS[@]} > 0)); then
+            s="$(ezb_plural "${#EZB_C_CERTS[@]}" "domain")"
+            info "  certificates:   ${s} from ${CERT_DIR}: ${EZB_C_CERTS[*]} (private keys are copied, never printed)"
+        else
+            info "  certificates:   none in ${CERT_DIR}"
+        fi
+    else
+        info "  (nginx sites and certificates are not part of this backup: this action does not change them)"
+    fi
+    info "The backup directory is mode 700 and ezvps never deletes backups."
+    return 0
+}
+
+ezb_create_cmd() {
+    ezb_preflight "Create backup" write || return 0
+    info ""
+    info "ezvps will back up its own files to ${EZB_BACKUP_BASE}/ (mode 700):"
+    info "  the ezvps script (${EZB_BIN}), the ezvps state files (${EZB_STATE_DIR}),"
+    info "  the ezvps-made nginx sites (${NGX_CONFD}) and the certificates (${CERT_DIR}) if present."
+    info "Other tools' own config (3x-ui, Backpack, ...), users and SSH settings are not included."
+    info ""
+    ezb_create manual full || true
+    return 0
+}
+
+# --- backup: list ------------------------------------------------------------
+
+# ezb_load_list: EZB_L_DIRS = the backups ezvps made (valid name, directory, MANIFEST), newest first.
+ezb_load_list() {
+    local LC_ALL=C e name i j tmp
+    EZB_L_DIRS=() EZB_L_SKIPPED=0
+    [[ -d "$EZB_BACKUP_BASE" ]] || return 0
+    for e in "$EZB_BACKUP_BASE"/"${EZB_PREFIX}".*; do
+        [[ -e "$e" || -L "$e" ]] || continue
+        name="${e##*/}"
+        if [[ -d "$e" && ! -L "$e" && "$name" =~ $EZB_NAME_RE && -f "$e/MANIFEST" && ! -L "$e/MANIFEST" ]]; then
+            EZB_L_DIRS+=("$e")
+        else
+            EZB_L_SKIPPED=$((EZB_L_SKIPPED + 1))
+        fi
+    done
+    for ((i = 1; i < ${#EZB_L_DIRS[@]}; i++)); do
+        tmp="${EZB_L_DIRS[$i]}"
+        j=$((i - 1))
+        while ((j >= 0)) && [[ "${EZB_L_DIRS[$j]}" < "$tmp" ]]; do
+            EZB_L_DIRS[j + 1]="${EZB_L_DIRS[$j]}"
+            j=$((j - 1))
+        done
+        EZB_L_DIRS[j + 1]="$tmp"
+    done
+    return 0
+}
+
+ezb_manifest_get() { # ezb_manifest_get <dir> <key>
+    local k v
+    while IFS='=' read -r k v; do
+        if [[ "$k" == "$2" ]]; then
+            printf '%s' "${v//[^A-Za-z0-9._+ -]/}"
+            return 0
+        fi
+    done <"$1/MANIFEST"
+    return 0
+}
+
+ezb_contents_summary() { # ezb_contents_summary <dir>: what is really inside, counted on disk
+    local parts="" n e
+    [[ -f "$1/bin/ezvps" ]] && parts="script"
+    n=0
+    [[ -d "$1/state" ]] && n="$(ezb_count_files "$1/state")"
+    ((n > 0)) && parts+="${parts:+, }$(ezb_plural "$n" "state file")"
+    n=0
+    for e in "$1/nginx-sites"/*.conf; do [[ -f "$e" ]] && n=$((n + 1)); done
+    ((n > 0)) && parts+="${parts:+, }$(ezb_plural "$n" "nginx site")"
+    n=0
+    for e in "$1/certs"/*; do [[ -d "$e" ]] && n=$((n + 1)); done
+    ((n > 0)) && parts+="${parts:+, }$(ezb_plural "$n" "certificate domain")"
+    printf '%s' "${parts:-nothing}"
+}
+
+ezb_print_list() {
+    local i d name ts size reason summary parts
+    info "ezvps backups in ${EZB_BACKUP_BASE} (newest first, times are UTC):"
+    for i in "${!EZB_L_DIRS[@]}"; do
+        d="${EZB_L_DIRS[$i]}"
+        name="${d##*/}"
+        ts="${name#"${EZB_PREFIX}".}"
+        ts="${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:9:2}:${ts:11:2}:${ts:13:2}"
+        size="$(du -sb -- "$d" 2>/dev/null)"
+        size="$(ezb_fmt_size "${size%%[[:space:]]*}")"
+        reason="$(ezb_manifest_get "$d" reason)"
+        summary="$(ezb_contents_summary "$d")"
+        printf '%2d) %s  %10s  %-12s  %s\n' "$((i + 1))" "$ts" "$size" "${reason:-unknown}" "$summary"
+        info "      ${d}"
+    done
+    if ((EZB_L_SKIPPED > 0)); then
+        info "(Not listed: $(ezb_plural "$EZB_L_SKIPPED" entry entries) named ${EZB_PREFIX}.* that are incomplete or unrecognised.)"
+    fi
+    return 0
+}
+
+ezb_list_cmd() {
+    ezb_preflight "List backups" read || return 0
+    ezb_load_list
+    info ""
+    if ((${#EZB_L_DIRS[@]} == 0)); then
+        info "No ezvps backups found in ${EZB_BACKUP_BASE}."
+        if ((EZB_L_SKIPPED > 0)); then
+            info "(Not listed: $(ezb_plural "$EZB_L_SKIPPED" entry entries) named ${EZB_PREFIX}.* that are incomplete or unrecognised.)"
+        fi
+    else
+        ezb_print_list
+    fi
+    info "Backups made by other ezvps modules (x-ui.*, nginx-*, ...) are not listed here."
+    return 0
+}
+
+# --- backup: restore ---------------------------------------------------------
+
+# ezb_validate_backup <dir>: refuses a backup with anything unexpected in it, before
+# anything is changed. Fills EZB_V_*.
+ezb_validate_backup() {
+    local d="$1" e name f bad=0 out
+    EZB_V_SCRIPT=0 EZB_V_STATE=() EZB_V_SITES=() EZB_V_CERTS=()
+    if [[ "$(ezb_manifest_get "$d" format)" != "1" ]]; then
+        err "${d}: unknown backup format."
+        return 1
+    fi
+    if [[ -e "$d/bin" || -L "$d/bin" ]]; then
+        if [[ -d "$d/bin" && ! -L "$d/bin" && -f "$d/bin/ezvps" && ! -L "$d/bin/ezvps" ]]; then
+            if ! out="$(bash -n "$d/bin/ezvps" 2>&1)"; then
+                err "The ezvps script in this backup has a syntax error; it will not be restored: ${out%%$'\n'*}"
+                bad=1
+            else
+                out="$(EZVPS_ALLOW_NONROOT=1 bash "$d/bin/ezvps" --version </dev/null 2>&1)"
+                if [[ "$out" =~ ^ezvps\ [A-Za-z0-9._+-]+$ ]]; then
+                    EZB_V_SCRIPT=1
+                else
+                    err "The ezvps script in this backup does not report a version; it will not be restored."
+                    bad=1
+                fi
+            fi
+        else
+            err "Unexpected entry bin in this backup."
+            bad=1
+        fi
+    fi
+    if [[ -e "$d/state" || -L "$d/state" ]]; then
+        if [[ -d "$d/state" && ! -L "$d/state" ]]; then
+            for e in "$d/state"/* "$d/state"/.[!.]*; do
+                [[ -e "$e" || -L "$e" ]] || continue
+                name="${e##*/}"
+                if [[ -f "$e" && ! -L "$e" && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                    EZB_V_STATE+=("$name")
+                else
+                    err "Unexpected entry in the state part of this backup."
+                    bad=1
+                fi
+            done
+        else
+            err "Unexpected entry state in this backup."
+            bad=1
+        fi
+    fi
+    if [[ -e "$d/nginx-sites" || -L "$d/nginx-sites" ]]; then
+        if [[ -d "$d/nginx-sites" && ! -L "$d/nginx-sites" ]]; then
+            for e in "$d/nginx-sites"/* "$d/nginx-sites"/.[!.]*; do
+                [[ -e "$e" || -L "$e" ]] || continue
+                if ezb_site_managed "$e"; then
+                    EZB_V_SITES+=("${e##*/}")
+                else
+                    err "Unexpected entry in the nginx sites part of this backup (not an ezvps-made <domain>.conf)."
+                    bad=1
+                fi
+            done
+        else
+            err "Unexpected entry nginx-sites in this backup."
+            bad=1
+        fi
+    fi
+    if [[ -e "$d/certs" || -L "$d/certs" ]]; then
+        if [[ -d "$d/certs" && ! -L "$d/certs" ]]; then
+            for e in "$d/certs"/* "$d/certs"/.[!.]*; do
+                [[ -e "$e" || -L "$e" ]] || continue
+                name="${e##*/}"
+                if [[ -d "$e" && ! -L "$e" ]] && ngx_valid_domain "$name"; then
+                    for f in "$e"/* "$e"/.[!.]*; do
+                        [[ -e "$f" || -L "$f" ]] || continue
+                        if [[ ! -f "$f" || -L "$f" || ! "${f##*/}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                            err "Unexpected entry in the certificate part of this backup."
+                            bad=1
+                        fi
+                    done
+                    EZB_V_CERTS+=("$name")
+                else
+                    err "Unexpected entry in the certificate part of this backup (not a <domain> directory)."
+                    bad=1
+                fi
+            done
+        else
+            err "Unexpected entry certs in this backup."
+            bad=1
+        fi
+    fi
+    ((bad == 0))
+}
+
+# Newly created paths are removed again, deepest first (directories only when empty).
+ezb_undo_new() {
+    local i p
+    for ((i = ${#EZB_NEW[@]} - 1; i >= 0; i--)); do
+        p="${EZB_NEW[$i]}"
+        if [[ -d "$p" && ! -L "$p" ]]; then
+            rmdir -- "$p" 2>/dev/null
+        else
+            rm -f -- "$p"
+        fi
+    done
+    EZB_NEW=()
+    return 0
+}
+
+# ezb_apply_certs <backup dir>: certs/<domain>/<file> into the store (dirs 700, privkey.pem 600).
+EZB_A_CERT_FILES=0
+ezb_apply_certs() {
+    local src="$1/certs" dom f dest rc=0
+    EZB_A_CERT_FILES=0
+    [[ -d "$src" ]] || return 0
+    if [[ ! -d "$CERT_DIR" ]]; then
+        mkdir -p -- "$CERT_DIR" || return 1
+        EZB_NEW+=("$CERT_DIR")
+        chmod 700 -- "$CERT_DIR" || return 1
+    fi
+    for dom in "$src"/*; do
+        [[ -d "$dom" ]] || continue
+        dest="$CERT_DIR/${dom##*/}"
+        if [[ ! -d "$dest" ]]; then
+            mkdir -m 700 -- "$dest" || return 1
+            EZB_NEW+=("$dest")
+        fi
+        for f in "$dom"/*; do
+            [[ -f "$f" ]] || continue
+            if ezb_put_file "$f" "$dest/${f##*/}"; then
+                [[ "${f##*/}" == "privkey.pem" ]] && chmod 600 -- "$dest/${f##*/}"
+                EZB_A_CERT_FILES=$((EZB_A_CERT_FILES + 1))
+            else
+                err "Could not restore ${dest}/${f##*/}."
+                rc=1
+            fi
+        done
+    done
+    return "$rc"
+}
+
+# ezb_apply_sites <backup dir> <names...>: into conf.d. A hand-written file or a symlink
+# with the same name is never overwritten. EZB_A_SITES / EZB_A_SKIPPED list the outcome.
+EZB_A_SITES=() EZB_A_SKIPPED=()
+ezb_apply_sites() {
+    local src="$1/nginx-sites" name rc=0
+    shift
+    EZB_A_SITES=() EZB_A_SKIPPED=()
+    for name in "$@"; do
+        if [[ -e "$NGX_CONFD/$name" || -L "$NGX_CONFD/$name" ]] && ! ezb_site_managed "$NGX_CONFD/$name"; then
+            warn "${NGX_CONFD}/${name} exists and was not made by ezvps; it is not overwritten."
+            EZB_A_SKIPPED+=("$name")
+            continue
+        fi
+        if ezb_put_file "$src/$name" "$NGX_CONFD/$name"; then
+            EZB_A_SITES+=("$name")
+        else
+            err "Could not restore ${NGX_CONFD}/${name}."
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# Everything restored in step 1 (certificates, sites) is read back from the file system.
+ezb_verify_step1() { # ezb_verify_step1 <backup dir>
+    local d="$1" name f
+    if [[ -d "$d/certs" ]]; then
+        ezb_same_tree "$d/certs" "$CERT_DIR" || return 1
+        for f in "$d/certs"/*/privkey.pem; do
+            [[ -f "$f" ]] || continue
+            [[ "$(stat -c %a -- "$CERT_DIR/${f#"$d"/certs/}" 2>/dev/null)" == "600" ]] || return 1
+        done
+    fi
+    for name in "${EZB_A_SITES[@]}"; do
+        cmp -s -- "$d/nginx-sites/$name" "$NGX_CONFD/$name" || return 1
+    done
+    return 0
+}
+
+# Put certificates and sites back as the pre-restore backup had them.
+ezb_rollback_step1() { # ezb_rollback_step1 <pre-restore backup>
+    local pre="$1" names=() e ok=1
+    ezb_undo_new
+    for e in "$pre/nginx-sites"/*.conf; do [[ -f "$e" ]] && names+=("${e##*/}"); done
+    ezb_apply_certs "$pre" || ok=0
+    ezb_apply_sites "$pre" "${names[@]}" || ok=0
+    EZB_NEW=()
+    ezb_verify_step1_after_rollback "$pre" || ok=0
+    ((ok == 1))
+}
+ezb_verify_step1_after_rollback() {
+    local e
+    [[ -d "$1/certs" ]] && { ezb_same_tree "$1/certs" "$CERT_DIR" || return 1; }
+    for e in "$1/nginx-sites"/*.conf; do
+        [[ -f "$e" ]] || continue
+        cmp -s -- "$e" "$NGX_CONFD/${e##*/}" || return 1
+    done
+    return 0
+}
+
+ezb_restore_cmd() {
+    local pick sel reply pre name nsites=0 do_sites=0 step1_ok=1 f failed=0 certs_n=0
+    local restored=() notes=()
+    ezb_preflight "Restore backup" write || return 0
+    ezb_load_list
+    info ""
+    if ((${#EZB_L_DIRS[@]} == 0)); then
+        info "No ezvps backups found in ${EZB_BACKUP_BASE}. Nothing to restore."
+        return 0
+    fi
+    ezb_print_list
+    info ""
+    if ! read -r -p "Number of the backup to restore (empty to cancel): " pick; then
+        info ""
+        return 0
+    fi
+    pick="${pick//[[:space:]]/}"
+    [[ -z "$pick" ]] && {
+        info "Cancelled. Nothing was changed."
+        return 0
+    }
+    if [[ ! "$pick" =~ ^[0-9]{1,4}$ ]] || ((10#$pick < 1 || 10#$pick > ${#EZB_L_DIRS[@]})); then
+        err "That is not one of the listed backups. Nothing was changed."
+        return 0
+    fi
+    sel="${EZB_L_DIRS[$((10#$pick - 1))]}"
+    ezb_validate_backup "$sel" || {
+        err "Nothing was changed."
+        return 0
+    }
+    info ""
+    info "Selected: ${sel}"
+    info "A restore will put back:"
+    ((EZB_V_SCRIPT == 1)) && info "  the ezvps script           -> ${EZB_BIN}"
+    ((${#EZB_V_STATE[@]} > 0)) && info "  ezvps state files          -> ${EZB_STATE_DIR}: ${EZB_V_STATE[*]}"
+    ((${#EZB_V_CERTS[@]} > 0)) && info "  certificates (with keys)   -> ${CERT_DIR}: ${EZB_V_CERTS[*]}"
+    ((${#EZB_V_SITES[@]} > 0)) && info "  ezvps-made nginx sites     -> ${NGX_CONFD}: ${EZB_V_SITES[*]}"
+    if ((EZB_V_SCRIPT == 0 && ${#EZB_V_STATE[@]} == 0 && ${#EZB_V_CERTS[@]} == 0 && ${#EZB_V_SITES[@]} == 0)); then
+        info "  nothing: this backup is empty."
+        info "Nothing was changed."
+        return 0
+    fi
+    info "Files with the same name are overwritten; files that are not in the backup are left as they are."
+    info "The current state is backed up first. If an nginx config test fails after the sites are"
+    info "restored, the certificates and sites are put back as they were and nginx is not reloaded."
+    if ! IFS= read -r -p "Type YES to restore this backup: " reply; then
+        info ""
+        info "Nothing was changed."
+        return 0
+    fi
+    if [[ "$reply" != "YES" ]]; then
+        info "Cancelled (only the exact word YES confirms). Nothing was changed."
+        return 0
+    fi
+
+    info ""
+    info "Backing up the current state first..."
+    ezb_create pre-restore full || {
+        err "Restore cancelled: the current state could not be backed up. Nothing was changed."
+        return 0
+    }
+    pre="$EZB_LAST_PATH"
+
+    # Sites need nginx: its config dir and the nginx command (for the config test).
+    nsites=${#EZB_V_SITES[@]}
+    if ((nsites > 0)); then
+        if [[ -d "$NGX_CONFD" ]] && have_cmd nginx; then
+            do_sites=1
+        else
+            warn "nginx (or ${NGX_CONFD}) is not present, so the nginx sites in this backup are NOT restored."
+            notes+=("nginx sites: not restored (nginx or ${NGX_CONFD} is missing)")
+        fi
+    fi
+
+    # Step 1: certificates, then sites, then the nginx config test.
+    EZB_NEW=()
+    EZB_A_SITES=() EZB_A_SKIPPED=()
+    ezb_apply_certs "$sel" || step1_ok=0
+    certs_n=$EZB_A_CERT_FILES
+    if ((do_sites == 1)); then
+        ezb_apply_sites "$sel" "${EZB_V_SITES[@]}" || step1_ok=0
+    fi
+    ezb_verify_step1 "$sel" || step1_ok=0
+    if ((step1_ok == 1 && ${#EZB_A_SITES[@]} > 0)); then
+        if ngx_config_test; then
+            info "nginx -t passed after restoring the sites."
+        else
+            step1_ok=0
+            err "nginx -t FAILED after restoring the sites:"
+            ngx_print_test_output
+        fi
+    fi
+    if ((step1_ok == 0)); then
+        err "Rolling back the certificates and sites restored in this run..."
+        if ezb_rollback_step1 "$pre"; then
+            info "Rolled back: certificates and sites are as they were (verified against ${pre})."
+            if ((do_sites == 1)); then
+                if ngx_config_test; then info "nginx -t passes again."; else
+                    err "nginx -t still fails; this was already so, or check it by hand:"
+                    ngx_print_test_output
+                fi
+            fi
+        else
+            err "The rollback could not be verified. The state before the restore is in ${pre}."
+        fi
+        err "Restore failed. nginx was not reloaded; the script and state files were not changed."
+        return 0
+    fi
+    if ((${#EZB_A_SITES[@]} > 0)); then
+        ngx_reload
+    elif ((certs_n > 0)); then
+        notes+=("certificates were restored; nginx was not reloaded (use Nginx > Restart if a site uses them)")
+    fi
+    ((certs_n > 0)) && restored+=("certificates: $(ezb_plural "$certs_n" file) in ${CERT_DIR} (verified, keys mode 600)")
+    ((${#EZB_A_SITES[@]} > 0)) && restored+=("nginx sites: ${EZB_A_SITES[*]} (nginx -t passed)")
+    ((${#EZB_A_SKIPPED[@]} > 0)) && notes+=("nginx sites not overwritten (not made by ezvps): ${EZB_A_SKIPPED[*]}")
+
+    # Step 2: state files, then the script.
+    if ((${#EZB_V_STATE[@]} > 0)); then
+        if [[ ! -d "$EZB_STATE_DIR" ]]; then mkdir -p -- "$EZB_STATE_DIR" && chmod 700 -- "$EZB_STATE_DIR"; fi
+        for name in "${EZB_V_STATE[@]}"; do
+            if ezb_put_file "$sel/state/$name" "$EZB_STATE_DIR/$name" && cmp -s -- "$sel/state/$name" "$EZB_STATE_DIR/$name"; then
+                :
+            else
+                err "Could not restore ${EZB_STATE_DIR}/${name}."
+                failed=1
+            fi
+        done
+        ((failed == 0)) && restored+=("state files: ${EZB_V_STATE[*]} in ${EZB_STATE_DIR} (verified)")
+    fi
+    if ((EZB_V_SCRIPT == 1)); then
+        if ezb_install_script "$sel/bin/ezvps" && cmp -s -- "$sel/bin/ezvps" "$EZB_BIN" && upd_verify_script "$EZB_BIN"; then
+            restored+=("ezvps script: ${EZB_BIN} (version ${UPD_VERIFY_VERSION}, verified)")
+        else
+            err "The restored ezvps script did not verify; putting the previous one back."
+            if [[ -f "$pre/bin/ezvps" ]] && ezb_install_script "$pre/bin/ezvps" && cmp -s -- "$pre/bin/ezvps" "$EZB_BIN"; then
+                info "The previous ezvps script is back (verified)."
+            else
+                err "Could not put the previous script back. It is in ${pre}/bin/ezvps."
+            fi
+            failed=1
+        fi
+    fi
+    info ""
+    if ((failed == 1)); then
+        err "The restore finished with problems (see above). The state before it is in ${pre}."
+    else
+        info "Restored from ${sel}:"
+    fi
+    for f in "${restored[@]}"; do info "  restored: ${f}"; done
+    for f in "${notes[@]}"; do info "  note:     ${f}"; done
+    info "Nothing that is not in the backup was deleted. The state before the restore is in ${pre}."
+    return 0
+}
+
+ezb_backup_menu() {
+    local choice i labels=("Create backup" "List backups" "Restore backup")
+    while true; do
+        info ""
+        info "${C_BOLD}Backup${C_RESET}"
+        info ""
+        for i in "${!labels[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) ezb_create_cmd || true ;;
+            2) ezb_list_cmd || true ;;
+            3) ezb_restore_cmd || true ;;
+            *) warn "Invalid choice: ${choice:-<empty>}" ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
+module_backup() { ezb_backup_menu; }
+
+# --- check for updates / update ----------------------------------------------
+
+# The update source is the git remote the checkout was cloned from (recorded by
+# install.sh), so nothing private is hardcoded and nothing is downloaded anonymously:
+# git uses the user's own authentication. Accepted: https://host/path (no credentials in
+# the address), ssh://[user@]host/path and user@host:path. Never http, git, file or a path.
+upd_valid_source() {
+    local u="$1"
+    ((${#u} <= 300)) || return 1
+    [[ "$u" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?/[A-Za-z0-9._~+-]+(/[A-Za-z0-9._~+-]+)*$ ]] && return 0
+    [[ "$u" =~ ^ssh://([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?/[A-Za-z0-9._~+-]+(/[A-Za-z0-9._~+-]+)*$ ]] && return 0
+    [[ "$u" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._~+-]+(/[A-Za-z0-9._~+-]+)*$ ]] && return 0
+    return 1
+}
+
+upd_resolve_source() {
+    local u
+    if upd_valid_source "$UPD_SOURCE"; then
+        return 0
+    fi
+    if [[ -n "$UPD_SOURCE" ]]; then
+        warn "The repository address recorded at install time is not an accepted one; it is ignored."
+    else
+        info "ezvps does not know which repository it was installed from (no install record)."
+    fi
+    info "Enter the address of the private ezvps repository, the same one you cloned to run install.sh:"
+    info "  git@github.com:<owner>/ezvps.git   or   https://github.com/<owner>/ezvps.git"
+    info "Do not put a token or password in it; git asks for credentials itself."
+    if ! read -r -p "Repository (empty to cancel): " u; then
+        info ""
+        return 1
+    fi
+    u="${u//[[:space:]]/}"
+    if [[ -z "$u" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 1
+    fi
+    if ! upd_valid_source "$u"; then
+        err "That is not an accepted repository address (https://host/owner/repo, ssh://host/owner/repo or user@host:owner/repo, with no credentials in it). Nothing was changed."
+        return 1
+    fi
+    UPD_SOURCE="$u"
+    return 0
+}
+
+upd_cleanup() {
+    [[ -n "$UPD_TMP" && -d "$UPD_TMP" ]] && rm -rf -- "$UPD_TMP"
+    UPD_TMP=""
+    return 0
+}
+
+# The only git network access outside the ctunnel fetch: a shallow clone of main, over
+# https or ssh only, with the user's own authentication (git's credential helpers, an ssh
+# key, or a prompt on the terminal). No anonymous URL, no curl, no wget.
+upd_fetch_latest() { # upd_fetch_latest <dir>
+    local g=(git -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always)
+    "${g[@]}" clone -q --depth 1 --branch "$EZB_UPDATE_BRANCH" --single-branch -- "$UPD_SOURCE" "$1"
+}
+
+# upd_get_latest: UPD_TMP/src is a checkout of the latest main; sets UPD_LATEST_COMMIT and
+# UPD_LATEST_VERSION. The caller runs upd_cleanup.
+upd_get_latest() {
+    local c
+    UPD_LATEST_COMMIT="" UPD_LATEST_VERSION=""
+    if ! have_cmd git; then
+        err "git is not installed. It is needed to fetch the latest ezvps from the private repository"
+        err "(ezvps never uses an anonymous URL for it). Install it with: apt-get install git"
+        return 1
+    fi
+    if ! UPD_TMP="$(mktemp -d)"; then
+        err "Cannot create a temporary directory."
+        return 1
+    fi
+    info "Fetching the latest '${EZB_UPDATE_BRANCH}' from ${UPD_SOURCE} with git."
+    info "git uses your own authentication (a GitHub CLI login, an SSH key, or a token typed at git's prompt)."
+    if ! upd_fetch_latest "${UPD_TMP}/src"; then
+        err "Could not fetch '${EZB_UPDATE_BRANCH}' from ${UPD_SOURCE}. Check the address and that you have access to the repository. Nothing was changed."
+        upd_cleanup
+        return 1
+    fi
+    c="$(git -C "${UPD_TMP}/src" rev-parse HEAD 2>/dev/null)"
+    if [[ ! "$c" =~ ^[0-9a-f]{40}$ ]] || [[ ! -f "${UPD_TMP}/src/ezvps" ]]; then
+        err "The fetched '${EZB_UPDATE_BRANCH}' is not an ezvps checkout (no commit or no ezvps script). Nothing was changed."
+        upd_cleanup
+        return 1
+    fi
+    UPD_LATEST_COMMIT="$c"
+    UPD_LATEST_VERSION="$(upd_file_version "${UPD_TMP}/src/ezvps")"
+    return 0
+}
+
+# Installed versus latest: up to date, update available, or unknown (never "up to date" by default).
+upd_compare() {
+    local iv="${UPD_INST_VERSION:-unknown}" lv="${UPD_LATEST_VERSION:-unknown}"
+    info ""
+    if [[ -n "$UPD_INST_COMMIT" ]]; then
+        info "Installed:  version ${iv}, commit ${UPD_INST_COMMIT:0:12}"
+    else
+        info "Installed:  version ${iv}, commit unknown"
+        info "            (${UPD_INST_WHY})"
+    fi
+    info "Latest:     version ${lv}, commit ${UPD_LATEST_COMMIT:0:12} (${EZB_UPDATE_BRANCH} of ${UPD_SOURCE})"
+    info ""
+    if [[ -z "$UPD_INST_COMMIT" ]]; then
+        warn "Unknown: ezvps cannot tell whether this install is up to date, so it is NOT reported as current."
+        [[ "$iv" != "$lv" ]] && info "The versions differ (${iv} installed, ${lv} latest)."
+        info "Use 'Update ezvps' to install the latest ${EZB_UPDATE_BRANCH}; that also records the version and commit."
+    elif [[ "$UPD_INST_COMMIT" == "$UPD_LATEST_COMMIT" ]]; then
+        info "Up to date: the installed commit is the latest ${EZB_UPDATE_BRANCH}."
+    else
+        info "Update available: the latest ${EZB_UPDATE_BRANCH} is a different commit than the installed one."
+        info "Use 'Update ezvps' to install it."
+    fi
+    return 0
+}
+
+upd_check_cmd() {
+    ezb_preflight "Check for updates" read || return 0
+    require_cmds sha256sum || return 0
+    upd_installed_info
+    upd_resolve_source || return 0
+    upd_get_latest || return 0
+    upd_compare
+    upd_cleanup
+    info "Nothing was changed."
+    return 0
+}
+
+# upd_verify_script <file>: bash -n, then --version must print "ezvps <version>".
+upd_verify_script() {
+    local out
+    UPD_VERIFY_VERSION="" UPD_VERIFY_OUT=""
+    if ! out="$(bash -n "$1" 2>&1)"; then
+        UPD_VERIFY_OUT="syntax check failed: ${out%%$'\n'*}"
+        return 1
+    fi
+    if ! out="$(EZVPS_ALLOW_NONROOT=1 bash "$1" --version </dev/null 2>&1)"; then
+        UPD_VERIFY_OUT="--version failed: ${out%%$'\n'*}"
+        return 1
+    fi
+    if [[ ! "$out" =~ ^ezvps\ ([A-Za-z0-9._+-]+)$ ]]; then
+        UPD_VERIFY_OUT="--version did not report a version"
+        return 1
+    fi
+    UPD_VERIFY_VERSION="${BASH_REMATCH[1]}"
+    return 0
+}
+
+# ezb_install_script <src>: temp file next to the target, mode 755, atomic mv.
+ezb_install_script() {
+    local tmp dir="${EZB_BIN%/*}"
+    mkdir -p -- "$dir" || return 1
+    tmp="$(mktemp "${dir}/.ezvps.XXXXXX")" || return 1
+    if cp -- "$1" "$tmp" && chmod 0755 -- "$tmp" && mv -f -- "$tmp" "$EZB_BIN"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# upd_state_write <version> <commit> <source>: records what is installed now (never a secret).
+upd_state_write() {
+    local sha tmp
+    sha="$(sha256sum "$EZB_BIN" 2>/dev/null)"
+    sha="${sha%% *}"
+    { mkdir -p -- "$EZB_STATE_DIR" && chmod 700 -- "$EZB_STATE_DIR"; } 2>/dev/null || return 1
+    tmp="${EZB_INSTALL_STATE}.tmp.$$"
+    {
+        printf 'version=%s\n' "$1"
+        printf 'commit=%s\n' "$2"
+        printf 'source=%s\n' "$3"
+        printf 'sha256=%s\n' "$sha"
+        printf 'installed=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >"$tmp" 2>/dev/null || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    if ! chmod 600 -- "$tmp" || ! mv -f -- "$tmp" "$EZB_INSTALL_STATE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    [[ "$(upd_state_get commit)" == "$2" && "$(upd_state_get sha256)" == "$sha" ]]
+}
+
+# Every state file except install.state is byte-for-byte what the backup holds.
+ezb_state_unchanged() { # ezb_state_unchanged <backup dir>
+    local e
+    for e in "$1/state"/*; do
+        [[ -f "$e" ]] || continue
+        [[ "${e##*/}" == "install.state" ]] && continue
+        cmp -s -- "$e" "$EZB_STATE_DIR/${e##*/}" || return 1
+    done
+    return 0
+}
+
+upd_update_cmd() {
+    local cand bak old_v new_v
+    ezb_preflight "Update ezvps" write || return 0
+    require_cmds sha256sum bash || return 0
+    if [[ ! -f "$EZB_BIN" ]]; then
+        err "ezvps is not installed at ${EZB_BIN}; nothing to update. Run install.sh from a checkout of the repository. Nothing was changed."
+        return 0
+    fi
+    upd_installed_info
+    upd_resolve_source || return 0
+    upd_get_latest || return 0
+    upd_compare
+    cand="${UPD_TMP}/src/ezvps"
+    old_v="${UPD_INST_VERSION:-unknown}"
+
+    # The candidate is checked before anything is touched.
+    if ! upd_verify_script "$cand"; then
+        err "The latest ${EZB_UPDATE_BRANCH} script is not usable (${UPD_VERIFY_OUT}). Nothing was changed."
+        upd_cleanup
+        return 0
+    fi
+    new_v="$UPD_VERIFY_VERSION"
+    if cmp -s -- "$cand" "$EZB_BIN"; then
+        info "The installed script is byte-for-byte the latest ${EZB_UPDATE_BRANCH}; there is nothing to replace."
+        if [[ "$UPD_INST_COMMIT" == "$UPD_LATEST_COMMIT" ]]; then
+            info "The install record already matches."
+        elif upd_state_write "$new_v" "$UPD_LATEST_COMMIT" "$UPD_SOURCE"; then
+            info "Recorded version ${new_v} and commit ${UPD_LATEST_COMMIT:0:12} in ${EZB_INSTALL_STATE} (verified)."
+        else
+            warn "Could not write ${EZB_INSTALL_STATE}; the commit stays unknown."
+        fi
+        upd_cleanup
+        return 0
+    fi
+    info ""
+    info "ezvps will replace ${EZB_BIN}: version ${old_v} -> ${new_v} (commit ${UPD_LATEST_COMMIT:0:12})."
+    info "The current script and the ezvps state files are backed up first. Tool configs, nginx sites,"
+    info "certificates, users and all other state are not touched."
+    if ! ask_yes_no "Update ezvps now?"; then
+        info "Nothing was changed."
+        upd_cleanup
+        return 0
+    fi
+    ezb_create pre-update core || {
+        err "Update cancelled: the current ezvps could not be backed up. Nothing was changed."
+        upd_cleanup
+        return 0
+    }
+    bak="$EZB_LAST_PATH"
+    if ! ezb_install_script "$cand" || ! cmp -s -- "$cand" "$EZB_BIN" || ! upd_verify_script "$EZB_BIN"; then
+        err "The new script did not verify after it was installed${UPD_VERIFY_OUT:+ (${UPD_VERIFY_OUT})}. Rolling back..."
+        if [[ -f "$bak/bin/ezvps" ]] && ezb_install_script "$bak/bin/ezvps" && cmp -s -- "$bak/bin/ezvps" "$EZB_BIN"; then
+            info "Rolled back: ${EZB_BIN} is the previous script again (verified byte for byte against ${bak})."
+        else
+            err "The rollback could not be verified. The previous script is in ${bak}/bin/ezvps; copy it to ${EZB_BIN}."
+        fi
+        upd_cleanup
+        return 0
+    fi
+    if ! upd_state_write "$new_v" "$UPD_LATEST_COMMIT" "$UPD_SOURCE"; then
+        warn "ezvps was updated but ${EZB_INSTALL_STATE} could not be written; its commit stays unknown."
+    fi
+    info ""
+    info "Updated ${EZB_BIN}: version ${old_v} -> ${UPD_VERIFY_VERSION}, commit ${UPD_LATEST_COMMIT:0:12}."
+    info "Verified: the installed file is byte-for-byte the fetched ${EZB_UPDATE_BRANCH}, passes bash -n and reports 'ezvps ${UPD_VERIFY_VERSION}'."
+    if ezb_state_unchanged "$bak"; then
+        info "Verified: the other ezvps state files are unchanged. Tool configs, sites, certificates and users were not touched."
+    else
+        warn "A state file differs from the backup; compare ${bak}/state with ${EZB_STATE_DIR}."
+    fi
+    info "Previous version backed up at ${bak}. Restart ezvps to use the new version."
+    upd_cleanup
+    return 0
+}
+
+upd_menu() {
+    local choice i labels=("Check for updates" "Update ezvps")
+    while true; do
+        info ""
+        info "${C_BOLD}Check For Updates${C_RESET}"
+        info ""
+        for i in "${!labels[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) upd_check_cmd || true ;;
+            2) upd_update_cmd || true ;;
+            *) warn "Invalid choice: ${choice:-<empty>}" ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
+module_update() { upd_menu; }
+
+# --- uninstall ---------------------------------------------------------------
+
+module_uninstall() {
+    local e reply bak p state_files=() removed=() left_over=() kept=() tool
+    ezb_preflight "Uninstall" write || return 0
+    for e in "$EZB_STATE_DIR"/*.state "$EZB_STATE_DIR"/*.state.tmp.*; do
+        [[ -f "$e" || -L "$e" ]] && state_files+=("$e")
+    done
+    if [[ ! -e "$EZB_BIN" && ! -L "$EZB_BIN" ]] && ((${#state_files[@]} == 0)); then
+        info ""
+        info "ezvps is not installed (no ${EZB_BIN}, no state files in ${EZB_STATE_DIR}); there is nothing to uninstall."
+        return 0
+    fi
+    info ""
+    info "Uninstall removes ezvps itself, and only that:"
+    [[ -e "$EZB_BIN" || -L "$EZB_BIN" ]] && info "  ${EZB_BIN}"
+    for e in "${state_files[@]}"; do info "  ${e}"; done
+    info "It does NOT touch nginx, 3x-ui, Backpack, ctunnel, Lazyports, ezl2tp, their configs, nginx sites,"
+    info "certificates, users, SSH settings, or any backup (backups are never deleted)."
+    info "Your current ezvps script and state files are backed up first."
+    if ! IFS= read -r -p "Type YES to uninstall ezvps: " reply; then
+        info ""
+        info "Nothing was changed."
+        return 0
+    fi
+    if [[ "$reply" != "YES" ]]; then
+        info "Cancelled (only the exact word YES confirms). Nothing was changed."
+        return 0
+    fi
+    info ""
+    ezb_create pre-uninstall core || {
+        err "Uninstall cancelled: the backup could not be made. Nothing was changed."
+        return 0
+    }
+    bak="$EZB_LAST_PATH"
+    info "Backup path: ${bak}"
+    if [[ -f "$EZB_BIN" && ! -f "$bak/bin/ezvps" ]]; then
+        err "The backup does not contain the ezvps script; not removing anything."
+        return 0
+    fi
+    for e in "$EZB_BIN" "${state_files[@]}"; do
+        [[ -e "$e" || -L "$e" ]] || continue
+        rm -f -- "$e" 2>/dev/null
+        if [[ -e "$e" || -L "$e" ]]; then
+            left_over+=("$e")
+        else
+            removed+=("$e")
+        fi
+    done
+    rmdir -- "$EZB_STATE_DIR" 2>/dev/null
+    info ""
+    info "Removed (checked on the file system):"
+    if ((${#removed[@]} == 0)); then info "  nothing"; fi
+    for e in "${removed[@]}"; do info "  ${e}"; done
+    if ((${#left_over[@]} > 0)); then
+        err "These could NOT be removed:"
+        for e in "${left_over[@]}"; do err "  ${e}"; done
+    fi
+    [[ -d "$EZB_STATE_DIR" ]] && info "The state directory ${EZB_STATE_DIR} is kept because it still holds other files."
+    info ""
+    info "Left untouched (looked up on the file system just now):"
+    kept=("$NGX_DIR" "$XUI_DIR" "$XUI_DB_DIR" "$CERT_DIR" "$ACME_HOME" "$LC_BACKPACK_CONF" "$EZB_BACKUP_BASE")
+    for tool in backpack ctunnel lazyports; do kept+=("${LC_PREFIX}/bin/${tool}"); done
+    for p in "${kept[@]}"; do
+        if [[ -e "$p" ]]; then info "  ${p} (present, not touched)"; else info "  ${p} (not present)"; fi
+    done
+    info "  user accounts, SSH settings and firewall rules (never touched by ezvps Uninstall)"
+    info "  ${EZB_BACKUP_BASE}: all backups kept, including ${bak}"
+    if [[ ! -e "$EZB_BIN" && ! -L "$EZB_BIN" ]]; then
+        info ""
+        info "ezvps is uninstalled. To bring it back: run install.sh from the repository checkout,"
+        info "or copy ${bak}/bin/ezvps to ${EZB_BIN}."
+        EZB_UNINSTALLED=1
+    fi
+    return 0
+}
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
@@ -6282,9 +7467,9 @@ run_module() {
         lazyports) module_lazyports ;;
         ssh) module_ssh ;;
         firewall) module_firewall ;;
-        backup | update | uninstall)
-            module_not_implemented "$1"
-            ;;
+        backup) module_backup ;;
+        update) module_update ;;
+        uninstall) module_uninstall ;;
         *)
             err "Unknown module: $1"
             return 2
@@ -6322,6 +7507,10 @@ main_menu() {
         elif [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#MODULE_KEYS[@]})); then
             run_module "${MODULE_KEYS[$((10#$choice - 1))]}"
             pause || true
+            if ((EZB_UNINSTALLED == 1)); then
+                info "ezvps has been uninstalled; leaving the menu."
+                return 0
+            fi
         else
             warn "Invalid choice: ${choice:-<empty>}"
             pause || true
@@ -6346,8 +7535,7 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp, 3x-ui, backpack, ctunnel, nginx, certs, lazyports, ssh and firewall are implemented
-in this release; the others report that they are not implemented yet."
+All of these modules are implemented in this release."
 }
 
 require_root() {

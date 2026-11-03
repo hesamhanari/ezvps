@@ -78,18 +78,20 @@ script it from ezvps)
 - [ ] re-run `bash install.sh`: output says `ezl2tp found; left untouched.`
       and `sha256sum "$(command -v ezl2tp)"` is the same before and after
 
-## 4. Menu and not-yet-implemented modules
+## 4. Menu
 
 - [ ] menu lines match exactly (no description text):
       `L2TP, 3x-ui, Backpack, ctunnel, Nginx, Certificates, Lazyports,
       SSH and Users, Firewall, Backup, Check For Updates, Uninstall`, then `0) Exit`
-- [ ] each of `10` to `12` prints `<Label> is not implemented yet.` and returns to
-      the menu after Enter (`2` opens the 3x-ui submenu, section 5; `3`, `4` and `7`
-      open the Backpack, ctunnel and Lazyports submenus, section 8; `5` opens the
-      Nginx submenu, section 6; `6` opens the Certificates submenu, section 7; `8`
-      opens the SSH and Users submenu, section 9; `9` opens the Firewall submenu, section 10)
+- [ ] no item prints `is not implemented yet` (`2` opens the 3x-ui submenu, section 5;
+      `3`, `4` and `7` open the Backpack, ctunnel and Lazyports submenus, section 8; `5`
+      opens the Nginx submenu, section 6; `6` opens the Certificates submenu, section 7;
+      `8` opens the SSH and Users submenu, section 9; `9` opens the Firewall submenu,
+      section 10; `10` opens Backup and `11` Check For Updates, section 11; `12` is
+      Uninstall, section 12)
 - [ ] `abc`, `13`, empty input -> `Invalid choice`, menu continues
-- [ ] `ezvps backup` (and `update`, `uninstall`) print the same message, exit 0
+- [ ] `ezvps backup`, `ezvps update` and `ezvps uninstall` open the same items as menu
+      `10`, `11` and `12` (answer `0` / do not type `YES`)
 - [ ] `ezvps bogus` prints usage, exit 2
 - [ ] Ctrl-D at the prompt exits cleanly
 
@@ -687,19 +689,128 @@ and never install one just to test unless you mean to.
 - [ ] there is no way to remove several rules in one run and no `disable`/`reset`/`flush` anywhere in the
       backend's own history (`journalctl`, `ufw status` still `active`)
 
-## 11. Non-root
+## 11. Backup, Check For Updates and Uninstall
+
+Needs the throwaway VPS from the earlier sections: `ezvps` installed with `install.sh` from a
+git checkout cloned with **your own authentication** (`gh auth login`, an SSH key or a token typed at git's
+prompt) of the **private** ezvps repository; ideally the 3x-ui, Nginx (with one ezvps-made site, section 6)
+and Certificates (section 7) sections done, so there is something to back up. Placeholders: `<owner>`,
+`example.com`. Never paste a token into the address you give ezvps.
+
+**11a. Install record**
+
+```bash
+cat /var/lib/ezvps/install.state     # no secrets in here; check by eye anyway
+stat -c '%a %U' /var/lib/ezvps /var/lib/ezvps/install.state
+sha256sum /usr/local/bin/ezvps
+```
+
+- [ ] `install.state` has `version=`, `commit=<40 hex>`, `source=` (your repository address, **with no
+      user name or token in it**), `sha256=` (the same as `sha256sum` prints) and `installed=`
+- [ ] the directory is `700` and the file `600`, owner root
+- [ ] `commit` equals `git -C <checkout> rev-parse HEAD` (only when the checkout was clean)
+
+**11b. Create backup** (`ezvps` -> `10` -> `1`)
+
+- [ ] the plan names the script, the state files, the ezvps-made nginx sites and the certificates
+- [ ] it prints `Backup created and verified: /var/backups/ezvps/ezvps-backup.<time>-01` and lists exactly
+      what went in (script, N state files, the site file names, the certificate domains)
+- [ ] `stat -c %a /var/backups/ezvps /var/backups/ezvps/ezvps-backup.*` prints `700` for both, and
+      `700` for `bin state nginx-sites certs` inside it; `MANIFEST` is `600`
+- [ ] `cmp /usr/local/bin/ezvps <backup>/bin/ezvps`, `cmp` of each state file, site and certificate file
+      against its source: no difference; `<backup>/certs/<domain>/privkey.pem` is `600`
+- [ ] **no private key text appeared on the screen** (the key was copied, not printed)
+- [ ] a hand-written site you put in `/etc/nginx/conf.d` is **not** in `<backup>/nginx-sites`
+- [ ] nothing from 3x-ui (`/etc/x-ui`), Backpack or the tools is in the backup
+- [ ] with `/var/backups/ezvps` made unwritable (`chattr +i /var/backups/ezvps` as a test, then
+      `chattr -i`) the item refuses with a message and creates nothing
+
+**11c. List backups** (`10` -> `2`)
+
+- [ ] newest first, with UTC time, size, reason and a contents summary that matches `ls -R` of each backup
+- [ ] backups made by other modules (`x-ui.*`, `nginx-*`) are not listed and the output says so
+
+**11d. Restore backup** (`10` -> `3`)
+
+1. Note a checksum of the site and the certificate: `sha256sum /etc/nginx/conf.d/example.com.conf`.
+2. Make a change: edit that site (add a comment line), `echo '# local edit' >> /usr/local/bin/ezvps`.
+3. Restore the backup from 11b.
+
+- [ ] anything other than the exact word `YES` (try `yes`, `y`, ` YES`) cancels with `Nothing was changed.`
+- [ ] with `YES`: a new `ezvps-backup.*` (reason `pre-restore`) appears **before** the restore and holds
+      the edited site and script
+- [ ] the report says `nginx -t passed after restoring the sites.`, the site and script now match the
+      checksums from step 1, `systemctl status nginx` is running, and the site still answers
+- [ ] the key is still mode `600`, `/etc/ssl/ezvps` and the domain directory `700`
+- [ ] a hand-written site with the same name as a backed-up one is **not overwritten** (try it)
+- [ ] failing test: add `BROKEN_DIRECTIVE;` inside the `server {}` of a site, take a backup, fix the site,
+      restore: `nginx -t FAILED`, `Rolled back`, the site files and certificates are as they were, nginx was
+      not reloaded and keeps serving
+
+**11e. Check for updates** (`11` -> `1`)
+
+- [ ] it fetches with git using **your own authentication** (a prompt for a token appears if you use an
+      https address without a credential helper); no `curl`/`wget` is run (`ps` while it works, or
+      `strace -f -e trace=execve -o /tmp/x ezvps update` and look for `curl`)
+- [ ] it prints `Installed:` and `Latest:` with versions and the first 12 characters of each commit
+- [ ] right after `install.sh` from the latest `main`: `Up to date`
+- [ ] after pushing a new commit to `main` of your repository: `Update available`
+- [ ] after `echo '# edit' >> /usr/local/bin/ezvps`: `commit unknown` with the reason, and it does **not**
+      say `Up to date`
+- [ ] after `rm /var/lib/ezvps/install.state`: `commit unknown`, `no install record`, it asks for the
+      repository address (try `http://example.com/owner/ezvps.git`: refused; an address with `user:token@`:
+      refused and **not echoed back**)
+- [ ] with git uninstalled (`apt-get remove git`, then `apt-get install git` again): a clear message, nothing
+      changed
+
+**11f. Update ezvps** (`11` -> `2`)
+
+- [ ] after pushing a harmless new commit to `main`: the plan shows `version old -> new`; `n` changes nothing
+- [ ] with `y`: a `pre-update` backup (script and state) is created and its path printed **before** the
+      replacement; `/usr/local/bin/ezvps` is mode `755`; `cmp` of it with the checkout of `main` shows no
+      difference; `ezvps --version` prints the new version; `install.state` has the new commit
+- [ ] the 3x-ui state file, sites, certificates and users are unchanged (`sha256sum` before/after)
+- [ ] push a commit to `main` whose `ezvps` has a syntax error: Update refuses (`not usable (syntax check
+      failed`), nothing is changed, no backup, the installed script still works; revert the commit
+- [ ] a second `Update ezvps` right after: `nothing to replace`, no new backup
+
+**11g. Non-root**
+
+- [ ] as a normal user `ezvps backup`, `ezvps update`, `ezvps uninstall` print `ezvps must be run as root.`, exit 1
+
+## 12. Uninstall (do this last, on the throwaway VPS)
+
+Put marker files next to what must survive: `sha256sum /etc/nginx/conf.d/* /etc/ssl/ezvps/*/* /etc/x-ui/x-ui.db
+2>/dev/null > /tmp/before.sum`, and note `ls /var/backups/ezvps`.
+
+- [ ] `ezvps` -> `12`: the plan lists `/usr/local/bin/ezvps` and the files in `/var/lib/ezvps` and says what
+      is not touched
+- [ ] `yes`, `y`, an empty line and Ctrl-D all cancel with `Nothing was changed.`; the script is still there
+- [ ] with `YES`: the backup path is printed **first** (`ezvps-backup.<time>-NN`, reason `pre-uninstall`,
+      mode `700`, holding `bin/ezvps` and `state/`)
+- [ ] `ls /usr/local/bin/ezvps` fails; `/var/lib/ezvps` has no `*.state` files (the directory is gone if it
+      was empty); the report lists exactly those removals and says `Left untouched` for nginx, 3x-ui, the
+      certificate store, Backpack, ctunnel, Lazyports and the backup directory
+- [ ] `sha256sum -c /tmp/before.sum` reports every file `OK` (nginx sites, certificates, 3x-ui database)
+- [ ] nginx, `x-ui` and any installed Backpack / ctunnel / Lazyports still run; ezl2tp (if present) is
+      untouched; users and `sshd_config` are unchanged
+- [ ] **no backup was deleted**: `ls /var/backups/ezvps` shows everything from before plus the new one
+- [ ] `bash install.sh` from the checkout installs ezvps again (and `cp <backup>/bin/ezvps` also works)
+- [ ] the interactive menu closes after a successful uninstall (`ezvps has been uninstalled; leaving the menu.`)
+
+## 13. Non-root
 
 - [ ] as a normal user: `ezvps` prints `ezvps must be run as root.`, exit 1
 - [ ] as a normal user: `ezvps --version` still works
 
-## 12. Cleanup (no uninstall module yet)
+## 14. Cleanup
 
 ```bash
 x-ui uninstall            # 3x-ui's own uninstaller, if you installed it
 # Backpack / ctunnel / Lazyports: use each submenu's Uninstall (section 8)
 apt-get purge -y nginx    # if you installed nginx for this test
-rm -f /usr/local/bin/ezvps
-rm -rf /var/backups/ezvps /var/lib/ezvps
+# ezvps itself: menu 12 Uninstall (section 12) removes the script and its state, never the backups
+rm -rf /var/backups/ezvps   # the backups hold private keys: remove them yourself on a throwaway VPS
 rm -rf /root/.acme.sh /etc/ssl/ezvps   # if you installed acme.sh / issued certificates
 userdel testuser; userdel testadmin    # the throwaway accounts from section 9 (add -r to drop their homes)
 # Firewall (section 10): remove the test rules you added (ezvps Remove rule, or the backend's own command)

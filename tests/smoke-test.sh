@@ -103,7 +103,6 @@ run_ezvps() {
 }
 
 LABELS=("L2TP" "3x-ui" "Backpack" "ctunnel" "Nginx" "Certificates" "Lazyports" "SSH and Users" "Firewall" "Backup" "Check For Updates" "Uninstall")
-KEYS=(l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall backup update uninstall)
 
 echo "== basics"
 run_ezvps "$EMPTY_BIN" "" --version
@@ -164,20 +163,11 @@ run_ezvps "$EMPTY_BIN" "" l2tp
 check "'ezvps l2tp' without ezl2tp gives instructions" contains "$OUT" "git clone"
 check "'ezvps l2tp' without ezl2tp exits 0" equals "$RC" 0
 
-echo "== not-yet-implemented modules"
-for i in "${!KEYS[@]}"; do
-    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" || "${KEYS[$i]}" == "backpack" || "${KEYS[$i]}" == "ctunnel" || "${KEYS[$i]}" == "lazyports" || "${KEYS[$i]}" == "ssh" || "${KEYS[$i]}" == "firewall" ]] && continue
-    n=$((i + 1))
-    label="${LABELS[$i]}"
-    run_ezvps "$STUB_BIN" "${n}\n\n0\n"
-    check "menu ${n} (${label}): shows not-implemented message" contains "$OUT" "${label} is not implemented yet."
-    check "menu ${n} (${label}): returns to the menu" at_least_menus "$OUT" 2
-    check "menu ${n} (${label}): does not launch ezl2tp" not_contains "$OUT" "FAKE-EZL2TP-RAN"
-    check "menu ${n} (${label}): exits 0" equals "$RC" 0
-    run_ezvps "$STUB_BIN" "" "${KEYS[$i]}"
-    check "cli '${KEYS[$i]}': not-implemented message, exit 0" contains "$OUT" "${label} is not implemented yet."
-    check "cli '${KEYS[$i]}': exits 0" equals "$RC" 0
-done
+echo "== every menu item is implemented"
+# The panel is complete (PR 12): no menu key dispatches to module_not_implemented any more. The shared
+# stub stays for a module that is added to the registry before it is built.
+check "run_module dispatches no key to module_not_implemented" equals "$(awk '/^run_module\(\)/,/^}/' "$EZVPS" | grep -c 'module_not_implemented')" 0
+check "every menu key has a module function" bash -c 'for k in l2tp 3x_ui backpack ctunnel nginx certs lazyports ssh firewall backup update uninstall; do grep -q "^module_${k}()" "$1" || exit 1; done' _ "$EZVPS"
 
 echo "== 3x-ui module (fake panel CLI, fake systemctl/curl/ss, no network)"
 
@@ -5850,6 +5840,1150 @@ FW_ENV=()
 export EZVPS_NO_PAUSE="${FW_SAVED_PAUSE:-0}"
 [[ -z "$FW_SAVED_PAUSE" ]] && unset EZVPS_NO_PAUSE
 
+echo "== Backup, Check For Updates and Uninstall (fake backups, fake installed/main versions, fake git/nginx, no network)"
+
+BKW="$WORK/bk"
+BK_STUBS="$BKW/stubs"
+mkdir -p "$BK_STUBS"
+BK_OLD_COMMIT="$(printf 'a%.0s' {1..40})"
+BK_NEW_COMMIT="$(printf 'b%.0s' {1..40})"
+BK_KEY_MARKER="FAKE-PRIVATE-KEY-MARKER-7f3a91"
+BK_SRC_HTTPS="https://example.com/owner/ezvps.git"
+BK_SRC_SSH="git@example.com:owner/ezvps.git"
+
+# bash wrapper: the only deviation from the real bash is that `bash -n <FAKE_BASH_FAIL_PATH>` fails,
+# which is how a script that passed the syntax check before the install can fail it afterwards.
+{
+    printf '#!/bin/sh\nreal_bash=%s\n' "$BASH_BIN"
+    cat <<'EOF'
+if [ "$1" = "-n" ] && [ -n "${FAKE_BASH_FAIL_PATH:-}" ] && [ "$2" = "$FAKE_BASH_FAIL_PATH" ]; then
+    echo "bash: $2: fake syntax error" >&2
+    exit 2
+fi
+# FAKE_BASH_TOUCH: something else changes a state file while the update is running
+if [ "$1" = "-n" ] && [ -n "${FAKE_BASH_TOUCH:-}" ] && [ "$2" = "${FAKE_BASH_TOUCH_AT:-}" ]; then
+    echo "# changed behind ezvps' back" >>"$FAKE_BASH_TOUCH"
+fi
+exec "$real_bash" "$@"
+EOF
+} >"$BK_STUBS/bash"
+chmod +x "$BK_STUBS/bash"
+
+# fake git: records every call; `clone` copies the fake main into the target and remembers its commit;
+# `-C <dir> rev-parse HEAD` answers with that commit. FAKE_GIT_FAIL=1 makes the clone fail.
+mkstub "$BK_STUBS/git" <<'EOF'
+echo "git $*" >>"$FAKE_LOG"
+args=("$@")
+dir="" i=0
+while ((i < ${#args[@]})); do
+    case "${args[$i]}" in
+        -c) i=$((i + 1)) ;;
+        -C) dir="${args[$((i + 1))]}"; i=$((i + 1)) ;;
+        rev-parse) read -r head <"$dir/.fake_head"; echo "$head"; exit 0 ;;
+        clone)
+            [[ "${FAKE_GIT_FAIL:-0}" == 1 ]] && { echo "fatal: could not read from remote repository" >&2; exit 128; }
+            dest="${args[$((${#args[@]} - 1))]}"
+            mkdir -p "$dest"
+            [[ -f "$FAKE_MAIN_DIR/ezvps" ]] && cp "$FAKE_MAIN_DIR/ezvps" "$dest/ezvps"
+            printf '%s\n' "$FAKE_MAIN_COMMIT" >"$dest/.fake_head"
+            exit 0 ;;
+    esac
+    i=$((i + 1))
+done
+exit 0
+EOF
+# fake nginx: -t fails when FAKE_NGINX_FAIL is set or when a conf.d file contains BROKEN_DIRECTIVE
+mkstub "$BK_STUBS/nginx" <<'EOF'
+echo "nginx $*" >>"$FAKE_LOG"
+if [[ "${1:-}" == "-t" ]]; then
+    fail=0
+    [[ -n "${FAKE_NGINX_FAIL:-}" ]] && fail=1
+    for f in "$FAKE_NGINX_CONFD"/*.conf; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r l; do [[ "$l" == *BROKEN_DIRECTIVE* ]] && fail=1; done <"$f"
+    done
+    if ((fail)); then
+        echo 'nginx: [emerg] unknown directive "BROKEN_DIRECTIVE" in a fake site' >&2
+        echo "nginx: configuration file /etc/nginx/nginx.conf test failed" >&2
+        exit 1
+    fi
+    echo "nginx: configuration file /etc/nginx/nginx.conf test is successful" >&2
+fi
+exit 0
+EOF
+mkstub "$BK_STUBS/systemctl" <<'EOF'
+echo "systemctl $*" >>"$FAKE_LOG"
+if [[ "${1:-}" == "is-active" ]]; then
+    [[ "${FAKE_NGINX_RUNNING:-1}" == 1 ]]
+    exit $?
+fi
+exit 0
+EOF
+
+# fake cp: the real cp, then (FAKE_CP_PATTERN) one copied file gets a comment line appended, so the copy no longer
+# matches its source although cp reported success. FAKE_CP_ONCE=1 corrupts only the first match (FAKE_CP_MARK).
+{
+    printf '#!%s\nreal_cp=%s\n' "$BASH_BIN" "$(command -v cp)"
+    cat <<'EOF'
+"$real_cp" "$@"
+rc=$?
+if [[ -n "${FAKE_CP_PATTERN:-}" && $rc -eq 0 ]]; then
+    last="${*: -1}"
+    [[ "${FAKE_CP_ONCE:-0}" == 1 && -e "${FAKE_CP_MARK:-/nonexistent}" ]] && exit 0
+    for f in "$last" "$last"/* "$last"/*/*; do
+        if [[ -f "$f" && "$f" == $FAKE_CP_PATTERN ]]; then
+            echo "# junk" >>"$f"
+            [[ -n "${FAKE_CP_MARK:-}" ]] && : >"$FAKE_CP_MARK"
+            break
+        fi
+    done
+fi
+exit $rc
+EOF
+} >"$BK_STUBS/cp"
+chmod +x "$BK_STUBS/cp"
+
+mk_bk_bin() { # mk_bk_bin <dir> [missing...]: coreutils + the stubs; a variant lacks the named commands
+    local dir="$1" c skip
+    shift
+    mkdir -p "$dir"
+    for c in cp mkdir mv rm rmdir mktemp date chmod cmp stat du sha256sum bash git nginx systemctl; do
+        for skip in "$@"; do [[ "$skip" == "$c" ]] && continue 2; done
+        case "$c" in
+            bash | git | nginx | systemctl) ln -sf "$BK_STUBS/$c" "$dir/$c" ;;
+            *) ln -sf "$(command -v "$c")" "$dir/$c" ;;
+        esac
+    done
+}
+BKBIN="$BKW/bin"
+BKBIN_NOGIT="$BKW/bin-nogit"
+BKBIN_NONGINX="$BKW/bin-nonginx"
+BKBIN_NOCMP="$BKW/bin-nocmp"
+mk_bk_bin "$BKBIN"
+mk_bk_bin "$BKBIN_NOGIT" git
+mk_bk_bin "$BKBIN_NONGINX" nginx
+mk_bk_bin "$BKBIN_NOCMP" cmp
+BKBIN_CPFAULT="$BKW/bin-cpfault"
+mk_bk_bin "$BKBIN_CPFAULT"
+ln -sf "$BK_STUBS/cp" "$BKBIN_CPFAULT/cp"
+
+# --- fixtures ----------------------------------------------------------------------------------
+BK_EXTRA=()
+D=""
+BK_N=0
+bk_write_ezvps() { # bk_write_ezvps <path> <version> [broken|noversion]: a tiny fake ezvps
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '# fake ezvps for the smoke test, version %s\n' "$2"
+        printf 'EZVPS_VERSION="%s"\n' "$2"
+        case "${3:-}" in
+            broken) printf 'if then\n' ;;
+            noversion) printf 'exit 3\n' ;;
+            *) printf 'case "${1:-}" in --version) echo "ezvps $EZVPS_VERSION" ;; esac\n' ;;
+        esac
+    } >"$1"
+    chmod 755 "$1"
+}
+bk_record() { # bk_record <commit> [source] [version]: install.state for the installed script as it is now
+    local sha
+    sha="$(sha256sum "$D/bin/ezvps")"
+    sha="${sha%% *}"
+    printf 'version=%s\ncommit=%s\nsource=%s\nsha256=%s\ninstalled=2026-01-01T00:00:00Z\n' \
+        "${3:-0.0.1-old}" "$1" "${2-$BK_SRC_HTTPS}" "$sha" >"$D/state/install.state"
+    chmod 600 "$D/state/install.state"
+}
+bk_site() { # bk_site <file name> <domain> <upstream> [extra directive]: an ezvps-made site in the fake conf.d
+    {
+        printf '# Managed by ezvps (Nginx module). Reverse proxy; edit via ezvps or keep the markers.\n'
+        printf '# ezvps:domain=%s\n# ezvps:upstream=%s\n' "$2" "$3"
+        printf 'server {\n    listen 80;\n    server_name %s;\n' "$2"
+        [[ -n "${4:-}" ]] && printf '    %s\n' "$4"
+        printf '    location / { proxy_pass http://%s; }\n}\n' "$3"
+    } >"$D/nginx/conf.d/$1"
+}
+bk_new() { # a fresh fake system under $D
+    BK_N=$((BK_N + 1))
+    D="$BKW/s$BK_N"
+    rm -rf "$D"
+    mkdir -p "$D/bin" "$D/state" "$D/backups" "$D/certs/example.com" "$D/nginx/conf.d" "$D/main" \
+        "$D/prefix/bin" "$D/xui" "$D/xuidb" "$D/backpack" "$D/acme" "$D/home" "$D/tmp"
+    chmod 700 "$D/backups"
+    BK_EXTRA=()
+    bk_write_ezvps "$D/bin/ezvps" "0.0.1-old"
+    printf '#!/bin/sh\necho fake-existing-ezl2tp\n' >"$D/bin/ezl2tp"
+    chmod 755 "$D/bin/ezl2tp"
+    printf 'mode=default\nusername=testuser\npassword_default=1\n' >"$D/state/3x-ui.state"
+    chmod 600 "$D/state/3x-ui.state"
+    bk_record "$BK_OLD_COMMIT"
+    chmod 700 "$D/certs" "$D/certs/example.com"
+    printf 'FAKE-CERTIFICATE-CHAIN-example\n' >"$D/certs/example.com/fullchain.pem"
+    printf '%s\n' "$BK_KEY_MARKER" >"$D/certs/example.com/privkey.pem"
+    chmod 644 "$D/certs/example.com/fullchain.pem"
+    chmod 600 "$D/certs/example.com/privkey.pem"
+    printf 'http {\n    include %s/conf.d/*.conf;\n}\n' "$D/nginx" >"$D/nginx/nginx.conf"
+    bk_site example.com.conf example.com 127.0.0.1:3000
+    printf 'server {\n    listen 8080;\n    server_name hand.example.com;\n}\n' >"$D/nginx/conf.d/hand.conf"
+    printf 'FAKE-XUI-DB\n' >"$D/xuidb/x-ui.db"
+    printf 'FAKE-XUI-BIN\n' >"$D/xui/x-ui"
+    printf 'FAKE-BACKPACK-CONF\n' >"$D/backpack/backpack.conf"
+    printf 'FAKE-TOOL\n' >"$D/prefix/bin/backpack"
+    printf 'FAKE-TOOL\n' >"$D/prefix/bin/ctunnel"
+    printf 'FAKE-ACME\n' >"$D/acme/acme.sh"
+    printf 'FAKE-HOME\n' >"$D/home/.bashrc"
+    bk_write_ezvps "$D/main/ezvps" "0.0.2-new"
+    : >"$D/log"
+}
+run_bk() { # run_bk <path-dir> <stdin> [ezvps args]; sets OUT and RC; per-test variables go in BK_EXTRA
+    local pd="$1" input="$2"
+    shift 2
+    OUT="$(printf '%b' "$input" | env PATH="$pd" EZVPS_NO_PAUSE=1 \
+        EZVPS_BIN_DIR="$D/bin" EZVPS_BACKUP_DIR="$D/backups" EZVPS_STATE_DIR="$D/state" EZVPS_CERT_DIR="$D/certs" \
+        EZVPS_NGINX_DIR="$D/nginx" EZVPS_XUI_DIR="$D/xui" EZVPS_XUI_DB_DIR="$D/xuidb" EZVPS_TOOL_PREFIX="$D/prefix" \
+        EZVPS_BACKPACK_CONF_DIR="$D/backpack" EZVPS_ACME_HOME="$D/acme" HOME="$D/home" TMPDIR="$D/tmp" \
+        FAKE_LOG="$D/log" FAKE_NGINX_CONFD="$D/nginx/conf.d" FAKE_MAIN_DIR="$D/main" FAKE_MAIN_COMMIT="$BK_NEW_COMMIT" \
+        "${BK_EXTRA[@]}" "$BASH_BIN" "$EZVPS" "$@" 2>&1)"
+    RC=$?
+}
+bk_snap() { # bk_snap <dir>: file checksums and the mode of every entry (host tools, outside the sandbox)
+    [[ -d "$1" ]] || { echo "(missing)"; return 0; }
+    (cd "$1" && {
+        find . -type f -exec cksum {} + | LC_ALL=C sort
+        find . -printf '%m %p\n' | LC_ALL=C sort
+    })
+}
+bk_snap_all() { # everything the three items could touch, backups included
+    local x
+    for x in bin state backups certs nginx xui xuidb prefix backpack acme home; do
+        printf '== %s\n' "$x"
+        bk_snap "$D/$x"
+    done
+}
+bk_snap_other() { # the other tools only (no certificates, no sites): a restore may change those, never these
+    local x
+    for x in xui xuidb prefix backpack acme home; do
+        printf '== %s\n' "$x"
+        bk_snap "$D/$x"
+    done
+}
+bk_tmp_clean() { [[ -z "$(ls -A "$D/tmp")" ]]; }
+bk_snap_tools() { # the things that must never change: sites, certificates, other tools, users' home
+    local x
+    for x in certs nginx xui xuidb prefix backpack acme home; do
+        printf '== %s\n' "$x"
+        bk_snap "$D/$x"
+    done
+}
+bk_n() { # number of ezvps backups in $D/backups
+    local n=0 e
+    for e in "$D/backups"/ezvps-backup.*; do [[ -d "$e" ]] && n=$((n + 1)); done
+    printf '%d' "$n"
+}
+bk_last() { # path of the newest backup (names sort by time)
+    local e l=""
+    for e in "$D/backups"/ezvps-backup.*; do [[ -d "$e" ]] && l="$e"; done
+    printf '%s' "$l"
+}
+bk_first() { # path of the oldest backup
+    local e
+    for e in "$D/backups"/ezvps-backup.*; do
+        [[ -d "$e" ]] && {
+            printf '%s' "$e"
+            return 0
+        }
+    done
+}
+mode_is() { [[ "$(stat -c %a -- "$1" 2>/dev/null)" == "$2" ]]; }
+bk_log_has() { grep -qF -- "$1" "$D/log"; }
+bk_log_lacks() { ! grep -qF -- "$1" "$D/log"; }
+bk_log_after() { # both logged, the first before the second
+    local a b
+    a="$(grep -nF -- "$1" "$D/log" | head -1 | cut -d: -f1)"
+    b="$(grep -nF -- "$2" "$D/log" | head -1 | cut -d: -f1)"
+    [[ -n "$a" && -n "$b" ]] && ((a < b))
+}
+out_order() { # out_order <first> <second>: both in $OUT, the first on an earlier line
+    local a b
+    a="$(printf '%s\n' "$OUT" | grep -nF -- "$1" | head -1 | cut -d: -f1)"
+    b="$(printf '%s\n' "$OUT" | grep -nF -- "$2" | head -1 | cut -d: -f1)"
+    [[ -n "$a" && -n "$b" ]] && ((a < b))
+}
+bk_state_get() { # bk_state_get <key>: from install.state
+    local k v
+    while IFS='=' read -r k v; do [[ "$k" == "$1" ]] && { printf '%s' "$v"; return 0; }; done <"$D/state/install.state"
+}
+no_tmp_in_bin() { [[ -z "$(find "$D/bin" -maxdepth 1 \( -name '.ezvps.*' -o -name '.ezb.*' \))" ]]; }
+no_key_leak() { not_contains "$1" "$BK_KEY_MARKER"; }
+
+# --- menus and dispatch ----------------------------------------------------------------------------
+bk_new
+run_bk "$BKBIN" "0\n" backup
+for l in " 1) Create backup" " 2) List backups" " 3) Restore backup" " 0) Back"; do
+    check "Backup submenu line '${l}' is exact (clean label)" has_line "$OUT" "$l"
+done
+check "Backup submenu has exactly 3 numbered entries" equals "$(printf '%s\n' "$OUT" | grep -cE '^ *[1-9]\) ')" 3
+check "Backup is no longer 'not implemented yet'" not_contains "$OUT" "is not implemented yet"
+check "opening the Backup submenu changes nothing (no backup was made)" equals "$(bk_n)" 0
+run_bk "$BKBIN" "0\n" update
+for l in " 1) Check for updates" " 2) Update ezvps" " 0) Back"; do
+    check "Check For Updates submenu line '${l}' is exact (clean label)" has_line "$OUT" "$l"
+done
+check "Check For Updates submenu has exactly 2 numbered entries" equals "$(printf '%s\n' "$OUT" | grep -cE '^ *[1-9]\) ')" 2
+check "Check For Updates is no longer 'not implemented yet'" not_contains "$OUT" "is not implemented yet"
+run_bk "$BKBIN" "10\n0\n0\n"
+check "main menu 10 opens the Backup submenu" contains "$OUT" " 1) Create backup"
+check "the main menu is shown again after Back" at_least_menus "$OUT" 2
+run_bk "$BKBIN" "11\n0\n0\n"
+check "main menu 11 opens the Check For Updates submenu" contains "$OUT" " 1) Check for updates"
+run_bk "$BKBIN" "" uninstall
+check "Uninstall is a menu item with no submenu: it shows the plan and waits for YES" contains "$OUT" "Uninstall removes ezvps itself, and only that:"
+check "Uninstall is no longer 'not implemented yet'" not_contains "$OUT" "is not implemented yet"
+run_bk "$BKBIN" "9\n0\n0\n" backup
+check "invalid Backup choice is reported" contains "$OUT" "Invalid choice: 9"
+run_bk "$BKBIN" "" backup
+check "EOF in the Backup submenu returns cleanly" equals "$RC" 0
+
+# --- create backup ---------------------------------------------------------------------------------
+echo "-- Create backup"
+bk_new
+ln -s hand.conf "$D/nginx/conf.d/linked.example.com.conf"
+ln -s "$D/nginx/conf.d/example.com.conf" "$D/nginx/conf.d/other.example.com.conf"
+chmod 755 "$D/backups"
+before_tools="$(bk_snap_tools)"
+before_bin="$(bk_snap "$D/bin")"
+before_state="$(bk_snap "$D/state")"
+run_bk "$BKBIN" "1\n0\n" backup
+BK1="$(bk_last)"
+check "create: exits 0" equals "$RC" 0
+check "create: exactly one backup directory was made" equals "$(bk_n)" 1
+check "create: the backup path is printed" contains "$OUT" "Backup created and verified: ${BK1}"
+check "create: the backup directory is named ezvps-backup.<UTC time>-NN" matches "${BK1##*/}" '^ezvps-backup\.[0-9]{8}-[0-9]{6}-01$'
+check "create: the backup directory itself is mode 700 (it was 755 before)" mode_is "$D/backups" 700
+check "create: the backup directory is mode 700" mode_is "$BK1" 700
+check "create: bin/, state/, nginx-sites/ and certs/ are mode 700" bash -c 'for d in bin state nginx-sites certs; do [[ "$(stat -c %a "$1/$d")" == 700 ]] || exit 1; done' _ "$BK1"
+check "create: MANIFEST is mode 600" mode_is "$BK1/MANIFEST" 600
+check "create: the ezvps script is in the backup, byte for byte" cmp -s "$D/bin/ezvps" "$BK1/bin/ezvps"
+check "create: the ezvps script keeps its mode" mode_is "$BK1/bin/ezvps" 755
+check "create: the 3x-ui state file is in the backup, byte for byte" cmp -s "$D/state/3x-ui.state" "$BK1/state/3x-ui.state"
+check "create: the install record is in the backup, byte for byte" cmp -s "$D/state/install.state" "$BK1/state/install.state"
+check "create: state file modes are kept (600)" mode_is "$BK1/state/3x-ui.state" 600
+check "create: the ezvps-made site is in the backup, byte for byte" cmp -s "$D/nginx/conf.d/example.com.conf" "$BK1/nginx-sites/example.com.conf"
+check "create: a hand-written site is NOT in the backup" test ! -e "$BK1/nginx-sites/hand.conf"
+check "create: symlinks in conf.d are NOT in the backup" test ! -e "$BK1/nginx-sites/linked.example.com.conf" -a ! -e "$BK1/nginx-sites/other.example.com.conf"
+check "create: only the one ezvps-made site is in the backup" equals "$(find "$BK1/nginx-sites" -type f | wc -l | tr -d ' ')" 1
+check "create: the certificate is in the backup, byte for byte" cmp -s "$D/certs/example.com/fullchain.pem" "$BK1/certs/example.com/fullchain.pem"
+check "create: the private key is in the backup, byte for byte" cmp -s "$D/certs/example.com/privkey.pem" "$BK1/certs/example.com/privkey.pem"
+check "create: the private key in the backup is mode 600" mode_is "$BK1/certs/example.com/privkey.pem" 600
+check "create: the certificate directories in the backup are mode 700" bash -c '[[ "$(stat -c %a "$1/certs/example.com")" == 700 ]]' _ "$BK1"
+check "create: MANIFEST records format, reason, scope, version and the installed commit" bash -c 'm="$(<"$1/MANIFEST")"; for s in "format=1" "reason=manual" "scope=full" "ezvps_version=0.0.1-old" "ezvps_commit=$2"; do [[ "$m" == *"$s"* ]] || exit 1; done' _ "$BK1" "$BK_OLD_COMMIT"
+check "create: other tools' config is not in the backup (3x-ui database, Backpack config, tool binaries)" bash -c '! find "$1" \( -name x-ui.db -o -name backpack.conf -o -name backpack -o -name ctunnel -o -name acme.sh -o -name .bashrc \) | grep -q .' _ "$BK1"
+check "create: the output lists exactly what is included (script)" contains "$OUT" "ezvps script:   ${D}/bin/ezvps"
+check "create: the output lists the state files" contains "$OUT" "ezvps state:    2 files from ${D}/state"
+check "create: the output lists the ezvps-made nginx site" contains "$OUT" "nginx sites:    1 ezvps-made site from ${D}/nginx/conf.d: example.com.conf"
+check "create: the output lists the certificate domain" contains "$OUT" "certificates:   1 domain from ${D}/certs: example.com"
+check "create: the plan says what is not included" contains "$OUT" "Other tools' own config (3x-ui, Backpack, ...), users and SSH settings are not included."
+check "create: the private key is never printed" no_key_leak "$OUT"
+check "create: no key block is printed" not_contains "$OUT" "PRIVATE KEY"
+check "create: the sources are untouched (sites, certificates, other tools)" equals "$(bk_snap_tools)" "$before_tools"
+check "create: the installed script and state are untouched" equals "$(bk_snap "$D/bin")$(bk_snap "$D/state")" "${before_bin}${before_state}"
+check "create: no temporary files are left behind" no_tmp_in_bin
+snap1="$(bk_snap "$BK1")"
+run_bk "$BKBIN" "1\n1\n0\n" backup
+check "create twice: two separate backups" equals "$(bk_n)" 3
+check "create twice: the first backup is unchanged" equals "$(bk_snap "$BK1")" "$snap1"
+check "create twice: the newer backup has a different name" test "$(bk_last)" != "$BK1"
+check "create: no temporary files in the temp directory" bk_tmp_clean
+
+echo "-- Create backup: nothing to include, and refusals"
+bk_new
+rm -rf "$D/certs" "$D/state"
+rm -f "$D/nginx/conf.d/example.com.conf"
+run_bk "$BKBIN" "1\n0\n" backup
+BK2="$(bk_last)"
+check "create (no sites, no certificates, no state): still succeeds" contains "$OUT" "Backup created and verified: ${BK2}"
+check "create: says there are no ezvps-made sites" contains "$OUT" "no ezvps-made sites in ${D}/nginx/conf.d"
+check "create: says there are no certificates" contains "$OUT" "none in ${D}/certs"
+check "create: says there is no state" contains "$OUT" "none found in ${D}/state"
+check "create: no empty nginx-sites/certs/state directories" test ! -e "$BK2/nginx-sites" -a ! -e "$BK2/certs" -a ! -e "$BK2/state"
+check "create: the script is still backed up" cmp -s "$D/bin/ezvps" "$BK2/bin/ezvps"
+bk_new
+printf 'not a directory\n' >"$D/afile"
+BK_EXTRA=(EZVPS_BACKUP_DIR="$D/afile/sub")
+run_bk "$BKBIN" "1\n0\n" backup
+check "create: an unusable backup directory is refused with a message" contains "$OUT" "cannot be created or set to mode 700"
+check "create: nothing is created when the backup directory is unusable" test ! -e "$D/afile/sub"
+check "create: the refusal exits 0 (the menu survives)" equals "$RC" 0
+bk_new
+BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/ubuntu2510")
+run_bk "$BKBIN" "1\n0\n" backup
+check "create: an unsupported system is refused with the shared message" contains "$OUT" "Create backup needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'"
+check "create: nothing is created on an unsupported system" equals "$(bk_n)" 0
+for f in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    bk_new
+    BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/$f")
+    run_bk "$BKBIN" "1\n0\n" backup
+    check "create works on the supported system ${f}" contains "$OUT" "Backup created and verified"
+done
+bk_new
+run_bk "$BKBIN_NOCMP" "1\n0\n" backup
+check "create: a missing required command is named, nothing created" bash -c '[[ "$1" == *"Required command(s) not found: cmp"* && "$2" == 0 ]]' _ "$OUT" "$(bk_n)"
+
+# --- list backups ----------------------------------------------------------------------------------
+echo "-- List backups"
+bk_new
+rm -rf "$D/backups"
+mkdir -p "$D/backups"
+chmod 700 "$D/backups"
+mk_fake_backup() { # mk_fake_backup <name> <reason> <state files> <sites> <cert domains> [script 1|0]
+    local b="$D/backups/$1" i
+    mkdir -m 700 "$b"
+    if [[ "${6:-1}" == 1 ]]; then
+        mkdir -m 700 "$b/bin"
+        bk_write_ezvps "$b/bin/ezvps" "0.0.0-fake-$1"
+    fi
+    if (($3 > 0)); then
+        mkdir -m 700 "$b/state"
+        for ((i = 1; i <= $3; i++)); do printf 'fake=%s\n' "$i" >"$b/state/f$i.state"; done
+    fi
+    if (($4 > 0)); then
+        mkdir -m 700 "$b/nginx-sites"
+        for ((i = 1; i <= $4; i++)); do printf 'fake site %s\n' "$i" >"$b/nginx-sites/s$i.example.com.conf"; done
+    fi
+    if (($5 > 0)); then
+        mkdir -m 700 "$b/certs"
+        for ((i = 1; i <= $5; i++)); do
+            mkdir -m 700 "$b/certs/d$i.example.com"
+            printf 'FAKE-CERT\n' >"$b/certs/d$i.example.com/fullchain.pem"
+        done
+    fi
+    printf 'format=1\ncreated=%s\nreason=%s\nscope=full\nezvps_version=0.0.0\nezvps_commit=unknown\n' "${1#ezvps-backup.}" "$2" >"$b/MANIFEST"
+}
+# created out of order on purpose; two share a second (the -NN suffix orders them)
+mk_fake_backup ezvps-backup.20260101-090000-01 manual 2 0 0
+mk_fake_backup ezvps-backup.20260301-120000-01 pre-update 1 1 1
+mk_fake_backup ezvps-backup.20251231-235959-01 manual 0 0 0
+mk_fake_backup ezvps-backup.20260301-120000-02 pre-restore 3 2 2
+mkdir -m 700 "$D/backups/ezvps-backup.20260401-000000-01" # no MANIFEST: an incomplete one
+mkdir -m 700 "$D/backups/ezvps-backup.not-a-time"
+mkdir -m 700 "$D/backups/x-ui.20260101-000000.123"
+printf 'x\n' >"$D/backups/nginx-site-example.com.20260101-000000.1"
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\n0\n" backup
+check "list: exits 0" equals "$RC" 0
+check "list: says times are UTC and newest first" contains "$OUT" "(newest first, times are UTC)"
+check "list: newest first (same second: -02 before -01)" out_order "2026-03-01 12:00:00" "2026-01-01 09:00:00"
+check "list: -02 listed before -01 of the same second" out_order "ezvps-backup.20260301-120000-02" "ezvps-backup.20260301-120000-01"
+check "list: then January, then December" out_order "ezvps-backup.20260101-090000-01" "ezvps-backup.20251231-235959-01"
+check "list: the order is exactly 4 > 3 > 2 > 1 by number" bash -c 'o="$1"; a="$(grep -nF "ezvps-backup.20260301-120000-02" <<<"$o" | head -1 | cut -d: -f1)"; b="$(grep -nF "ezvps-backup.20260301-120000-01" <<<"$o" | head -1 | cut -d: -f1)"; c="$(grep -nF "ezvps-backup.20260101-090000-01" <<<"$o" | head -1 | cut -d: -f1)"; d="$(grep -nF "ezvps-backup.20251231-235959-01" <<<"$o" | head -1 | cut -d: -f1)"; ((a < b && b < c && c < d))' _ "$OUT"
+check "list: numbered 1 to 4" bash -c '[[ "$1" == *" 1) 2026-03-01 12:00:00"* && "$1" == *" 4) 2025-12-31 23:59:59"* ]]' _ "$OUT"
+check "list: shows the timestamp of each backup" contains "$OUT" "2026-01-01 09:00:00"
+check "list: shows a size for each backup" bash -c '[[ "$(grep -cE "[0-9]+(\.[0-9])? (B|KiB|MiB) " <<<"$1")" == 4 ]]' _ "$OUT"
+check "list: contents summary (script, state files, sites, certificate domains)" contains "$OUT" "script, 3 state files, 2 nginx sites, 2 certificate domains"
+check "list: contents summary for a smaller backup" contains "$OUT" "script, 1 state file, 1 nginx site, 1 certificate domain"
+check "list: contents summary, script only" contains "$OUT" "script, 2 state files"
+check "list: shows the reason (pre-restore, pre-update, manual)" bash -c '[[ "$1" == *pre-restore* && "$1" == *pre-update* && "$1" == *manual* ]]' _ "$OUT"
+check "list: prints the path of each backup" contains "$OUT" "${D}/backups/ezvps-backup.20260301-120000-02"
+check "list: the incomplete backup (no MANIFEST) and the odd name are not listed, but counted" contains "$OUT" "(Not listed: 2 entries named ezvps-backup.* that are incomplete or unrecognised.)"
+check "list: backups of other modules are not listed (and the output says so)" bash -c '[[ "$1" != *"x-ui.2026"* && "$1" != *"nginx-site-example"* && "$1" == *"Backups made by other ezvps modules"* ]]' _ "$OUT"
+check "list: it changes nothing" equals "$(bk_snap_all)" "$before"
+rm -rf "$D/backups"
+BK_EXTRA=()
+run_bk "$BKBIN" "2\n0\n" backup
+check "list (no backup directory): says there are none" contains "$OUT" "No ezvps backups found in ${D}/backups."
+check "list: a read-only action does not create the backup directory" test ! -e "$D/backups"
+BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/ubuntu2510")
+run_bk "$BKBIN" "2\n0\n" backup
+check "list: an unsupported system is refused" contains "$OUT" "List backups needs a supported system"
+
+# --- restore backup --------------------------------------------------------------------------------
+echo "-- Restore backup"
+bk_restore_setup() { # state A is backed up, then the system is changed to state B
+    bk_new
+    run_bk "$BKBIN" "1\n0\n" backup
+    BKA="$(bk_last)"
+    cp -a "$D/bin/ezvps" "$BKW/A-ezvps"
+    # --- now state B
+    bk_write_ezvps "$D/bin/ezvps" "0.0.1-changed"
+    printf 'mode=self\nusername=otheruser\npassword_default=0\n' >"$D/state/3x-ui.state"
+    bk_record "$BK_NEW_COMMIT" "$BK_SRC_SSH" "0.0.1-changed"
+    bk_site example.com.conf example.com 127.0.0.1:4000
+    bk_site b.example.com.conf b.example.com 127.0.0.1:5000
+    printf 'CHANGED-CHAIN\n' >"$D/certs/example.com/fullchain.pem"
+    printf 'CHANGED-KEY-MARKER\n' >"$D/certs/example.com/privkey.pem"
+    chmod 644 "$D/certs/example.com/fullchain.pem"
+    chmod 600 "$D/certs/example.com/privkey.pem"
+    mkdir -m 700 "$D/certs/b.example.com"
+    printf 'B-CHAIN\n' >"$D/certs/b.example.com/fullchain.pem"
+    : >"$D/log"
+}
+bk_restore_setup
+cp -a "$D/bin" "$BKW/B-bin" && cp -a "$D/state" "$BKW/B-state" && cp -a "$D/nginx" "$BKW/B-nginx" && cp -a "$D/certs" "$BKW/B-certs"
+snapA="$(bk_snap "$BKA")"
+hand_before="$(<"$D/nginx/conf.d/hand.conf")"
+other_before="$(bk_snap_other)"
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+BKP="$(bk_last)"
+check "restore: exits 0" equals "$RC" 0
+check "restore: lists the backups first" out_order "ezvps backups in ${D}/backups" "A restore will put back:"
+check "restore: shows what will be restored before anything is changed" out_order "A restore will put back:" "Backing up the current state first..."
+check "restore: the current state is backed up (a second backup exists)" equals "$(bk_n)" 2
+check "restore: the current-state backup is made first, before anything is restored" out_order "Backing up the current state first..." "Restored from"
+check "restore: the pre-restore backup is announced with its path" contains "$OUT" "Backup created and verified: ${BKP}"
+check "restore: the pre-restore backup is marked as such" file_has "$BKP/MANIFEST" "reason=pre-restore"
+check "restore: the pre-restore backup holds the CURRENT script (state B), not the restored one" cmp -s "$BKW/B-bin/ezvps" "$BKP/bin/ezvps"
+check "restore: the pre-restore backup holds the current state files" cmp -s "$BKW/B-state/3x-ui.state" "$BKP/state/3x-ui.state"
+check "restore: the pre-restore backup holds the current sites" cmp -s "$BKW/B-nginx/conf.d/example.com.conf" "$BKP/nginx-sites/example.com.conf"
+check "restore: the pre-restore backup holds the site that is not in the chosen backup" cmp -s "$BKW/B-nginx/conf.d/b.example.com.conf" "$BKP/nginx-sites/b.example.com.conf"
+check "restore: the pre-restore backup holds the current certificates and keys" bash -c 'cmp -s "$1/example.com/privkey.pem" "$2/certs/example.com/privkey.pem" && cmp -s "$1/b.example.com/fullchain.pem" "$2/certs/b.example.com/fullchain.pem"' _ "$BKW/B-certs" "$BKP"
+check "restore: the pre-restore backup directory is mode 700" mode_is "$BKP" 700
+check "restore: the script is the backed-up one (byte for byte)" cmp -s "$BKW/A-ezvps" "$D/bin/ezvps"
+check "restore: the script is executable again" test -x "$D/bin/ezvps"
+check "restore: the state file is the backed-up one" cmp -s "$BKA/state/3x-ui.state" "$D/state/3x-ui.state"
+check "restore: the install record is the backed-up one" cmp -s "$BKA/state/install.state" "$D/state/install.state"
+check "restore: the site is the backed-up one" cmp -s "$BKA/nginx-sites/example.com.conf" "$D/nginx/conf.d/example.com.conf"
+check "restore: the certificate is the backed-up one" cmp -s "$BKA/certs/example.com/fullchain.pem" "$D/certs/example.com/fullchain.pem"
+check "restore: the private key is the backed-up one" cmp -s "$BKA/certs/example.com/privkey.pem" "$D/certs/example.com/privkey.pem"
+check "restore: the private key is mode 600" mode_is "$D/certs/example.com/privkey.pem" 600
+check "restore: the certificate directories are mode 700" bash -c '[[ "$(stat -c %a "$1/certs")" == 700 && "$(stat -c %a "$1/certs/example.com")" == 700 ]]' _ "$D"
+check "restore: a site that is not in the backup is left alone (nothing is deleted)" test -f "$D/nginx/conf.d/b.example.com.conf"
+check "restore: a certificate that is not in the backup is left alone" test -f "$D/certs/b.example.com/fullchain.pem"
+check "restore: a hand-written site is untouched" equals "$(<"$D/nginx/conf.d/hand.conf")" "$hand_before"
+check "restore: other tools (3x-ui, Backpack, tool binaries, acme.sh, home) are untouched" equals "$(bk_snap_other)" "$other_before"
+check "restore: the chosen backup itself is unchanged" equals "$(bk_snap "$BKA")" "$snapA"
+check "restore: reports the script as restored and verified" contains "$OUT" "restored: ezvps script: ${D}/bin/ezvps (version 0.0.1-old, verified)"
+check "restore: reports the state files as restored" contains "$OUT" "restored: state files: 3x-ui.state install.state in ${D}/state (verified)"
+check "restore: reports the certificates as restored" contains "$OUT" "restored: certificates: 2 files in ${D}/certs (verified, keys mode 600)"
+check "restore: reports the nginx site as restored after the config test" contains "$OUT" "restored: nginx sites: example.com.conf (nginx -t passed)"
+check "restore: nginx -t ran after the sites were written" contains "$OUT" "nginx -t passed after restoring the sites."
+check "restore: nginx -t ran before the reload" bk_log_after "nginx -t" "systemctl reload nginx"
+check "restore: nginx was reloaded exactly once" equals "$(grep -c 'systemctl reload nginx' "$D/log")" 1
+check "restore: points to the pre-restore backup" contains "$OUT" "The state before the restore is in ${BKP}."
+check "restore: the private key is never printed" no_key_leak "$OUT"
+check "restore: the other key is never printed either" not_contains "$OUT" "CHANGED-KEY-MARKER"
+check "restore: no temporary files are left behind" no_tmp_in_bin
+check "restore: no temporary files in conf.d" bash -c '! find "$1" -name ".ezb.*" | grep -q .' _ "$D/nginx"
+
+echo "-- Restore backup: confirmation and input"
+bk_restore_setup
+before="$(bk_snap_all)"
+for ans in yes Yes y "YES please" "" " " "NO" "YES " " YES"; do
+    run_bk "$BKBIN" "3\n1\n${ans}\n0\n" backup
+    check "restore: answer '${ans}' does not confirm (only the exact word YES does)" bash -c '[[ "$1" == *"Cancelled (only the exact word YES confirms). Nothing was changed."* ]]' _ "$OUT"
+done
+check "restore: nothing changed after the wrong answers, and no pre-restore backup was made" equals "$(bk_snap_all)" "$before"
+run_bk "$BKBIN" "3\n1\n" backup
+check "restore: EOF at the YES prompt changes nothing" equals "$(bk_snap_all)" "$before"
+for pick in 0 9 abc -1 1.5 "1 2" 00; do
+    run_bk "$BKBIN" "3\n${pick}\n0\n" backup
+    check "restore: backup number '${pick}' is refused, nothing changed" bash -c '[[ "$1" == *"That is not one of the listed backups. Nothing was changed."* || "$1" == *"Cancelled. Nothing was changed."* ]]' _ "$OUT"
+done
+run_bk "$BKBIN" "3\n\n0\n" backup
+check "restore: an empty number cancels" contains "$OUT" "Cancelled. Nothing was changed."
+check "restore: nothing changed after the bad numbers" equals "$(bk_snap_all)" "$before"
+bk_new
+run_bk "$BKBIN" "3\n0\n" backup
+check "restore: with no backups it says so" contains "$OUT" "No ezvps backups found in ${D}/backups. Nothing to restore."
+bk_restore_setup
+BK_EXTRA=(EZVPS_BACKUP_DIR="$D/afile/sub")
+printf 'x\n' >"$D/afile"
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+check "restore: an unusable backup directory is refused before anything is asked" contains "$OUT" "cannot be created or set to mode 700"
+BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/debian11")
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+check "restore: an unsupported system is refused" contains "$OUT" "Restore backup needs a supported system"
+check "restore: nothing changed on an unsupported system" equals "$(bk_snap_all)" "$before"
+
+echo "-- Restore backup: a failing nginx config test rolls everything back"
+bk_new
+bk_site bad.example.com.conf bad.example.com 127.0.0.1:6000 "BROKEN_DIRECTIVE;"
+run_bk "$BKBIN" "1\n0\n" backup
+BKA="$(bk_last)"
+rm -f "$D/nginx/conf.d/bad.example.com.conf"
+bk_write_ezvps "$D/bin/ezvps" "0.0.1-changed"
+bk_site example.com.conf example.com 127.0.0.1:4000
+printf 'CHANGED-CHAIN\n' >"$D/certs/example.com/fullchain.pem"
+printf 'CHANGED-KEY-MARKER\n' >"$D/certs/example.com/privkey.pem"
+chmod 600 "$D/certs/example.com/privkey.pem"
+printf 'mode=self\n' >"$D/state/3x-ui.state"
+: >"$D/log"
+before_bin="$(bk_snap "$D/bin")"
+before_state="$(bk_snap "$D/state")"
+before_nginx="$(bk_snap "$D/nginx")"
+before_certs="$(bk_snap "$D/certs")"
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+check "rollback: nginx -t failed and says so" contains "$OUT" "nginx -t FAILED after restoring the sites:"
+check "rollback: the nginx error output is shown" contains "$OUT" 'unknown directive "BROKEN_DIRECTIVE"'
+check "rollback: says it rolled back and verified it" contains "$OUT" "Rolled back: certificates and sites are as they were (verified against"
+check "rollback: nginx -t passes again afterwards" contains "$OUT" "nginx -t passes again."
+check "rollback: says the restore failed" contains "$OUT" "Restore failed. nginx was not reloaded; the script and state files were not changed."
+check "rollback: the new site from the backup is gone again" test ! -e "$D/nginx/conf.d/bad.example.com.conf"
+check "rollback: the nginx directory is exactly as before (sites, modes)" equals "$(bk_snap "$D/nginx")" "$before_nginx"
+check "rollback: the certificates and the key are exactly as before (content, modes)" equals "$(bk_snap "$D/certs")" "$before_certs"
+check "rollback: the script is untouched" equals "$(bk_snap "$D/bin")" "$before_bin"
+check "rollback: the state files are untouched" equals "$(bk_snap "$D/state")" "$before_state"
+check "rollback: nginx was never reloaded" bk_log_lacks "systemctl reload"
+check "rollback: the pre-restore backup was made (and is kept)" equals "$(bk_n)" 2
+check "rollback: the key is never printed" no_key_leak "$OUT"
+bk_restore_setup
+BK_EXTRA=(FAKE_NGINX_RUNNING=0)
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+check "restore with nginx stopped: sites restored after a passing test" contains "$OUT" "restored: nginx sites: example.com.conf (nginx -t passed)"
+check "restore with nginx stopped: no reload is attempted" bk_log_lacks "systemctl reload"
+check "restore with nginx stopped: says nothing was reloaded" contains "$OUT" "nginx is not running, so nothing was reloaded."
+bk_restore_setup
+printf 'server {\n    listen 80;\n    server_name example.com;\n}\n' >"$D/nginx/conf.d/example.com.conf"
+before_hand="$(<"$D/nginx/conf.d/example.com.conf")"
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+check "restore: a hand-written file with the same name is not overwritten" equals "$(<"$D/nginx/conf.d/example.com.conf")" "$before_hand"
+check "restore: says so" contains "$OUT" "exists and was not made by ezvps; it is not overwritten."
+check "restore: lists it in the notes" contains "$OUT" "nginx sites not overwritten (not made by ezvps): example.com.conf"
+check "restore: the rest is restored (state, certificate)" bash -c 'cmp -s "$1/state/3x-ui.state" "$2/state/3x-ui.state" && cmp -s "$1/certs/example.com/fullchain.pem" "$2/certs/example.com/fullchain.pem"' _ "$BKA" "$D"
+check "restore: no site written means nginx is neither tested nor reloaded for it" bk_log_lacks "systemctl reload"
+bk_restore_setup
+run_bk "$BKBIN_NONGINX" "3\n1\nYES\n0\n" backup
+check "restore without nginx: sites are not restored, and it says so" contains "$OUT" "the nginx sites in this backup are NOT restored"
+check "restore without nginx: the site stays as it was" file_has "$D/nginx/conf.d/example.com.conf" "127.0.0.1:4000"
+check "restore without nginx: script, state and certificates are restored" bash -c 'cmp -s "$1/bin/ezvps" "$2/bin/ezvps" && cmp -s "$1/state/3x-ui.state" "$2/state/3x-ui.state" && cmp -s "$1/certs/example.com/privkey.pem" "$2/certs/example.com/privkey.pem"' _ "$BKA" "$D"
+check "restore without nginx: nothing was reloaded" bk_log_lacks "systemctl reload"
+check "restore without nginx: certificates restored without sites get a note" contains "$OUT" "certificates were restored; nginx was not reloaded"
+bk_restore_setup
+BK_EXTRA=(FAKE_BASH_FAIL_PATH="$D/bin/ezvps")
+cp -a "$D/bin/ezvps" "$BKW/B-ezvps"
+run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+check "restore: a script that fails its syntax check after the copy is rolled back" contains "$OUT" "The restored ezvps script did not verify; putting the previous one back."
+check "restore: the previous script is back, byte for byte" cmp -s "$BKW/B-ezvps" "$D/bin/ezvps"
+check "restore: the problem is reported" contains "$OUT" "The restore finished with problems"
+check "restore: the other parts were restored" cmp -s "$BKA/state/3x-ui.state" "$D/state/3x-ui.state"
+
+echo "-- Restore backup: backups with anything unexpected are refused before any change"
+bk_tamper() { # bk_tamper <description> <command...>: a fresh backup is made, tampered with, and must be refused
+    local desc="$1"
+    shift
+    bk_restore_setup
+    "$@"
+    before="$(bk_snap_all)"
+    run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
+    check "refused: ${desc}" bash -c '[[ "$1" == *"Nothing was changed."* && "$1" != *"Restored from"* && "$1" != *"Backing up the current state"* ]]' _ "$OUT"
+    check "refused: ${desc} (nothing changed, no pre-restore backup)" equals "$(bk_snap_all)" "$before"
+}
+t_symlink_site() { ln -s ../../../etc/passwd "$BKA/nginx-sites/evil.example.com.conf"; }
+t_foreign_site() { printf 'server {\n    server_name hand.example.com;\n}\n' >"$BKA/nginx-sites/hand.example.com.conf"; }
+t_misnamed_site() { cp "$BKA/nginx-sites/example.com.conf" "$BKA/nginx-sites/other.example.com.conf"; }
+t_broken_script() { printf 'if then\n' >>"$BKA/bin/ezvps"; }
+t_noversion() { bk_write_ezvps "$BKA/bin/ezvps" "0.0.9" noversion; }
+t_format() { printf 'format=2\n' >"$BKA/MANIFEST"; }
+t_cert_dir() { mkdir -m 700 "$BKA/certs/not_a_domain"; }
+t_cert_link() { ln -s /etc/passwd "$BKA/certs/example.com/link.pem"; }
+t_state_dir() { mkdir "$BKA/state/subdir"; }
+t_state_link() { ln -s /etc/passwd "$BKA/state/evil.state"; }
+t_bin_link() { mv "$BKA/bin/ezvps" "$BKA/bin/ezvps.real"; ln -s ezvps.real "$BKA/bin/ezvps"; }
+bk_tamper "a symlink among the nginx sites" t_symlink_site
+bk_tamper "a hand-written file among the nginx sites" t_foreign_site
+bk_tamper "an ezvps site whose name does not match its domain" t_misnamed_site
+bk_tamper "a script with a syntax error" t_broken_script
+bk_tamper "a script that reports no version" t_noversion
+bk_tamper "an unknown backup format" t_format
+bk_tamper "a certificate entry that is not a domain" t_cert_dir
+bk_tamper "a symlink inside a certificate directory" t_cert_link
+bk_tamper "a directory inside the state part" t_state_dir
+bk_tamper "a symlink inside the state part" t_state_link
+bk_tamper "a symlinked script" t_bin_link
+
+# --- check for updates -----------------------------------------------------------------------------
+echo "-- Check for updates"
+bk_new
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "1\n0\n" update
+check "check (update available): exits 0" equals "$RC" 0
+check "check: shows the installed version and commit" contains "$OUT" "Installed:  version 0.0.1-old, commit ${BK_OLD_COMMIT:0:12}"
+check "check: shows the latest version and commit, and where from" contains "$OUT" "Latest:     version 0.0.2-new, commit ${BK_NEW_COMMIT:0:12} (main of ${BK_SRC_HTTPS})"
+check "check: says an update is available" contains "$OUT" "Update available"
+check "check: does not claim to be up to date" not_contains "$OUT" "Up to date"
+check "check: nothing was changed (no backup directory entry, nothing written)" equals "$(bk_snap_all)" "$before"
+check "check: git cloned main shallowly from the recorded source (after '--')" bk_log_has "--depth 1 --branch main --single-branch -- ${BK_SRC_HTTPS} "
+check "check: git is limited to https and ssh" bk_log_has "-c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always"
+check "check: git was called once to clone and once to read the commit" equals "$(grep -c '^git ' "$D/log")" 2
+check "check: says what authentication git uses" contains "$OUT" "git uses your own authentication"
+check "check: no temporary directory is left behind" bk_tmp_clean
+BK_EXTRA=(FAKE_MAIN_COMMIT="$BK_OLD_COMMIT")
+run_bk "$BKBIN" "1\n0\n" update
+check "check (same commit): reports up to date" contains "$OUT" "Up to date: the installed commit is the latest main."
+check "check (same commit): does not offer an update" not_contains "$OUT" "Update available"
+bk_new
+rm -f "$D/state/install.state"
+run_bk "$BKBIN" "1\n${BK_SRC_HTTPS}\n0\n" update
+check "check (no install record): version known, commit unknown" contains "$OUT" "Installed:  version 0.0.1-old, commit unknown"
+check "check (no install record): says why" contains "$OUT" "no install record in ${D}/state"
+check "check (no install record): treated as unknown, NOT as up to date" contains "$OUT" "Unknown: ezvps cannot tell whether this install is up to date, so it is NOT reported as current."
+check "check (no install record): never says 'Up to date'" not_contains "$OUT" "Up to date"
+check "check (no install record): points to Update ezvps" contains "$OUT" "Use 'Update ezvps' to install the latest main; that also records the version and commit."
+check "check (no install record): notes that the versions differ" contains "$OUT" "The versions differ (0.0.1-old installed, 0.0.2-new latest)."
+check "check (no install record): asks for the repository (placeholder example)" contains "$OUT" "git@github.com:<owner>/ezvps.git"
+check "check (no install record): used the address that was typed" bk_log_has "-- ${BK_SRC_HTTPS} "
+check "check (no install record): did not record anything" test ! -e "$D/state/install.state"
+bk_new
+bk_record "" "$BK_SRC_HTTPS"
+run_bk "$BKBIN" "1\n0\n" update
+check "check (record without a commit): commit unknown, and why" contains "$OUT" "the install record has no commit"
+check "check (record without a commit): not reported as up to date" not_contains "$OUT" "Up to date"
+bk_new
+bk_record "$BK_NEW_COMMIT"
+printf '# edited by hand\n' >>"$D/bin/ezvps"
+BK_EXTRA=(FAKE_MAIN_COMMIT="$BK_NEW_COMMIT")
+run_bk "$BKBIN" "1\n0\n" update
+check "check (installed script edited after the record, same commit): unknown, not up to date" contains "$OUT" "the installed script differs from the one the install record describes"
+check "check (edited script): never says 'Up to date'" not_contains "$OUT" "Up to date"
+bk_new
+run_bk "$BKBIN_NOGIT" "1\n0\n" update
+check "check without git: says git is needed and why (private repository, no anonymous URL)" contains "$OUT" "git is not installed. It is needed to fetch the latest ezvps from the private repository"
+check "check without git: nothing was changed" equals "$(bk_n)$(<"$D/log")" 0
+bk_new
+BK_EXTRA=(FAKE_GIT_FAIL=1)
+run_bk "$BKBIN" "1\n0\n" update
+check "check: a failing git fetch is reported, nothing changed" contains "$OUT" "Could not fetch 'main' from ${BK_SRC_HTTPS}. Check the address and that you have access to the repository. Nothing was changed."
+check "check: a failing fetch exits 0" equals "$RC" 0
+bk_new
+rm -f "$D/main/ezvps"
+run_bk "$BKBIN" "1\n0\n" update
+check "check: a main without an ezvps script is refused" contains "$OUT" "is not an ezvps checkout"
+bk_new
+bk_record "$BK_OLD_COMMIT" "$BK_SRC_SSH"
+run_bk "$BKBIN" "1\n0\n" update
+check "check: an ssh source (user@host:path) is used as recorded" bk_log_has "-- ${BK_SRC_SSH} "
+bk_new
+bk_record "$BK_OLD_COMMIT" "http://example.com/owner/ezvps.git"
+run_bk "$BKBIN" "1\n\n0\n" update
+check "check: a recorded http:// source is ignored with a warning, never fetched" bash -c '[[ "$1" == *"not an accepted one; it is ignored."* && "$2" == 0 ]]' _ "$OUT" "$(grep -c '^git ' "$D/log")"
+for bad in "http://example.com/owner/ezvps.git" "git://example.com/owner/ezvps.git" "file:///srv/repo" "/srv/repo" "../repo" "-oProxyCommand=x" "ext::sh -c x" "https://testuser:fakepw@example.com/owner/ezvps.git" "https://example.com" "ftp://example.com/o/r"; do
+    bk_new
+    rm -f "$D/state/install.state"
+    run_bk "$BKBIN" "1\n${bad}\n0\n" update
+    check "check: the address '${bad}' is refused, git is not called" bash -c '[[ "$1" == *"That is not an accepted repository address"* && "$2" == 0 ]]' _ "$OUT" "$(grep -c '^git ' "$D/log")"
+    check "check: the refused address '${bad}' is never echoed back" not_contains "$OUT" "${bad#*@}"
+    [[ "$bad" == *fakepw* ]] && check "check: a password in a refused address is never echoed back" not_contains "$OUT" "fakepw"
+done
+bk_new
+rm -f "$D/state/install.state"
+run_bk "$BKBIN" "1\n\n0\n" update
+check "check: an empty address cancels" contains "$OUT" "Cancelled. Nothing was changed."
+for good in "https://github.com/owner/ezvps.git" "https://example.com:8443/owner/ezvps" "ssh://git@example.com/owner/ezvps.git" "ssh://example.com:2222/owner/ezvps.git" "git@github.com:owner/ezvps.git" "deploy_user@example.com:owner/sub/ezvps.git"; do
+    bk_new
+    rm -f "$D/state/install.state"
+    run_bk "$BKBIN" "1\n${good}\n0\n" update
+    check "check: the address '${good}' is accepted" bk_log_has "-- ${good} "
+done
+bk_new
+BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/debian11")
+run_bk "$BKBIN" "1\n0\n" update
+check "check: an unsupported system is refused, git is not called" bash -c '[[ "$1" == *"Check for updates needs a supported system"* && ! -s "$2" ]]' _ "$OUT" "$D/log"
+bk_new
+BK_EXTRA=(EZVPS_BACKUP_DIR="$D/not-yet/backups")
+run_bk "$BKBIN" "1\n0\n" update
+check "check does not need a backup directory (it writes nothing)" contains "$OUT" "Update available"
+check "check does not create the backup directory" test ! -e "$D/not-yet"
+
+# --- update ezvps ----------------------------------------------------------------------------------
+echo "-- Update ezvps"
+bk_new
+cp -a "$D/bin/ezvps" "$BKW/U-old-ezvps"
+cp -a "$D/state/3x-ui.state" "$BKW/U-old-3xui.state"
+printf 'x\n' >"$D/state/extra.state"
+tools_before="$(bk_snap_tools)"
+other_before="$(bk_snap "$D/bin/ezl2tp" 2>/dev/null)"
+run_bk "$BKBIN" "2\nn\n0\n" update
+check "update declined: the plan is shown first" contains "$OUT" "ezvps will replace ${D}/bin/ezvps: version 0.0.1-old -> 0.0.2-new"
+check "update declined: nothing changed" bash -c 'cmp -s "$1" "$2" && [[ "$3" == 0 ]]' _ "$BKW/U-old-ezvps" "$D/bin/ezvps" "$(bk_n)"
+check "update declined: says so" contains "$OUT" "Nothing was changed."
+run_bk "$BKBIN" "2\n\n0\n" update
+check "update: an empty answer is a no" bash -c 'cmp -s "$1" "$2" && [[ "$3" == 0 ]]' _ "$BKW/U-old-ezvps" "$D/bin/ezvps" "$(bk_n)"
+run_bk "$BKBIN" "2\n" update
+check "update: EOF at the question is a no" bash -c 'cmp -s "$1" "$2" && [[ "$3" == 0 ]]' _ "$BKW/U-old-ezvps" "$D/bin/ezvps" "$(bk_n)"
+
+run_bk "$BKBIN" "2\ny\n0\n" update
+BKU="$(bk_last)"
+check "update: exits 0" equals "$RC" 0
+check "update: shows installed versus latest before the plan" out_order "Installed:  version 0.0.1-old" "ezvps will replace"
+check "update: shows the plan (what is replaced, what is preserved)" contains "$OUT" "ezvps will replace ${D}/bin/ezvps: version 0.0.1-old -> 0.0.2-new (commit ${BK_NEW_COMMIT:0:12})."
+check "update: exactly one backup was made, under the backup directory" equals "$(bk_n)" 1
+check "update: the backup is announced before the new script is installed" out_order "Backup created and verified: ${BKU}" "Updated ${D}/bin/ezvps"
+check "update: the backup holds the OLD script, byte for byte" cmp -s "$BKW/U-old-ezvps" "$BKU/bin/ezvps"
+check "update: the backup holds the state files" bash -c 'cmp -s "$1" "$2/state/3x-ui.state" && [[ -f "$2/state/install.state" && -f "$2/state/extra.state" ]]' _ "$BKW/U-old-3xui.state" "$BKU"
+check "update: the backup is marked pre-update, script and state only" bash -c 'm="$(<"$1/MANIFEST")"; [[ "$m" == *"reason=pre-update"* && "$m" == *"scope=core"* && ! -e "$1/nginx-sites" && ! -e "$1/certs" ]]' _ "$BKU"
+check "update: the backup directory is mode 700" mode_is "$BKU" 700
+check "update: the installed file is byte for byte the fetched main" cmp -s "$D/main/ezvps" "$D/bin/ezvps"
+check "update: the installed file is executable (mode 755)" mode_is "$D/bin/ezvps" 755
+check "update: the installed file passes bash -n (checked on the file system)" bash -n "$D/bin/ezvps"
+check "update: the installed file reports the new version" equals "$(EZVPS_ALLOW_NONROOT=1 "$BASH_BIN" "$D/bin/ezvps" --version)" "ezvps 0.0.2-new"
+check "update: reports old -> new and the commit" contains "$OUT" "Updated ${D}/bin/ezvps: version 0.0.1-old -> 0.0.2-new, commit ${BK_NEW_COMMIT:0:12}."
+check "update: reports what was verified" contains "$OUT" "Verified: the installed file is byte-for-byte the fetched main, passes bash -n and reports 'ezvps 0.0.2-new'."
+check "update: records the new version in the install record" equals "$(bk_state_get version)" "0.0.2-new"
+check "update: records the new commit" equals "$(bk_state_get commit)" "$BK_NEW_COMMIT"
+check "update: keeps the source" equals "$(bk_state_get source)" "$BK_SRC_HTTPS"
+check "update: records the sha256 of the installed script" equals "$(bk_state_get sha256)" "$(sha256sum "$D/bin/ezvps" | cut -d' ' -f1)"
+check "update: the install record is mode 600" mode_is "$D/state/install.state" 600
+check "update: the other state files are unchanged" bash -c 'cmp -s "$1" "$2/state/3x-ui.state" && [[ "$(<"$2/state/extra.state")" == x ]]' _ "$BKW/U-old-3xui.state" "$D"
+check "update: says the other state is unchanged" contains "$OUT" "Verified: the other ezvps state files are unchanged. Tool configs, sites, certificates and users were not touched."
+check "update: sites, certificates, tool configs and users are untouched" equals "$(bk_snap_tools)" "$tools_before"
+check "update: ezl2tp next to it is untouched" equals "$(bk_snap "$D/bin/ezl2tp" 2>/dev/null)" "$other_before"
+check "update: no temporary files left behind" no_tmp_in_bin
+check "update: no temporary directory left behind" bk_tmp_clean
+check "update: only git was used to fetch (no curl or wget in the sandbox, no raw URL)" bash -c '! grep -qE "curl|wget|raw\.githubusercontent" "$1"' _ "$D/log"
+check "update: tells the user to restart ezvps" contains "$OUT" "Restart ezvps to use the new version."
+echo "-- Check for updates after the update"
+run_bk "$BKBIN" "1\n0\n" update
+check "check after the update: up to date" contains "$OUT" "Up to date: the installed commit is the latest main."
+check "check after the update: installed equals latest" contains "$OUT" "Installed:  version 0.0.2-new, commit ${BK_NEW_COMMIT:0:12}"
+echo "-- Update again (already the latest)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "update again: nothing to replace" contains "$OUT" "The installed script is byte-for-byte the latest main; there is nothing to replace."
+check "update again: no new backup" equals "$(bk_n)" 1
+check "update again: the install record already matches" contains "$OUT" "The install record already matches."
+check "update again: no plan is shown, nothing is offered" not_contains "$OUT" "ezvps will replace"
+
+echo "-- Update ezvps: a candidate that is not usable is refused before anything changes"
+bk_new
+bk_write_ezvps "$D/main/ezvps" "0.0.2-new" broken
+cp -a "$D/bin/ezvps" "$BKW/U-old-ezvps"
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "failed syntax check of the new script: refused" contains "$OUT" "The latest main script is not usable (syntax check failed:"
+check "failed syntax check: no plan is shown, nothing is offered" not_contains "$OUT" "ezvps will replace"
+check "failed syntax check: the installed script and everything else is as before" equals "$(bk_snap_all)" "$before"
+bk_new
+bk_write_ezvps "$D/main/ezvps" "0.0.2-new" noversion
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "a new script whose --version fails: refused" contains "$OUT" "The latest main script is not usable (--version failed"
+check "a new script whose --version fails: nothing changed" equals "$(bk_snap_all)" "$before"
+bk_new
+printf '#!/usr/bin/env bash\necho hello\n' >"$D/main/ezvps"
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "a new script that prints no version: refused" contains "$OUT" "--version did not report a version"
+check "a new script that prints no version: nothing changed" equals "$(bk_snap_all)" "$before"
+
+echo "-- Update ezvps: rollback when the installed script fails its check afterwards"
+bk_new
+cp -a "$D/bin/ezvps" "$BKW/U-old-ezvps"
+cp -a "$D/state/install.state" "$BKW/U-old-install.state"
+tools_before="$(bk_snap_tools)"
+BK_EXTRA=(FAKE_BASH_FAIL_PATH="$D/bin/ezvps")
+run_bk "$BKBIN" "2\ny\n0\n" update
+BKU="$(bk_last)"
+check "rollback: the failed check after the install is reported" contains "$OUT" "The new script did not verify after it was installed (syntax check failed:"
+check "rollback: says it rolled back and verified it byte for byte" contains "$OUT" "Rolled back: ${D}/bin/ezvps is the previous script again (verified byte for byte against ${BKU})."
+check "rollback: the previous script is back, byte for byte" cmp -s "$BKW/U-old-ezvps" "$D/bin/ezvps"
+check "rollback: the previous script still runs" equals "$(EZVPS_ALLOW_NONROOT=1 "$BASH_BIN" "$D/bin/ezvps" --version)" "ezvps 0.0.1-old"
+check "rollback: the backup was made before the replacement and is kept" bash -c 'cmp -s "$1" "$2/bin/ezvps"' _ "$BKW/U-old-ezvps" "$BKU"
+check "rollback: the install record was not rewritten" cmp -s "$BKW/U-old-install.state" "$D/state/install.state"
+check "rollback: never reports an update as done" not_contains "$OUT" "Updated ${D}/bin/ezvps"
+check "rollback: the mode is 755 again" mode_is "$D/bin/ezvps" 755
+check "rollback: no temporary files are left behind" no_tmp_in_bin
+check "rollback: everything else is untouched" equals "$(bk_snap_tools)" "$tools_before"
+
+echo "-- Update ezvps: edge cases"
+bk_new
+rm -f "$D/bin/ezvps"
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "update when ezvps is not installed: says so and points to install.sh" contains "$OUT" "ezvps is not installed at ${D}/bin/ezvps; nothing to update. Run install.sh from a checkout"
+check "update when ezvps is not installed: nothing changed, git not called" bash -c '[[ ! -s "$1" ]]' _ "$D/log"
+bk_new
+cp "$D/main/ezvps" "$D/bin/ezvps"
+chmod 755 "$D/bin/ezvps"
+rm -f "$D/state/install.state"
+run_bk "$BKBIN" "2\n${BK_SRC_HTTPS}\n0\n" update
+check "update (identical script, unknown commit): nothing is replaced" contains "$OUT" "there is nothing to replace."
+check "update (identical script, unknown commit): the commit is recorded and verified" contains "$OUT" "Recorded version 0.0.2-new and commit ${BK_NEW_COMMIT:0:12} in ${D}/state/install.state (verified)."
+check "update (identical script, unknown commit): the record has commit and source" bash -c '[[ "$1" == "$2" && "$3" == "$4" ]]' _ "$(bk_state_get commit)" "$BK_NEW_COMMIT" "$(bk_state_get source)" "$BK_SRC_HTTPS"
+check "update (identical script, unknown commit): no backup, no question" bash -c '[[ "$1" == 0 && "$2" != *"ezvps will replace"* ]]' _ "$(bk_n)" "$OUT"
+run_bk "$BKBIN" "1\n0\n" update
+check "update (identical script): the next check says up to date" contains "$OUT" "Up to date: the installed commit is the latest main."
+bk_new
+BK_EXTRA=(EZVPS_BACKUP_DIR="$D/afile/sub")
+printf 'x\n' >"$D/afile"
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "update: an unusable backup directory is refused before anything is fetched" bash -c '[[ "$1" == *"cannot be created or set to mode 700"* && ! -s "$2" ]]' _ "$OUT" "$D/log"
+check "update: an unusable backup directory changes nothing" equals "$(bk_snap_all)" "$before"
+bk_new
+BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/ubuntu2310")
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "update: an unsupported system is refused, git is not called" bash -c '[[ "$1" == *"Update ezvps needs a supported system"* && ! -s "$2" ]]' _ "$OUT" "$D/log"
+check "update: an unsupported system changes nothing" equals "$(bk_snap_all)" "$before"
+bk_new
+run_bk "$BKBIN_NOGIT" "2\ny\n0\n" update
+check "update without git: refused with a message, nothing changed" bash -c '[[ "$1" == *"git is not installed"* && "$2" == 0 ]]' _ "$OUT" "$(bk_n)"
+bk_new
+BK_EXTRA=(FAKE_GIT_FAIL=1)
+cp -a "$D/bin/ezvps" "$BKW/U-old-ezvps"
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "update: a failed fetch changes nothing and makes no backup" bash -c 'cmp -s "$1" "$2" && [[ "$3" == 0 ]]' _ "$BKW/U-old-ezvps" "$D/bin/ezvps" "$(bk_n)"
+
+# --- uninstall -------------------------------------------------------------------------------------
+echo "-- Uninstall"
+bk_uninstall_setup() {
+    bk_new
+    mkdir -m 700 "$D/backups/ezvps-backup.20250101-000000-01"
+    printf 'format=1\ncreated=20250101-000000-01\nreason=manual\nscope=full\n' >"$D/backups/ezvps-backup.20250101-000000-01/MANIFEST"
+    printf 'old backup\n' >"$D/backups/x-ui.20250101-000000.99"
+    chmod 700 "$D/backups"
+}
+bk_uninstall_setup
+before="$(bk_snap_all)"
+for ans in yes y Yes "" "YES please" " YES" "NO"; do
+    run_bk "$BKBIN" "${ans}\n" uninstall
+    check "uninstall: answer '${ans}' does not confirm" contains "$OUT" "Cancelled (only the exact word YES confirms). Nothing was changed."
+done
+run_bk "$BKBIN" "" uninstall
+check "uninstall: EOF at the prompt changes nothing" contains "$OUT" "Nothing was changed."
+check "uninstall: nothing changed after refusals, and no backup was made" equals "$(bk_snap_all)" "$before"
+check "uninstall: the plan lists exactly what will be removed" bash -c '[[ "$1" == *"  ${2}/bin/ezvps"* && "$1" == *"  ${2}/state/3x-ui.state"* && "$1" == *"  ${2}/state/install.state"* ]]' _ "$OUT" "$D"
+check "uninstall: the plan says what stays" contains "$OUT" "It does NOT touch nginx, 3x-ui, Backpack, ctunnel, Lazyports, ezl2tp, their configs, nginx sites,"
+check "uninstall: the plan says backups are never deleted" contains "$OUT" "or any backup (backups are never deleted)."
+
+bk_uninstall_setup
+cp -a "$D/bin/ezvps" "$BKW/N-old-ezvps"
+cp -a "$D/state" "$BKW/N-old-state"
+cp -a "$D/backups/ezvps-backup.20250101-000000-01" "$BKW/N-old-backup"
+tools_before="$(bk_snap_tools)"
+ezl2tp_before="$(bk_snap "$D/bin/ezl2tp" 2>/dev/null)"
+oldbk_before="$(bk_snap "$D/backups/ezvps-backup.20250101-000000-01")"
+run_bk "$BKBIN" "YES\n" uninstall
+BKN="$(bk_last)"
+check "uninstall: exits 0" equals "$RC" 0
+check "uninstall: a backup was made under the backup directory (the older one is still there)" equals "$(bk_n)" 2
+check "uninstall: the backup path is printed" contains "$OUT" "Backup path: ${BKN}"
+check "uninstall: the backup is made before anything is removed" out_order "Backup path: ${BKN}" "Removed (checked on the file system):"
+check "uninstall: the backup holds the script, byte for byte" cmp -s "$BKW/N-old-ezvps" "$BKN/bin/ezvps"
+check "uninstall: the backup holds the state files" bash -c 'cmp -s "$1/3x-ui.state" "$2/state/3x-ui.state" && cmp -s "$1/install.state" "$2/state/install.state"' _ "$BKW/N-old-state" "$BKN"
+check "uninstall: the backup is marked pre-uninstall and is mode 700" bash -c '[[ "$(<"$1/MANIFEST")" == *"reason=pre-uninstall"* ]] && [[ "$(stat -c %a "$1")" == 700 ]]' _ "$BKN"
+check "uninstall: /usr/local/bin/ezvps is gone (checked on the file system)" test ! -e "$D/bin/ezvps"
+check "uninstall: the state files are gone" test ! -e "$D/state/3x-ui.state" -a ! -e "$D/state/install.state"
+check "uninstall: the empty state directory is gone" test ! -e "$D/state"
+check "uninstall: the report lists what was removed: the script" contains "${OUT#*Removed (checked on the file system):}" "  ${D}/bin/ezvps"
+check "uninstall: the report lists what was removed: the state files" bash -c '[[ "$1" == *"  ${2}/state/3x-ui.state"* && "$1" == *"  ${2}/state/install.state"* ]]' _ "$OUT" "$D"
+check "uninstall: nothing is reported as not removable" not_contains "$OUT" "could NOT be removed"
+check "uninstall: the report has a 'Left untouched' list" contains "$OUT" "Left untouched (looked up on the file system just now):"
+check "uninstall: nginx is reported present and not touched" contains "$OUT" "${D}/nginx (present, not touched)"
+check "uninstall: 3x-ui is reported present and not touched" contains "$OUT" "${D}/xui (present, not touched)"
+check "uninstall: the certificate store is reported present and not touched" contains "$OUT" "${D}/certs (present, not touched)"
+check "uninstall: Backpack's config and the tool binaries are reported" bash -c '[[ "$1" == *"${2}/backpack (present, not touched)"* && "$1" == *"${2}/prefix/bin/backpack (present, not touched)"* && "$1" == *"${2}/prefix/bin/ctunnel (present, not touched)"* && "$1" == *"${2}/prefix/bin/lazyports (not present)"* ]]' _ "$OUT" "$D"
+check "uninstall: users, SSH settings and firewall rules are named as untouched" contains "$OUT" "user accounts, SSH settings and firewall rules (never touched by ezvps Uninstall)"
+check "uninstall: nginx sites, certificates (and the key), 3x-ui, Backpack, tools, acme.sh, home are byte for byte untouched" equals "$(bk_snap_tools)" "$tools_before"
+check "uninstall: the private key is still there, mode 600" mode_is "$D/certs/example.com/privkey.pem" 600
+check "uninstall: ezl2tp next to ezvps is untouched" equals "$(bk_snap "$D/bin/ezl2tp" 2>/dev/null)" "$ezl2tp_before"
+check "uninstall: an older backup is kept, unchanged" equals "$(bk_snap "$D/backups/ezvps-backup.20250101-000000-01")" "$oldbk_before"
+check "uninstall: another module's backup is kept" test -f "$D/backups/x-ui.20250101-000000.99"
+check "uninstall: says all backups are kept" contains "$OUT" "all backups kept, including ${BKN}"
+check "uninstall: says how to bring ezvps back" contains "$OUT" "copy ${BKN}/bin/ezvps to ${D}/bin/ezvps."
+check "uninstall: the private key is never printed" no_key_leak "$OUT"
+check "uninstall: nothing but the script and the state was removed (only 'ezl2tp' remains in the bin dir)" equals "$(ls -A "$D/bin")" "ezl2tp"
+
+echo "-- Uninstall: other files in the state directory, the menu, refusals"
+bk_uninstall_setup
+printf 'keep me\n' >"$D/state/notes.txt"
+run_bk "$BKBIN" "YES\n" uninstall
+check "uninstall: a state directory with other files is kept, and says so" contains "$OUT" "The state directory ${D}/state is kept because it still holds other files."
+check "uninstall: the other file is untouched" equals "$(<"$D/state/notes.txt")" "keep me"
+check "uninstall: only the state files were removed from it" equals "$(ls -A "$D/state")" "notes.txt"
+bk_uninstall_setup
+printf 'partial\n' >"$D/state/3x-ui.state.tmp.123"
+run_bk "$BKBIN" "YES\n" uninstall
+check "uninstall: a leftover state temp file is removed too" test ! -e "$D/state/3x-ui.state.tmp.123"
+bk_uninstall_setup
+run_bk "$BKBIN" "12\nYES\n\n0\n"
+check "uninstall via the main menu: removes ezvps" test ! -e "$D/bin/ezvps"
+check "uninstall via the main menu: leaves the menu afterwards" contains "$OUT" "ezvps has been uninstalled; leaving the menu."
+check "uninstall via the main menu: the menu is not drawn again" equals "$(count_lines "$OUT" "ezvps 0.0.1")" 1
+check "uninstall via the main menu: exits 0" equals "$RC" 0
+bk_uninstall_setup
+rm -f "$D/bin/ezvps"
+run_bk "$BKBIN" "YES\n" uninstall
+check "uninstall with only state files left: removes them, with a backup" bash -c '[[ ! -e "$1/state/3x-ui.state" && "$2" == 2 ]]' _ "$D" "$(bk_n)"
+bk_new
+rm -f "$D/bin/ezvps"
+rm -rf "$D/state"
+run_bk "$BKBIN" "YES\n" uninstall
+check "uninstall when nothing is installed: says so, asks nothing, makes no backup" bash -c '[[ "$1" == *"there is nothing to uninstall."* && "$1" != *"Uninstall removes ezvps itself"* && "$2" == 0 ]]' _ "$OUT" "$(bk_n)"
+bk_uninstall_setup
+BK_EXTRA=(EZVPS_BACKUP_DIR="$D/afile/sub")
+printf 'x\n' >"$D/afile"
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "YES\n" uninstall
+check "uninstall: an unusable backup directory is refused, nothing removed" bash -c '[[ "$1" == *"cannot be created or set to mode 700"* && -e "$2/bin/ezvps" && -e "$2/state/install.state" ]]' _ "$OUT" "$D"
+check "uninstall: an unusable backup directory changes nothing" equals "$(bk_snap_all)" "$before"
+bk_uninstall_setup
+BK_EXTRA=(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/ubuntu2504")
+before="$(bk_snap_all)"
+run_bk "$BKBIN" "YES\n" uninstall
+check "uninstall: an unsupported system is refused" contains "$OUT" "Uninstall needs a supported system"
+check "uninstall: an unsupported system changes nothing" equals "$(bk_snap_all)" "$before"
+bk_uninstall_setup
+run_bk "$BKBIN_NOCMP" "YES\n" uninstall
+check "uninstall without a required command: named, nothing removed" bash -c '[[ "$1" == *"Required command(s) not found: cmp"* && -e "$2/bin/ezvps" ]]' _ "$OUT" "$D"
+
+# --- the results are verified on the file system, not taken from cp's success ------------------------
+echo "-- verification: a copy that cp reported as successful but that does not match is caught"
+for t in "bin/ezvps|*/backups/*/bin/ezvps|the script" "state|*/state/*3x-ui.state|a state file" "site|*/backups/*/nginx-sites/example.com.conf|a nginx site" "cert|*/certs/*example.com/privkey.pem|the private key"; do
+    IFS='|' read -r _ tp td <<<"$t"
+    bk_new
+    before="$(bk_snap "$D/bin")$(bk_snap_tools)$(bk_snap "$D/state")"
+    BK_EXTRA=(FAKE_CP_PATTERN="$tp")
+    run_bk "$BKBIN_CPFAULT" "1\n0\n" backup
+    check "create: a bad copy of ${td} is detected and the backup is discarded" contains "$OUT" "could not be completed and verified; it was discarded. Nothing was changed."
+    check "create: no backup directory is left after a bad copy of ${td}" equals "$(bk_n)" 0
+    check "create: no success is reported after a bad copy of ${td}" not_contains "$OUT" "Backup created and verified"
+    check "create: the sources are untouched after a bad copy of ${td}" equals "$(bk_snap "$D/bin")$(bk_snap_tools)$(bk_snap "$D/state")" "$before"
+done
+bk_new
+before="$(bk_snap_all)"
+BK_EXTRA=(FAKE_CP_PATTERN='*/backups/*/bin/ezvps')
+run_bk "$BKBIN_CPFAULT" "2\ny\n0\n" update
+check "update: a backup that does not verify stops the update before anything is replaced" contains "$OUT" "Update cancelled: the current ezvps could not be backed up. Nothing was changed."
+check "update: nothing changed after the bad backup (script, state, no backup left)" equals "$(bk_snap_all)" "$before"
+bk_new
+before="$(bk_snap_all)"
+BK_EXTRA=(FAKE_CP_PATTERN='*/backups/*/bin/ezvps')
+run_bk "$BKBIN_CPFAULT" "YES\n" uninstall
+check "uninstall: a backup that does not verify stops the uninstall" contains "$OUT" "Uninstall cancelled: the backup could not be made. Nothing was changed."
+check "uninstall: the script and the state files are still there" equals "$(bk_snap_all)" "$before"
+bk_new
+cp -a "$D/bin/ezvps" "$BKW/V-old-ezvps"
+cp -a "$D/state/install.state" "$BKW/V-old-install.state"
+BK_EXTRA=(FAKE_CP_PATTERN='*/.ezvps.*' FAKE_CP_ONCE=1 FAKE_CP_MARK="$D/cp.mark")
+run_bk "$BKBIN_CPFAULT" "2\ny\n0\n" update
+check "update: an installed file that is not the fetched one is detected" contains "$OUT" "The new script did not verify after it was installed"
+check "update: ... and rolled back, byte for byte" cmp -s "$BKW/V-old-ezvps" "$D/bin/ezvps"
+check "update: ... the install record is untouched and no update is reported" bash -c 'cmp -s "$1" "$2" && [[ "$3" != *"Updated "* ]]' _ "$BKW/V-old-install.state" "$D/state/install.state" "$OUT"
+bk_restore_setup
+cp -a "$D/bin/ezvps" "$BKW/V-b-ezvps"
+BK_EXTRA=(FAKE_CP_PATTERN='*/nginx/conf.d/.ezb.*' FAKE_CP_ONCE=1 FAKE_CP_MARK="$D/cp.mark")
+before_nginx="$(bk_snap "$D/nginx")"
+before_certs="$(bk_snap "$D/certs")"
+run_bk "$BKBIN_CPFAULT" "3\n1\nYES\n0\n" backup
+check "restore: a restored site that does not match the backup is detected, and everything is rolled back" contains "$OUT" "Rolled back: certificates and sites are as they were (verified against"
+check "restore: ... the sites and certificates are exactly as before" equals "$(bk_snap "$D/nginx")$(bk_snap "$D/certs")" "$before_nginx$before_certs"
+check "restore: ... nothing is reloaded and the script is untouched" bash -c '[[ "$(grep -c "systemctl reload" "$1")" == 0 ]] && cmp -s "$2" "$3"' _ "$D/log" "$BKW/V-b-ezvps" "$D/bin/ezvps"
+bk_restore_setup
+cp -a "$D/bin/ezvps" "$BKW/V-b-ezvps"
+BK_EXTRA=(FAKE_CP_PATTERN='*/bin/.ezvps.*' FAKE_CP_ONCE=1 FAKE_CP_MARK="$D/cp.mark")
+run_bk "$BKBIN_CPFAULT" "3\n1\nYES\n0\n" backup
+check "restore: a restored script that does not match is detected and replaced by the previous one" contains "$OUT" "The restored ezvps script did not verify; putting the previous one back."
+check "restore: ... the previous script is back, byte for byte" cmp -s "$BKW/V-b-ezvps" "$D/bin/ezvps"
+check "restore: ... and the problem is reported, not a success" bash -c '[[ "$1" == *"The restore finished with problems"* && "$1" != *"restored: ezvps script"* ]]' _ "$OUT"
+echo "-- verification: a state file that changes during the update is reported"
+bk_new
+BK_EXTRA=(FAKE_BASH_TOUCH="$D/state/3x-ui.state" FAKE_BASH_TOUCH_AT="$D/bin/ezvps")
+run_bk "$BKBIN" "2\ny\n0\n" update
+check "update: a state file that differs from the backup afterwards is reported" contains "$OUT" "A state file differs from the backup; compare"
+check "update: ... and the 'unchanged' claim is not made" not_contains "$OUT" "Verified: the other ezvps state files are unchanged."
+
+# --- install.sh records what it installed ----------------------------------------------------------
+echo "-- install.sh: install record (version, commit, source, sha256)"
+IRW="$WORK/inst-rec"
+rm -rf "$IRW"
+mkdir -p "$IRW"
+ir_state() { # ir_state <state file> <key>
+    local k v
+    while IFS='=' read -r k v; do [[ "$k" == "$2" ]] && { printf '%s' "$v"; return 0; }; done <"$1"
+}
+ir_run() { # ir_run <install.sh> <name>: installs into $IRW/<name>/{bin,backup,state}
+    OUT="$(EZVPS_BIN_DIR="$IRW/$2/bin" EZVPS_BACKUP_DIR="$IRW/$2/backup" EZVPS_STATE_DIR="$IRW/$2/state" "$BASH_BIN" "$1" 2>&1)"
+    RC=$?
+}
+EZVPS_FILE_VERSION="$(grep -oE '^EZVPS_VERSION="[^"]+"' "$EZVPS" | cut -d'"' -f2)"
+if command -v git >/dev/null 2>&1; then
+    REPO="$IRW/repo"
+    mkdir -p "$REPO"
+    cp "$EZVPS" "$INSTALL" "$REPO/"
+    g() { git -C "$REPO" -c user.name=testuser -c user.email=testuser@example.com -c commit.gpgsign=false "$@"; }
+    g init -q
+    g add ezvps install.sh
+    g commit -q -m "fake commit"
+    g remote add origin "https://testuser@example.com/owner/ezvps.git"
+    HEAD_COMMIT="$(g rev-parse HEAD)"
+    ir_run "$REPO/install.sh" c1
+    S="$IRW/c1/state/install.state"
+    check "install record: install still succeeds" equals "$RC" 0
+    check "install record: written, mode 600, in a mode 700 directory" bash -c '[[ "$(stat -c %a "$1")" == 600 && "$(stat -c %a "$(dirname "$1")")" == 700 ]]' _ "$S"
+    check "install record: the version" equals "$(ir_state "$S" version)" "$EZVPS_FILE_VERSION"
+    check "install record: the commit of the clean checkout" equals "$(ir_state "$S" commit)" "$HEAD_COMMIT"
+    check "install record: the origin, with the user name removed" equals "$(ir_state "$S" source)" "https://example.com/owner/ezvps.git"
+    check "install record: the sha256 of the installed script" equals "$(ir_state "$S" sha256)" "$(sha256sum "$IRW/c1/bin/ezvps" | cut -d' ' -f1)"
+    check "install record: says what was recorded" contains "$OUT" "Recorded version ${EZVPS_FILE_VERSION} and commit ${HEAD_COMMIT:0:12}"
+    ir_run "$REPO/install.sh" c1
+    check "install record: a re-run keeps the same record (idempotent)" bash -c '[[ "$(grep -c "^commit=" "$1")" == 1 && "$(grep -c "^sha256=" "$1")" == 1 ]]' _ "$S"
+    check "install record: a re-run is still 'already up to date'" contains "$OUT" "already up to date"
+    # end to end: ezvps reads exactly this record
+    bk_new
+    rm -rf "${D:?}/bin" "${D:?}/state"
+    ir_run "$REPO/install.sh" c1b
+    cp -a "$IRW/c1b/bin" "$D/bin"
+    cp -a "$IRW/c1b/state" "$D/state"
+    BK_EXTRA=(FAKE_MAIN_COMMIT="$HEAD_COMMIT")
+    run_bk "$BKBIN" "1\n0\n" update
+    check "install record, end to end: Check For Updates reads it (installed commit = checkout commit => up to date)" contains "$OUT" "Up to date: the installed commit is the latest main."
+    check "install record, end to end: it fetched from the recorded origin without asking" bk_log_has "-- https://example.com/owner/ezvps.git "
+    check "install record, end to end: it did not ask for an address" not_contains "$OUT" "Repository (empty to cancel)"
+    # uncommitted change => the commit is unknown
+    printf '# local edit\n' >>"$REPO/ezvps"
+    ir_run "$REPO/install.sh" c2
+    S="$IRW/c2/state/install.state"
+    check "install record (modified ezvps): no commit is recorded" equals "$(ir_state "$S" commit)" ""
+    check "install record (modified ezvps): the source and sha256 still are" bash -c '[[ -n "$(grep "^source=https" "$1")" && -n "$(grep -E "^sha256=[0-9a-f]{64}$" "$1")" ]]' _ "$S"
+    check "install record (modified ezvps): says the commit is unknown" contains "$OUT" "commit unknown"
+    g checkout -q -- ezvps
+    g remote set-url origin "https://testuser:fakepw@example.com/owner/ezvps.git"
+    ir_run "$REPO/install.sh" c3
+    S="$IRW/c3/state/install.state"
+    check "install record: credentials in the origin never reach the record" bash -c '! grep -q "fakepw\|testuser" "$1"' _ "$S"
+    check "install record: the origin is recorded without them" equals "$(ir_state "$S" source)" "https://example.com/owner/ezvps.git"
+    g remote set-url origin "git@example.com:owner/ezvps.git"
+    ir_run "$REPO/install.sh" c4
+    check "install record: an ssh origin is recorded as it is" equals "$(ir_state "$IRW/c4/state/install.state" source)" "git@example.com:owner/ezvps.git"
+    g remote set-url origin "http://example.com/owner/ezvps.git"
+    ir_run "$REPO/install.sh" c5
+    check "install record: an http origin is not recorded" equals "$(ir_state "$IRW/c5/state/install.state" source)" ""
+    g remote remove origin
+    ir_run "$REPO/install.sh" c6
+    check "install record: no origin => no source, install still works" bash -c '[[ "$1" == 0 && -x "$2/c6/bin/ezvps" ]]' _ "$RC" "$IRW"
+else
+    echo "skip - git is not available: install record (commit, source) checks"
+fi
+PLAIN="$IRW/plain"
+mkdir -p "$PLAIN"
+cp "$EZVPS" "$INSTALL" "$PLAIN/"
+ir_run "$PLAIN/install.sh" p1
+S="$IRW/p1/state/install.state"
+check "install record (not a git checkout): installs and succeeds" equals "$RC" 0
+check "install record (not a git checkout): the commit is empty" equals "$(ir_state "$S" commit)" ""
+check "install record (not a git checkout): the source is empty" equals "$(ir_state "$S" source)" ""
+check "install record (not a git checkout): the version is recorded" equals "$(ir_state "$S" version)" "$EZVPS_FILE_VERSION"
+printf 'x\n' >"$IRW/afile"
+OUT="$(EZVPS_BIN_DIR="$IRW/p2/bin" EZVPS_BACKUP_DIR="$IRW/p2/backup" EZVPS_STATE_DIR="$IRW/afile/state" "$BASH_BIN" "$PLAIN/install.sh" 2>&1)"
+RC=$?
+check "install record: a state directory that cannot be created only warns, the install succeeds" bash -c '[[ "$1" == 0 && "$2" == *"the installed version is not recorded"* && -x "$3/p2/bin/ezvps" ]]' _ "$RC" "$OUT" "$IRW"
+# a script from a pre-record install: Check For Updates treats it as unknown
+bk_new
+rm -f "$D/state/install.state"
+run_bk "$BKBIN" "1\n${BK_SRC_HTTPS}\n0\n" update
+check "an old install (no record) is unknown, not up to date" bash -c '[[ "$1" == *"commit unknown"* && "$1" != *"Up to date"* ]]' _ "$OUT"
+
+# --- every item runs through the CLI too -------------------------------------------------------------
+echo "-- CLI"
+bk_new
+run_bk "$BKBIN" "" backup
+check "cli 'backup' exits 0" equals "$RC" 0
+run_bk "$BKBIN" "" update
+check "cli 'update' exits 0" equals "$RC" 0
+run_bk "$BKBIN" "" uninstall
+check "cli 'uninstall' exits 0 when not confirmed" equals "$RC" 0
+check "cli 'uninstall' without a confirmation removes nothing" test -e "$D/bin/ezvps"
+run_ezvps "$EMPTY_BIN" "" --help
+check "--help lists backup, update and uninstall and no longer says 'not implemented'" bash -c '[[ "$1" == *"backup update uninstall"* && "$1" != *"not implemented yet"* ]]' _ "$OUT"
+
 echo "== source rules"
 # curl may appear only in the 3x-ui functions that need it; never in the L2TP
 # path, the menu or the main script body.
@@ -5882,6 +7016,8 @@ only_pinned_urls() {
             'https://$host$request_uri;'* | 'https://\$host\$request_uri'* | 'https://${domain}/'* | 'http://${1};') ;;
             # Nginx module: upstream parsing/rendering, not network access
             'https://*' | 'http://}' | 'http://${2};') ;;
+            # Check For Updates: the address validation patterns and the help text for the address prompt (git does the fetching)
+            'https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5}' | 'https://host/owner/repo,') ;;
             *) echo "unexpected URL: $u" >&2; bad=1 ;;
         esac
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
@@ -5901,7 +7037,8 @@ git_network_functions() {
 reads_outside_menu() { # `read` in lc_* other than the submenu choice and the parsers of a tool's own output
     awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""} !/^[[:space:]]*#/ && /(^|[[:space:];])read[[:space:]]+-/ && fn ~ /^lc_/ && fn != "lc_module()" && fn != "lc_version()" && fn != "lc_print_services()" {print fn": "$0}' "$EZVPS"
 }
-check "git fetches only inside lc_fetch_source (the pinned ctunnel commit)" equals "$(git_network_functions "$EZVPS")" "lc_fetch_source() "
+check "git touches the network only inside lc_fetch_source (the pinned ctunnel commit) and upd_fetch_latest (main of the private repository)" equals "$(git_network_functions "$EZVPS")" "lc_fetch_source() upd_fetch_latest() "
+check "the update fetch allows https and ssh only, with the user's own authentication" contains "$(<"$EZVPS")" "-c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always"
 check "the ctunnel fetch allows https only" contains "$(<"$EZVPS")" "-c protocol.allow=never -c protocol.https.allow=always"
 check "the upstream installer runs with /dev/null as input (it must not open the tool)" contains "$(<"$EZVPS")" 'bash "${tmp}/install.sh" </dev/null'
 check "the lifecycle code asks for no token, link, password or key (no read outside the submenu and the yes/no helper)" equals "$(reads_outside_menu)" ""
@@ -5909,6 +7046,21 @@ check "the lifecycle code never launches a tool with tunnel arguments" not_conta
 check "one shared submenu: the four labels are declared once" equals "$(grep -c '"Install" "Status" "Update" "Uninstall"' "$EZVPS")" 1
 check "the three module functions are one-line wrappers around the shared flow" equals "$(grep -cE '^module_(backpack|ctunnel|lazyports)\(\) \{ lc_module (backpack|ctunnel|lazyports); \}$' "$EZVPS")" 3
 check "Backpack and Lazyports installers are pinned (no main/master/HEAD in their URLs)" not_contains "$(grep -E '^[[:space:]]*LC_URL=' "$EZVPS")" "/main/"
+ezb_code() { awk '/^(ezb_[a-z_]+|upd_[a-z_]+|module_uninstall)\(\) \{/ {on=1} on {print} /^}/ {on=0}' "$EZVPS" | grep -vE '^[[:space:]]*#'; }
+ezb_fn() { awk -v f="$1" '$0 ~ "^" f "\\(\\) \\{" {on=1} on {print} /^}/ {on=0}' "$EZVPS" | grep -vE '^[[:space:]]*#'; }
+check "the Backup, Update and Uninstall code exists (ezb_*, upd_*, module_uninstall)" bash -c '[[ "$(grep -c "^ezb_\|^upd_" <<<"$1")" -gt 0 ]]' _ "$(grep -E '^(ezb_|upd_)[a-z_]+\(\) \{' "$EZVPS")"
+check "the Backup, Update and Uninstall code never uses curl, wget or a raw/anonymous download URL" bash -c '! grep -qE "curl|wget|raw\.githubusercontent|get\.acme\.sh|http://" <<<"$1"' _ "$(ezb_code)"
+check "rm -rf appears only for this run's own discarded backup and the update's temp directory" equals "$(ezb_code | grep -c 'rm -rf')" 2
+check "Uninstall removes with 'rm -f --' and rmdir only (no rm -r, no service, package or user command)" bash -c '! grep -qE "rm -[a-z]*r|systemctl|apt-get|dpkg|userdel|usermod|nginx|x-ui" <<<"$1"' _ "$(ezb_fn module_uninstall | grep -vE 'info |err |warn |kept=')"
+check "Uninstall can only remove the script and the *.state files of the state directory" bash -c 'grep -q "for e in \"\$EZB_STATE_DIR\"/\*.state \"\$EZB_STATE_DIR\"/\*.state.tmp.\*; do" <<<"$1" && [[ "$(grep -c "rm -f" <<<"$1")" == 1 ]]' _ "$(ezb_fn module_uninstall)"
+check "no code prints or reads a private key (privkey.pem is only chmod'ed, stat'ed and copied)" bash -c '! grep -qE "(cat|printf|info|echo|err|warn)[^|]*privkey|<[^<]*privkey" <<<"$1"' _ "$(ezb_code)"
+check "the YES confirmations read the answer exactly (IFS= read), so ' YES' and 'YES ' do not confirm" equals "$(ezb_code | grep -c 'IFS= read -r -p "Type YES')" 2
+check "restore and uninstall both ask for the exact word YES" bash -c '[[ "$1" == *"Type YES to restore this backup"* && "$2" == *"Type YES to uninstall ezvps"* ]]' _ "$(ezb_fn ezb_restore_cmd)" "$(ezb_fn module_uninstall)"
+check "restore backs up the current state before it writes anything" bash -c 'a="$(grep -n "ezb_create pre-restore full" <<<"$1" | head -1 | cut -d: -f1)"; b="$(grep -n "ezb_apply_certs \"\$sel\"" <<<"$1" | head -1 | cut -d: -f1)"; [[ -n "$a" && -n "$b" ]] && ((a < b))' _ "$(ezb_fn ezb_restore_cmd)"
+check "update and uninstall back up before they replace or remove" bash -c 'u="$1"; n="$2"; ((  $(grep -n "ezb_create pre-update core" <<<"$u" | head -1 | cut -d: -f1) < $(grep -n "ezb_install_script \"\$cand\"" <<<"$u" | head -1 | cut -d: -f1) )) && ((  $(grep -n "ezb_create pre-uninstall core" <<<"$n" | head -1 | cut -d: -f1) < $(grep -n "rm -f" <<<"$n" | head -1 | cut -d: -f1) ))' _ "$(ezb_fn upd_update_cmd)" "$(ezb_fn module_uninstall)"
+check "every item starts with ezb_preflight (root, supported system, and a writable backup directory where it writes)" bash -c 'for f in ezb_create_cmd ezb_list_cmd ezb_restore_cmd upd_check_cmd upd_update_cmd module_uninstall; do grep -q "ezb_preflight" <<<"$(sed -n "/^${f}() {/,/^}/p" "$2")" || exit 1; done' _ "$(ezb_code)" "$EZVPS"
+check "ezb_preflight requires root and a supported system" bash -c '[[ "$1" == *"require_root"* && "$1" == *"require_supported_os"* ]]' _ "$(ezb_fn ezb_preflight)"
+check "the update source is never hardcoded (no github.com address of a private repo in the update code)" bash -c '! grep -qE "https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|git@github\.com:[A-Za-z0-9_.-]+/" <<<"$1"' _ "$(ezb_code | grep -vE 'info |warn |err ')"
 module_l2tp_body="$(awk '/^module_l2tp\(\)/,/^}/' "$EZVPS")"
 check "the L2TP module still has no download code" no_downloads <(printf '%s\n' "$module_l2tp_body")
 
@@ -5916,7 +7068,7 @@ echo "== install.sh"
 IBIN="$WORK/inst/bin"
 IBAK="$WORK/inst/backup"
 run_install() {
-    OUT="$(EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" "$BASH_BIN" "$INSTALL" 2>&1)"
+    OUT="$(EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" EZVPS_STATE_DIR="$WORK/inst/state" "$BASH_BIN" "$INSTALL" 2>&1)"
     RC=$?
 }
 installed_runs() { [[ "$("$IBIN/ezvps" --version)" == "ezvps "* ]]; }
@@ -5958,7 +7110,7 @@ check "no temp files left behind" no_temp_files
 
 # Without ezl2tp the installer still succeeds.
 rm -f "$IBIN/ezl2tp"
-OUT="$(PATH="$EMPTY_BIN:/usr/bin:/bin" EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" "$BASH_BIN" "$INSTALL" 2>&1)"
+OUT="$(PATH="$EMPTY_BIN:/usr/bin:/bin" EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" EZVPS_STATE_DIR="$WORK/inst/state" "$BASH_BIN" "$INSTALL" 2>&1)"
 RC=$?
 check "install without ezl2tp exits 0" equals "$RC" 0
 check "install without ezl2tp says so" contains "$OUT" "ezl2tp not found"
@@ -5967,7 +7119,7 @@ check "install without ezl2tp says so" contains "$OUT" "ezl2tp not found"
 BROKEN="$WORK/broken-ezvps"
 printf 'if then\n' >"$BROKEN"
 BEFORE="$(file_sum "$IBIN/ezvps")"
-OUT="$(EZVPS_SOURCE="$BROKEN" EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" "$BASH_BIN" "$INSTALL" 2>&1)"
+OUT="$(EZVPS_SOURCE="$BROKEN" EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" EZVPS_STATE_DIR="$WORK/inst/state" "$BASH_BIN" "$INSTALL" 2>&1)"
 RC=$?
 check "syntax-broken source is refused" test "$RC" -ne 0
 check "installed file untouched after refused install" equals "$(file_sum "$IBIN/ezvps")" "$BEFORE"
@@ -5977,7 +7129,7 @@ echo "-- install.sh: operating systems (fake os-release, check on)"
 os_install() { # os_install <os-release file> -> OUT / RC; installs into a fresh dir
     OSBIN="$WORK/inst-os/$(basename "$1")/bin"
     rm -rf "$WORK/inst-os/$(basename "$1")"
-    OUT="$(env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$1" EZVPS_BIN_DIR="$OSBIN" EZVPS_BACKUP_DIR="$WORK/inst-os/$(basename "$1")/backup" "$BASH_BIN" "$INSTALL" 2>&1)"
+    OUT="$(env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$1" EZVPS_BIN_DIR="$OSBIN" EZVPS_BACKUP_DIR="$WORK/inst-os/$(basename "$1")/backup" EZVPS_STATE_DIR="$WORK/inst-os/$(basename "$1")/state" "$BASH_BIN" "$INSTALL" 2>&1)"
     RC=$?
 }
 for c in "${OS_CASES[@]}"; do

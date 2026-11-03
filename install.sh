@@ -9,11 +9,17 @@
 #   one is backed up first, then replaced atomically.
 # - Never touches ezl2tp (command, config or state). It only reports whether
 #   ezl2tp is present.
-# - Needs no extra packages and downloads nothing.
+# - Records what it installed (version, commit, source repository, sha256) in
+#   /var/lib/ezvps/install.state so Check For Updates can compare it with the
+#   latest main. The commit is recorded only when this is a clean git checkout
+#   whose ezvps is the committed one; otherwise it is left out (unknown). The
+#   source address is the checkout's own `origin`, with any credentials removed.
+# - Needs no extra packages and downloads nothing (git is only read locally).
 #
 # Overrides (mainly for tests):
 #   EZVPS_BIN_DIR       install directory      (default /usr/local/bin)
 #   EZVPS_BACKUP_DIR    backup directory       (default /var/backups/ezvps)
+#   EZVPS_STATE_DIR     state directory        (default /var/lib/ezvps)
 #   EZVPS_ALLOW_NONROOT=1  skip the root check
 #   EZVPS_SKIP_OS_CHECK=1  skip the OS check (tests only)
 #   EZVPS_OS_RELEASE    os-release file to read (default /etc/os-release)
@@ -25,6 +31,9 @@ BACKUP_DIR="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE="${EZVPS_SOURCE:-${SCRIPT_DIR}/ezvps}"
 TARGET="${BIN_DIR}/ezvps"
+STATE_DIR="${EZVPS_STATE_DIR:-/var/lib/ezvps}"
+STATE_FILE="${STATE_DIR}/install.state"
+SOURCE_VERSION=""
 
 info() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -127,6 +136,8 @@ check_source() {
     local out
     out="$(EZVPS_ALLOW_NONROOT=1 bash "$SOURCE" --version 2>&1)" ||
         die "${SOURCE} failed its --version check: ${out}"
+    [[ "$out" =~ ^ezvps\ ([A-Za-z0-9._+-]+)$ ]] && SOURCE_VERSION="${BASH_REMATCH[1]}"
+    return 0
 }
 
 backup_existing() {
@@ -162,6 +173,65 @@ install_script() {
     info "Installed ezvps to ${TARGET}"
 }
 
+# The checkout's origin as an address ezvps Check For Updates accepts (https, ssh or
+# user@host:path), with any user name or token in an https address removed. Empty
+# when it is not such an address; git asks for credentials itself at update time.
+clean_source() { # clean_source <url>
+    local u="$1" rest auth
+    if [[ "$u" == https://* ]]; then
+        rest="${u#https://}"
+        auth="${rest%%/*}"
+        [[ "$auth" == *@* ]] && u="https://${auth##*@}${rest#"$auth"}"
+    fi
+    ((${#u} <= 300)) || return 0
+    if [[ "$u" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?/[A-Za-z0-9._~+-]+(/[A-Za-z0-9._~+-]+)*$ ||
+        "$u" =~ ^ssh://([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?/[A-Za-z0-9._~+-]+(/[A-Za-z0-9._~+-]+)*$ ||
+        "$u" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._~+-]+(/[A-Za-z0-9._~+-]+)*$ ]]; then
+        printf '%s' "$u"
+    fi
+    return 0
+}
+
+# Records what is installed. Never fatal: without a record, Check For Updates simply
+# reports the installed commit as unknown.
+record_install() {
+    local commit="" source="" sha="" tmp
+    if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]] &&
+        git -C "$SCRIPT_DIR" ls-files --error-unmatch -- ezvps >/dev/null 2>&1 &&
+        git -C "$SCRIPT_DIR" diff --quiet HEAD -- ezvps >/dev/null 2>&1; then
+        commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)"
+        [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || commit=""
+    fi
+    if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]]; then
+        source="$(clean_source "$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null)")"
+    fi
+    sha="$(sha256sum "$TARGET" 2>/dev/null)" || sha=""
+    sha="${sha%% *}"
+    if ! { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; } 2>/dev/null; then
+        warn "cannot create ${STATE_DIR}; the installed version is not recorded"
+        return 0
+    fi
+    tmp="${STATE_FILE}.tmp.$$"
+    if ! {
+        {
+            printf 'version=%s\n' "$SOURCE_VERSION"
+            printf 'commit=%s\n' "$commit"
+            printf 'source=%s\n' "$source"
+            printf 'sha256=%s\n' "$sha"
+            printf 'installed=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$STATE_FILE"
+    } 2>/dev/null; then
+        rm -f "$tmp"
+        warn "cannot write ${STATE_FILE}; the installed version is not recorded"
+        return 0
+    fi
+    if [[ -n "$commit" ]]; then
+        info "Recorded version ${SOURCE_VERSION} and commit ${commit:0:12} in ${STATE_FILE}"
+    else
+        info "Recorded version ${SOURCE_VERSION} in ${STATE_FILE} (commit unknown: not a clean git checkout)"
+    fi
+}
+
 report_ezl2tp() {
     if PATH="${BIN_DIR}:${PATH}" command -v ezl2tp >/dev/null 2>&1; then
         info "ezl2tp found; left untouched."
@@ -175,6 +245,7 @@ main() {
     check_os
     check_source
     install_script
+    record_install
     report_ezl2tp
     info "Done. Run: ezvps"
 }

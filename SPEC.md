@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10), Firewall (PR 11).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10), Firewall (PR 11), Backup, Check For Updates and Uninstall (PR 12): **the panel is complete, every menu item is implemented**.
 
 ## 1. What ezvps is
 
@@ -16,7 +16,9 @@ Certificates: `curl` and the pinned acme.sh script; Backpack and Lazyports: `cur
 ctunnel: `git`, `make`, `gcc` and the OpenSSL and zlib development packages. Lazyports needs
 Go, which ezvps never installs; SSH and Users: `sudo`, only when you ask for sudo access on a
 system without it. It never installs the OpenSSH server; Firewall: nothing, it uses the firewall
-backend that is already present and never installs one).
+backend that is already present and never installs one; Check For Updates and Update ezvps: `git`, only to fetch
+the private repository with the user's own authentication, never installed by ezvps; Backup, Restore and Uninstall:
+nothing beyond coreutils, `cmp` and `bash`).
 
 ### 1.1 Supported systems
 
@@ -42,6 +44,7 @@ Per module:
 | Backpack, ctunnel, Lazyports (`x86_64` and `aarch64` only) | yes | yes | yes | yes | yes |
 | SSH and Users | yes | yes | yes | yes | yes |
 | Firewall (whichever of ufw, firewalld, nftables, iptables is present) | yes | yes | yes | yes | yes |
+| Backup, Check For Updates, Uninstall (ezvps itself) | yes | yes | yes | yes | yes |
 | L2TP (ezl2tp) | **no** (gate below) | yes | **no** (gate below) | **no** (gate below) | **no** (gate below) |
 
 * **L2TP has its own gate.** ezvps running on a system does not mean ezl2tp
@@ -95,6 +98,7 @@ Per module:
   | certificate store `/etc/ssl/ezvps` (PR 8) | no package owns it | no package owns it (Ubuntu's `ssl-cert` group is not used) | one path |
   | Backpack, ctunnel, Lazyports (PR 9) | upstream installers branch on nothing distro-specific (Backpack's `install.sh` keys on `uname -m` only; ctunnel is `make`; Lazyports is `go install`); apt package names `git make gcc libssl-dev zlib1g-dev curl` are identical | identical | one path (Go is not installed by ezvps, so the distro's Go version only matters to Lazyports, see 6.7) |
   | SSH and Users (PR 10) | `useradd`/`usermod`/`userdel`/`passwd` (shadow-utils), group `sudo` (only when the `sudo` package is installed, which a minimal Debian image may lack), `ssh.service` | same commands; group `sudo`; sudo is preinstalled; **Ubuntu 22.10+ starts sshd through `ssh.socket`**, whose port is not always taken from `sshd_config` | one code path. The group name (`sudo`, not `wheel`) and the documented command (`usermod -aG sudo <user>`) are the same on both. The socket difference is handled by *verifying* that sshd listens on the new port after a port change and rolling back if it does not (6.8); ezvps does not branch on the distro for it |
+  | Backup, Check For Updates, Uninstall (PR 12) | coreutils (`cp`, `mv`, `rm`, `mkdir`, `mktemp`, `date`, `chmod`, `stat`, `du`, `cmp`, `sha256sum`) and `git` have the same arguments and the same package names (`git`) | same | one code path. Restoring nginx sites uses the same `nginx -t` and `systemctl` as the Nginx module on all five systems; `/etc/nginx/conf.d` is the nginx.org layout everywhere |
   | Firewall (PR 11) | which backend exists differs by image (Ubuntu usually ships `ufw`; Debian usually has `nftables`/`iptables`), not by release: `ufw`, `firewall-cmd`, `nft` and `iptables` take the same arguments on all five systems | same | one code path. The backend is chosen by which command is present, in the fixed order of 6.9, never by `ID`; ezvps does not branch on the distro |
 
 ## 2. Principles (same as easyl2tp)
@@ -187,12 +191,13 @@ redraws. EOF on stdin exits 0.
 | 7 | Lazyports         | **implemented**     | PR 9       |
 | 8 | SSH and Users     | **implemented**     | PR 10      |
 | 9 | Firewall          | **implemented**     | PR 11      |
-| 10| Backup            | not implemented yet | later      |
-| 11| Check For Updates | not implemented yet | later      |
-| 12| Uninstall         | not implemented yet | later      |
+| 10| Backup            | **implemented**     | PR 12      |
+| 11| Check For Updates | **implemented**     | PR 12      |
+| 12| Uninstall         | **implemented**     | PR 12      |
 
-One module per PR. Every implemented module runs on all five supported systems
-(section 1.1), **except L2TP, which is Debian 13 only** for now (the ezl2tp gate).
+One module per PR. **All twelve items are implemented: the full panel is complete.** Every implemented
+module runs on all five supported systems (section 1.1), **except L2TP, which is Debian 13 only** for now
+(the ezl2tp gate).
 
 ### 6.1 L2TP (PR 1, done; Debian 13 only, gated by ezl2tp)
 
@@ -1538,22 +1543,226 @@ rule, which is why that is the case guarded above.
 * `ufw` adds IPv4 and IPv6 rules; removing a rule removes only that one row (its IPv6 twin has its own ID).
 * Disabled ufw / not-running firewalld: read-only. Enabling is left to the administrator.
 
-### 6.10 Backup (later PR)
+### 6.10 Backup (PR 12, done)
 
-Back up ezvps-managed configs to `/var/backups/ezvps`, list backups,
-restore one (backing up the current file first).
+Menu item 10 opens a submenu. Clean labels only:
 
-### 6.11 Check For Updates (later PR)
+```
+ 1) Create backup
+ 2) List backups
+ 3) Restore backup
+ 0) Back
+```
 
-Compare the installed ezvps with the latest source and offer to update by
-re-running the installer path (which backs up the old script). Open
-question for that PR: how the update source is located without hardcoding
-anything private (for example, the git remote of the original checkout).
+`0` or EOF returns to the main menu; after each action "Press Enter to continue..."; invalid input
+prints `Invalid choice: <input>`. Module key `backup` maps to `module_backup`; its helpers are prefixed
+`ezb_`. Backup, Check For Updates and Uninstall (6.10-6.12) manage **ezvps itself and nothing else**: they
+never install, update, restart or remove nginx, 3x-ui, Backpack, ctunnel, Lazyports or ezl2tp, and never
+touch those tools' own configs, users, SSH settings or firewall rules.
 
-### 6.12 Uninstall (later PR)
+#### Checks before every item (`ezb_preflight`)
 
-Remove ezvps per module with confirmation, backing up first. Never removes
-ezl2tp unless the user explicitly picks it.
+1. Root, and a supported system (section 1.1, `require_supported_os`): otherwise the shared refusal
+   message and nothing is changed.
+2. The commands it uses exist (`cp mkdir mv rm rmdir mktemp date chmod cmp stat du`): otherwise the missing
+   ones are named and nothing is changed.
+3. Anything that writes (Create backup, Restore backup, Update ezvps, Uninstall) also needs a **writable
+   backup directory**: `/var/backups/ezvps` is created if missing, set to mode 700, and a probe file is
+   written and removed. If that fails, nothing is changed. List backups and Check for updates write
+   nothing and therefore do not create the directory.
+
+#### What a backup contains
+
+A backup is a directory `/var/backups/ezvps/ezvps-backup.<UTC time>-<NN>/` (`YYYYMMDD-HHMMSS`, `NN` =
+01, 02, ... for backups made in the same second), **mode 700**, with a `MANIFEST` (mode 600) and:
+
+| Part | Source | Included in |
+|------|--------|-------------|
+| `bin/ezvps` | the ezvps script, `/usr/local/bin/ezvps` | every backup |
+| `state/` | the ezvps state files, `/var/lib/ezvps` (`3x-ui.state`, `install.state`, ...) | every backup |
+| `nginx-sites/<domain>.conf` | the **ezvps-made** sites in `/etc/nginx/conf.d`: regular files named `<domain>.conf` that carry the `# Managed by ezvps` marker and a matching `# ezvps:domain=` (hand-written files and symlinks are not included) | full backups |
+| `certs/<domain>/...` | the certificate store `/etc/ssl/ezvps`, **including the private keys** (copied with their modes: directories 700, keys 600), if it exists | full backups |
+
+`MANIFEST` records `format=1`, the creation time, the reason (`manual`, `pre-restore`, `pre-update`,
+`pre-uninstall`), the scope (`full` or `core` = script and state only), and the installed ezvps version
+and commit (`unknown` when not recorded). It holds no secret.
+
+Not included, on purpose: the other tools' configs and data (3x-ui database, Backpack config, the tool
+binaries), acme.sh's own home (`~/.acme.sh`), `nginx.conf`, hand-written nginx sites, users, SSH settings
+and firewall rules. Those are each owned by their own tool; the module names this in its output.
+
+**No secret is ever printed.** The private keys are copied byte for byte and never read, printed or
+logged; the output names domains and file names only. Test fixtures never contain a private key.
+
+#### 1) Create backup
+
+Prints the plan, makes a **full** backup, and **verifies it on the file system**: every copied file is
+compared byte for byte with its source, the directory mode is read back and must be 700. A failed or
+unverified backup is discarded (only this run's own incomplete directory) with a message, and nothing
+else is changed. On success it prints `Backup created and verified: <path>` and exactly what was included
+(script, number of state files, the site file names, the certificate domains). Nothing is deleted or
+overwritten: every backup is a new directory, and ezvps never deletes a backup.
+
+#### 2) List backups
+
+Read-only. Every `ezvps-backup.*` directory that has a valid name and a `MANIFEST` is listed, **newest
+first** (the time in the name, then `NN`), numbered, with the **timestamp (UTC)**, the **size**
+(`du -sb`), the **reason** and a **contents summary counted from the directory itself** (script, state
+files, nginx sites, certificate domains), then its path. Incomplete or unrecognised `ezvps-backup.*`
+entries are counted, not listed. Backups that other modules make in the same directory (`x-ui.*`,
+`nginx-*`, `apt-*`, `cert-*`, ...) are not listed, and the output says so.
+
+#### 3) Restore backup
+
+1. The backups are listed first and one is chosen by number (empty = cancel; anything else is refused).
+2. **The backup is validated before anything is changed.** Refused as a whole, with nothing changed, when
+   it holds anything unexpected: an unknown format, a symlink anywhere, a site that is not an ezvps-made
+   `<domain>.conf` for its own domain, a certificate entry that is not a domain directory of plain files,
+   a state entry that is not a plain file, or an ezvps script that fails `bash -n` or does not print
+   `ezvps <version>` for `--version`.
+3. The plan lists what will be put back; **the exact word `YES` must be typed** (`yes`, `y`, `YES ` and
+   ` YES` do not count; EOF is a no). Nothing is deleted by a restore: files that are not in the backup stay.
+4. **The current state is backed up first** (a full backup, reason `pre-restore`); if that fails, nothing
+   is restored.
+5. Step 1, certificates then nginx sites: written atomically (temp file in the same directory + `mv`),
+   modes kept (directories 700, `privkey.pem` 600). A hand-written file or a symlink with the same site name
+   is **never overwritten** (named in the report). Sites are restored only when nginx and its `conf.d`
+   exist. They are verified byte for byte, and **`nginx -t` must pass**; only then is nginx reloaded (and
+   only if it is running). **A failing config test, or a copy that does not verify, rolls back everything
+   step 1 wrote**: files it created are removed, files it replaced are put back from the pre-restore
+   backup, the rollback is verified, `nginx -t` is run again, nginx is not reloaded, and the script and state
+   files have not been touched yet.
+6. Step 2, state files, then the ezvps script (atomic, mode 755): each is verified byte for byte, the
+   script also by `bash -n` and `--version`. A script that does not verify is replaced by the pre-restore
+   copy again.
+7. The report says what was restored (each line backed by the verification above), what was skipped and why,
+   and where the pre-restore backup is.
+
+#### Known limits
+
+* A restore does not remove what the backup does not contain (a site or certificate created after the
+  backup stays); the pre-restore backup and the normal tools (Nginx > Remove site, Certificates > Remove
+  certificate) cover that.
+* Restoring certificates does not reload nginx unless sites were restored too; the report says so.
+* The backup holds private keys: it is root-only (700/600) and ezvps never deletes it. Move or shred old
+  backups yourself.
+
+### 6.11 Check For Updates (PR 12, done)
+
+Menu item 11 opens a submenu. Clean labels only:
+
+```
+ 1) Check for updates
+ 2) Update ezvps
+ 0) Back
+```
+
+Module key `update` maps to `module_update`; helpers are prefixed `upd_`.
+
+#### Where the latest version comes from, and the authentication
+
+`install.sh` downloads nothing and has no credentials: it runs from a checkout the user cloned **with their
+own authentication** (GitHub CLI login, SSH key, or a token typed at git's prompt). Check For Updates uses
+exactly that method and no other: **`git` against the private repository the checkout came from**, so
+nothing private is hardcoded and nothing is ever fetched from an anonymous or public URL (no `curl`, no
+`wget`, no raw URL).
+
+* `install.sh` records the checkout's `origin` as `source` in `install.state` (below), with any user name
+  or token in an `https://` address **removed**. Only these forms are accepted, here and again by ezvps
+  before every use: `https://host/path` (no credentials in it), `ssh://[user@]host[:port]/path` and
+  `user@host:path`. `http://`, `git://`, `file://`, local paths, options (a leading `-`) and anything with
+  spaces or control characters are refused, and a refused address is **never echoed back** (it may contain a
+  token).
+* If no valid source is recorded (an install made before this existed, or a copy that was not a git
+  checkout), ezvps asks once for the repository address (placeholders `git@github.com:<owner>/ezvps.git`
+  or `https://github.com/<owner>/ezvps.git`) and explains that git asks for credentials itself.
+* The fetch is `git clone -q --depth 1 --branch main --single-branch -- <source> <temp dir>` (the only
+  git network access besides the pinned ctunnel fetch, in `upd_fetch_latest`, with
+  `-c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always`), into a private
+  temp directory that is always removed. git's own prompts and messages reach the terminal.
+* **`main` is deliberate here.** The pinning rule of principle 7 is for third-party downloads. This is the
+  owner's own repository and "latest main" is the request, so instead of a pin the update is guarded by the
+  checks below (candidate verified before anything changes, confirmation, backup, verification after,
+  rollback).
+
+#### The install record
+
+`/var/lib/ezvps/install.state` (dir 700, file 600; plain `key=value`, read without `source`, no secret):
+`version`, `commit`, `source`, `sha256` (of the installed script) and `installed` (UTC time).
+`install.sh` writes it on every run (also when the script is already up to date, so re-running it gives an
+old install a record), and Update ezvps rewrites it. `commit` is recorded **only** when `install.sh` ran from
+a git checkout whose `ezvps` is tracked and identical to `HEAD`; otherwise it is empty (unknown). A failure
+to write the record only warns.
+
+#### 1) Check for updates
+
+Read-only (nothing is written; no backup directory is created). It fetches `main` as above and prints:
+
+```
+Installed:  version 0.0.1-old, commit aaaaaaaaaaaa
+Latest:     version 0.0.2-new, commit bbbbbbbbbbbb (main of <source>)
+```
+
+The installed **version** is read from the installed file (as text, never executed). The installed
+**commit** counts as known only when `install.state` has a valid 40-hex commit **and** the installed
+script still has the recorded `sha256`. Then:
+
+* same commit: `Up to date: the installed commit is the latest main.`
+* different commit: `Update available` (pointing to Update ezvps);
+* **otherwise the commit is unknown, and ezvps says so and why** (no record, no commit in the record, the
+  installed script differs from the one the record describes, record unreadable) and prints `Unknown:
+  ezvps cannot tell whether this install is up to date, so it is NOT reported as current.` An old install
+  without a record is therefore never shown as up to date; differing versions are noted.
+
+Refusals, all with nothing changed: not root / unsupported system, `git` missing (the message says why git
+is required and to install it with apt; ezvps does not install it), an unaccepted address, a failed fetch
+(address or access wrong), a `main` without an `ezvps` script.
+
+#### 2) Update ezvps
+
+1. Same preflight (including a writable backup directory), `sha256sum` and `bash` present, and ezvps must
+   be installed at `/usr/local/bin/ezvps` (else it says so and points to `install.sh`).
+2. Fetch and show installed versus latest, as in Check.
+3. **The candidate is verified before anything is touched**: `bash -n` must pass and `--version` must exit 0
+   and print `ezvps <version>`. Otherwise it is refused, nothing is changed and nothing is offered.
+4. If the installed script is already byte for byte the fetched one, nothing is replaced and nothing is
+   asked; an unknown or stale install record is rewritten (and read back) so the next check is exact.
+5. The plan (`version old -> new`, commit) is shown and **a yes is required** (default no, EOF is no).
+6. **The current script and the ezvps state files are backed up first** (`core` backup, reason
+   `pre-update`, under `/var/backups/ezvps`, path printed); if that fails nothing is changed.
+7. The script is replaced atomically (temp file next to it, mode 755, `mv`). Tool configs, nginx sites,
+   certificates, users and all other state are not touched; the install record is the only state file
+   rewritten.
+8. **Verified on the file system**: the installed file is byte for byte the fetched one, passes `bash -n`
+   and prints `ezvps <new version>` for `--version`. **On any failure the previous script is put back from
+   the backup, checked byte for byte, and the install record is left as it was;** the update is never
+   reported as done.
+9. The install record is rewritten (and read back), the other state files are compared with the backup, and
+   the report says `Updated <path>: version old -> new, commit ...` plus what was verified. The running
+   session keeps the old code; restart ezvps to use the new one.
+
+### 6.12 Uninstall (PR 12, done)
+
+Menu item 12 (module key `uninstall`, `module_uninstall`). It has no submenu: it shows the plan and asks.
+
+1. The same preflight (root, supported system, writable backup directory). If neither the script nor a
+   state file exists: `there is nothing to uninstall`.
+2. The plan lists exactly what will be removed: **`/usr/local/bin/ezvps` and the ezvps state files**
+   (`/var/lib/ezvps/*.state` and leftover `*.state.tmp.*`), and says what stays.
+3. **The exact word `YES` must be typed** (anything else, including `yes`, `YES ` and EOF, changes nothing).
+4. **A backup is made first** (`core`: script and state, reason `pre-uninstall`, mode 700, verified byte
+   for byte) and its path is printed. If it fails, nothing is removed.
+5. Only the script and the state files are removed (`rm -f -- <file>`); the state directory is removed only
+   if it is then empty (`rmdir`), otherwise it stays and the output says so. Nothing else is ever removed:
+   not nginx, 3x-ui, Backpack, ctunnel, Lazyports or ezl2tp, not their configs, nginx sites, certificates,
+   acme.sh, users, SSH settings or firewall rules, and **never a backup**.
+6. **Verified on the file system**: each target is checked to be gone, and anything that could not be
+   removed is reported as an error. The report lists exactly what was removed and, for each of nginx,
+   3x-ui, the certificate store, acme.sh, Backpack, the tool binaries and the backup directory, whether it
+   is present and untouched (looked up at that moment, not assumed), and how to bring ezvps back (run
+   `install.sh`, or copy `bin/ezvps` from the backup).
+7. In the interactive menu a successful uninstall leaves the menu (`ezvps has been uninstalled; leaving the
+   menu.`), since the script no longer exists on disk.
 
 ## 7. Installer (`install.sh`)
 
@@ -1570,7 +1779,13 @@ ezl2tp unless the user explicitly picks it.
   then atomic replace (temp file + `mv`).
 * Never touches ezl2tp (command, config, state); only reports whether it is
   found.
-* Test overrides: `EZVPS_BIN_DIR`, `EZVPS_BACKUP_DIR`, `EZVPS_SOURCE`,
+* **Records what it installed** in `/var/lib/ezvps/install.state` (dir 700, file 600): `version`,
+  `commit` (only from a git checkout whose `ezvps` is tracked and identical to `HEAD`, else empty),
+  `source` (the checkout's `origin`, user name and token removed from an `https://` address, and only
+  an `https://`, `ssh://` or `user@host:path` address; else empty), `sha256` of the installed script and the
+  time. Written on every run, also when the script is already up to date. A failure only warns. Check For
+  Updates (6.11) reads it; `git` is used here only to read the local checkout, nothing is downloaded.
+* Test overrides: `EZVPS_BIN_DIR`, `EZVPS_BACKUP_DIR`, `EZVPS_STATE_DIR`, `EZVPS_SOURCE`,
   `EZVPS_ALLOW_NONROOT=1`, `EZVPS_SKIP_OS_CHECK=1`.
 
 ## 7a. Test-only environment variables
@@ -1580,27 +1795,28 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, Backup, Check For Updates, Uninstall, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, Backup, Check For Updates, Uninstall, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
-| `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
-| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall), install.sh | backup dir (default `/var/backups/ezvps`) |
-| `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
+| `EZVPS_STATE_DIR` | ezvps (3x-ui, Backup, Check For Updates, Uninstall), install.sh | state dir (default `/var/lib/ezvps`): `3x-ui.state`, `install.state` |
+| `EZVPS_BIN_DIR` | ezvps (Backup, Check For Updates, Uninstall), install.sh | directory of the installed script (default `/usr/local/bin`); the script is `<dir>/ezvps` |
+| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, Backup, Check For Updates, Uninstall), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_NGINX_DIR` | ezvps (Nginx, Backup, Uninstall) | nginx config dir (default `/etc/nginx`); Backup reads and Restore writes its `conf.d` |
 | `EZVPS_APT_DIR` | ezvps (Nginx) | apt config dir for the nginx.org source and pin (default `/etc/apt`) |
 | `EZVPS_KEYRING_DIR` | ezvps (Nginx) | where `nginx-archive-keyring.gpg` is stored (default `/usr/share/keyrings`) |
 | `EZVPS_NGINX_HTTP_PORT` | ezvps (Nginx) | port used for the port-in-use check and the responds probe (default `80`; generated sites always listen on 80) |
 | `EZVPS_IF_INET6_FILE` | ezvps (Nginx) | file whose existence means "kernel has IPv6" (default `/proc/net/if_inet6`) |
 | `EZVPS_NGINX_WAIT_SECONDS` | ezvps (Nginx) | how long to wait for nginx to answer (default 15) |
 | `EZVPS_XUI_WAIT_SECONDS` | ezvps (3x-ui) | how long to wait for the panel to answer (default 30) |
-| `EZVPS_ACME_HOME` | ezvps (Certificates) | acme.sh home (default `$HOME/.acme.sh`) |
-| `EZVPS_CERT_DIR` | ezvps (Nginx, Certificates) | certificate store, also the path written into HTTPS sites (default `/etc/ssl/ezvps`) |
+| `EZVPS_ACME_HOME` | ezvps (Certificates, Uninstall report) | acme.sh home (default `$HOME/.acme.sh`); Uninstall only reports whether it is present |
+| `EZVPS_CERT_DIR` | ezvps (Nginx, Certificates, Backup) | certificate store, also the path written into HTTPS sites (default `/etc/ssl/ezvps`) |
 | `EZVPS_PASSWD_FILE` / `EZVPS_GROUP_FILE` / `EZVPS_SHELLS_FILE` | ezvps (SSH and Users) | passwd, group and shells files that are read (defaults `/etc/passwd`, `/etc/group`, `/etc/shells`); the `useradd`/`usermod`/`userdel` stubs of the tests edit fake copies |
 | `EZVPS_PROC_DIR` | ezvps (SSH and Users) | where `<pid>/status` and `self/loginuid` are read (default `/proc`) |
 | `EZVPS_HOME_BASE` | ezvps (SSH and Users) | the only directory under which a home directory may be offered for removal (default `/home`) |
 | `EZVPS_SSHD_CONFIG` | ezvps (SSH and Users, Firewall) | sshd configuration file that is read, backed up and rewritten (default `/etc/ssh/sshd_config`); the Firewall module only reads its `Port` lines, as a fallback, to find the SSH port |
 | `EZVPS_SSH_WAIT_SECONDS` | ezvps (SSH and Users) | how long to wait for sshd to listen on a new port (default 10) |
-| `EZVPS_TOOL_PREFIX` | ezvps (Backpack, ctunnel, Lazyports) | install prefix of the tools (default `/usr/local`: binaries in `<prefix>/bin`, ctunnel's man page in `<prefix>/share/man/man1`; also passed to `make` as `PREFIX`) |
+| `EZVPS_TOOL_PREFIX` | ezvps (Backpack, ctunnel, Lazyports, Uninstall report) | install prefix of the tools (default `/usr/local`: binaries in `<prefix>/bin`, ctunnel's man page in `<prefix>/share/man/man1`; also passed to `make` as `PREFIX`) |
 | `EZVPS_BACKPACK_CONF_DIR` | ezvps (Backpack) | Backpack's config directory, backed up before changes (default `/etc/backpack`) |
 | `EZVPS_NO_PAUSE=1` | ezvps | do not wait for Enter |
 
@@ -1609,7 +1825,7 @@ Defaults are the real paths; none of these relax a check on a real server.
 * `tests/lint.sh`: `bash -n` + `shellcheck` on every script, plus a hygiene
   scan (no non-documentation IPs, key material or token patterns) and the
   download rules: `curl` only inside `xui_fetch_installer` / `xui_probe` /
-  `ngx_fetch_key` / `acme_fetch_script` / `lc_fetch_installer`, git network access only in `lc_fetch_source`, no
+  `ngx_fetch_key` / `acme_fetch_script` / `lc_fetch_installer`, git network access only in `lc_fetch_source` and `upd_fetch_latest`, no
   download piped into a shell, none in `install.sh`, installer URL pinned to
   a tag (not `master`), pin constants present.
 * `tests/smoke-test.sh`: runs in a temp dir with an empty/stub `PATH`;
@@ -1832,6 +2048,51 @@ Defaults are the real paths; none of these relax a check on a real server.
   checks, the changed-rules check, the backup, the in-use warning, the disabled-firewall refusal, `--force`,
   the permanent firewalld write, the nftables/iptables insert position and the port-range, service and
   application-profile coverage).
+  **Backup, Check For Updates and Uninstall** (`== Backup, Check For Updates and Uninstall`) run against **fake
+  backup directories, fake installed versions (a fake `ezvps` with its `install.state`), fake main versions (a
+  fake `ezvps` that is good, has a syntax error, fails or prints no `--version`) and a fake `git`** (it records
+  every call and "clones" the fake main; `FAKE_GIT_FAIL=1` makes it fail), a fake `nginx` (`-t` fails on a
+  `BROKEN_DIRECTIVE` site), a stub `systemctl`, and a `bash` wrapper whose only difference is that `bash -n`
+  fails for one chosen path (that is how a script that passed before the install fails after it). Each scenario
+  has its own tree of fake `/usr/local/bin`, `/var/lib/ezvps`, `/var/backups/ezvps`, nginx `conf.d`, certificate
+  store (the "private key" is a plain text marker that must never appear in any output), 3x-ui, Backpack and
+  tool files, snapshotted with checksums and modes before and after. The sandbox `PATH` holds only the stubs and
+  a few coreutils; variants lack `git`, `nginx` or `cmp`. Covered: the exact submenus and dispatch (menu and CLI);
+  **create** (mode 700 on the directory and every part, path printed, script/state/sites/certificates byte for
+  byte, only ezvps-made regular files as sites, symlinks and hand-written sites left out, other tools' files left
+  out, MANIFEST, key mode 600, nothing printed from a key, sources untouched, two backups, no sites/certs/state,
+  unusable backup directory, unsupported system, all five supported systems, missing command); **list** (fake
+  backups created out of order, newest first including the `-NN` tie-break, size, reason, contents summary,
+  incomplete and foreign entries not listed but counted, read-only, no directory created); **restore** (the
+  list first, wrong answers and numbers change nothing, `YES` only when exact, the pre-restore backup holds the
+  *current* state and exists before anything is restored, script/state/site/certificate/key restored byte for byte
+  with modes, nothing deleted, hand-written files and other tools untouched, `nginx -t` before one reload, a
+  stopped nginx, a **failing config test rolls certificates and sites back byte for byte with modes and no
+  reload**, a hand-written file with the same name kept, nginx missing, a script that fails after the copy put
+  back, eleven kinds of tampered backup refused with no pre-restore backup); **check** (update available, up to
+  date, no record, record without commit, edited script with the same commit, all reported as unknown rather
+  than current; git flags and the exact clone; no git; failed fetch; main without a script; ssh and https
+  sources; eleven refused addresses that are never echoed back, six accepted forms; unsupported system; no
+  writable backup directory needed); **update** (declined/EOF, the backup before the replacement, old script in
+  the backup, installed file byte for byte the fetched one, mode, `bash -n`, `--version`, new record with
+  commit, source and sha256, other state files and tools untouched, a second run is a no-op, a candidate with
+  a syntax error / failing `--version` / no version refused before anything changes, **rollback when the
+  installed script fails its check afterwards** with the record unchanged, not installed, identical script with
+  an unknown commit, unusable backup directory, unsupported system, no git, failed fetch); **uninstall** (seven
+  wrong answers and EOF change nothing and make no backup, the backup before the removal with its path
+  printed, the script and state files gone and checked, **nginx sites, certificates and the key, 3x-ui,
+  Backpack, tool binaries, acme.sh, home, ezl2tp and every older backup byte for byte untouched**, a state
+  directory with other files kept, leftover temp files, via the main menu, only state files left, nothing to
+  uninstall, unusable backup directory, unsupported system, missing command); and **install.sh's install
+  record** (commit from a clean checkout, user name/token removed from the origin, ssh origin kept, http origin
+  and missing origin left out, a modified script records no commit, a non-git copy, an unwritable state
+  directory only warns, re-run idempotent, and Check For Updates reading the record end to end). Source rules:
+  git network access only in `lc_fetch_source` and `upd_fetch_latest`, no curl/wget/raw URL/`http://` in the
+  new code, `rm -rf` only twice, Uninstall without any service, package or user command, the backup before the
+  write in restore/update/uninstall, exact `IFS= read` confirmations, a preflight in every item, no key printed,
+  no hardcoded repository. Each assertion was checked to fail when the behaviour it covers is broken (a scripted
+  mutation run removed, one at a time, each confirmation, backup, verification, rollback, mode, listing order,
+  address check, record check and untouched-tool guarantee).
   It touches nothing outside its temp dir and uses no network.
   `tests/lint.sh` additionally checks that the SSH and Users code never touches `/etc/shadow`, stores no key
   material and downloads nothing, and that the Firewall code never enables, disables, resets or flushes a
@@ -1842,7 +2103,7 @@ Defaults are the real paths; none of these relax a check on a real server.
   the nginx.org suite is not hardcoded, that the repository URL is the stable
   one (never mainline), the key URL, the fingerprint pins and the priority-900
   pin are present, that `curl` is used only in the 3x-ui download/probe
-  functions, `ngx_fetch_key`, `acme_fetch_script` and `lc_fetch_installer`, that the Backpack, ctunnel and Lazyports pins (repository, tag or full commit, SHA-256) are present and well formed and their installer URLs are built from the pin, that the installer runs with `</dev/null`, that git touches the network only in `lc_fetch_source`, that the acme.sh pin (tag,
+  functions, `ngx_fetch_key`, `acme_fetch_script` and `lc_fetch_installer`, that the Backpack, ctunnel and Lazyports pins (repository, tag or full commit, SHA-256) are present and well formed and their installer URLs are built from the pin, that the installer runs with `</dev/null`, that git touches the network only in `lc_fetch_source` and `upd_fetch_latest` (https and ssh only), that the Backup, Check For Updates and Uninstall code downloads nothing, uses `rm -rf` only for this run's own discarded backup and the update temp directory, lets Uninstall remove nothing but the script and the state files, and never prints a private key, that the acme.sh pin (tag,
   exact tag-based URL, SHA-256) is present and well formed, and that the script has
   no `get.acme.sh`, DNS-validation, DNS-credential or certbot code.
 * **Operating systems** (`== operating systems` in the smoke test, always with
