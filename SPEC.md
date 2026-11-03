@@ -490,8 +490,9 @@ Install steps:
 4. Fresh install only: if port 80 is already in use (`ss`, else a `/dev/tcp`
    connect) warn, show who listens (`ss -ltnp`) and ask whether to install
    anyway.
-5. Show the plan (repository line, key URL, pin, version rule, what is
-   replaced) and ask once. If `curl` or `gpg` is missing the plan says so and
+5. Print the one-line progress message `Installing nginx (stable, nginx.org)...`
+   (the repository line, key URL, pin and version rule above are not repeated
+   on screen), list what is replaced, and ask once. If `curl` or `gpg` is missing the plan says so and
    they (`curl gnupg ca-certificates`) are installed with `apt-get` first.
 6. Download and verify the key (above); write the keyring, the apt source and
    the pin (an identical existing file is left alone, a different one is backed
@@ -528,7 +529,10 @@ Install steps:
     automatically; they are listed with the backup path, as is the old
     default site.
 13. **Verify it responds** (pure bash `/dev/tcp` HEAD, retried up to 15 s) and
-    print the HTTP-only / Certificates note.
+    print a short result: the installed version, that the config test passed
+    and that nginx is enabled and running. A failed check prints what was found
+    and what was required (for example the version found and "stable 1.30 or
+    newer from nginx.org").
 
 #### 2) Status
 

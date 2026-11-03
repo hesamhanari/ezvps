@@ -207,13 +207,10 @@ domains and a throwaway backend such as `python3 -m http.server 3000
 
 **6b. Install (nginx.org stable only)**
 
-- [ ] `1) Install Nginx`: the plan names the `https://nginx.org/packages/debian`
-      repository line with this system's codename (`bookworm` or `trixie`) or
-      the `https://nginx.org/packages/ubuntu` line (`jammy`, `noble` or
-      `resolute`), the key URL, the pin (`origin nginx.org,
-      priority 900`) and says stable 1.30 or newer; answer `n` first: nothing
-      is changed (`ls /etc/apt/sources.list.d/nginx.list` fails), then repeat
-      with `y`
+- [ ] `1) Install Nginx`: prints the one short line `Installing nginx (stable,
+      nginx.org)...` (no repository URL, key path or pin text; those are in
+      README and SPEC.md); answer `n` first: nothing is changed (`ls
+      /etc/apt/sources.list.d/nginx.list` fails), then repeat with `y`
 - [ ] the key fingerprints are listed as `matches the pinned nginx.org key`;
       `/usr/share/keyrings/nginx-archive-keyring.gpg` exists
       (`gpg --show-keys /usr/share/keyrings/nginx-archive-keyring.gpg` shows
@@ -233,7 +230,8 @@ domains and a throwaway backend such as `python3 -m http.server 3000
       `~<codename>`; `systemctl is-enabled nginx` is `enabled`, `systemctl
       is-active nginx` is `active`
 - [ ] output shows `Config test passes.` and `Verified: nginx answers on
-      127.0.0.1:80 (HTTP 200)`, then the HTTP-only / Certificates note
+      127.0.0.1:80 (HTTP 200)`, then `Installed nginx/1.30.x.` and `nginx is
+      enabled and running.` (no repository URL, key path or pin details)
 - [ ] `curl -sI http://127.0.0.1/` shows the nginx.org welcome page headers;
       `/etc/nginx/conf.d/default.conf` exists, and `/etc/nginx/sites-enabled`
       does not

@@ -1168,10 +1168,11 @@ check "built-by-hand nginx: no key download" no_key_download
 echo "-- install: fresh machine, nginx.org stable"
 new_ngx inst_new
 run_ezvps "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-check "plan: says nginx.org stable only" contains "$OUT" "ONLY from the official nginx.org STABLE repository"
-check "plan: shows the repository line" contains "$OUT" "deb [signed-by=$(KR)] https://nginx.org/packages/debian trixie nginx"
-check "plan: shows the key URL" contains "$OUT" "https://nginx.org/keys/nginx_signing.key"
-check "plan: shows the pin" contains "$OUT" "origin nginx.org, priority 900"
+check "progress: one short line" contains "$OUT" "Installing nginx (stable, nginx.org)..."
+check "progress: no long plan" not_contains "$OUT" "ONLY from the official"
+check "progress: repository URL is not printed" not_contains "$OUT" "https://nginx.org/packages"
+check "progress: key URL is not printed" not_contains "$OUT" "nginx_signing.key"
+check "progress: pin details are not printed" not_contains "$OUT" "priority 900"
 check "key is downloaded over https/TLS1.2" has_line "$(log)" "curl KEY https://nginx.org/keys/nginx_signing.key"
 check "key download uses --proto =https --tlsv1.2" equals "$(nlog_count 'KEY-INSECURE')" 0
 check "fingerprints are verified and reported" contains "$OUT" "key fingerprint ${FPR_B}: matches the pinned nginx.org key"
@@ -1197,9 +1198,12 @@ check "enables and starts the service" has_line "$(log)" "systemctl enable --now
 check "runs the config test" contains "$(log)" "nginx -t"
 check "service ends up running" equals "$(<"$FAKE_NGX_SVC")" active
 check_py "verifies that nginx responds" contains "$OUT" "Verified: nginx answers on 127.0.0.1:${PORT_UP} (HTTP 200)"
-check "mentions that upgrades stay on nginx.org stable" contains "$OUT" "Upgrades stay on nginx.org stable"
-check "says it is HTTP only and defers HTTPS to Certificates" contains "$OUT" "Certificates module"
-check "does not touch the firewall" contains "$OUT" "firewall is not changed"
+check "result: short summary with the version" contains "$OUT" "Installed nginx/1.30.2."
+check "result: enabled and running" contains "$OUT" "nginx is enabled and running."
+check "result: config test passed" contains "$OUT" "Config test passes."
+check "result: key path is not printed" not_contains "$OUT" "$(KR)"
+check "result: pin path is not printed" not_contains "$OUT" "$(PRF)"
+check "result: long notes are gone" not_contains "$OUT" "Upgrades stay on"
 check "fresh install exits 0" equals "$RC" 0
 echo "-- install: re-run is a no-op"
 KEYS_BEFORE="$(nlog_count '^curl KEY ')"
@@ -2933,7 +2937,7 @@ for c in "${OS_CASES[@]}"; do
     new_ngx "os-$f"
     run_os "$osf" "$NGX_BOX" "${N}1\nn\n\n0\n\n0\n"
     if [[ "$ok" == yes ]]; then
-        check "${f}: Nginx is accepted" contains "$OUT" "ONLY from the official nginx.org STABLE repository"
+        check "${f}: Nginx is accepted" contains "$OUT" "Installing nginx (stable, nginx.org)..."
         check "${f}: Nginx accepted, declined at the prompt: apt untouched" no_apt
     else
         check "${f}: Nginx is rejected with the shared message" contains "$OUT" "Nginx install needs a supported system: ${OS_LIST_TEXT}; found '${found}'"
@@ -3000,8 +3004,7 @@ ngx_flow() {
     new_ngx "flow-$tag"
     FAKE_DISTRO="$distro" FAKE_CODENAME="$cn" FAKE_DISTRO_NGX_VERSION="$dver" FAKE_ORG_VERSION="$org"
     run_os "$osf" "$NGX_BOX" "${N}1\ny\n\n0\n\n0\n"
-    check "${label}: plan shows the ${distro} repository for ${cn}" contains "$OUT" "deb [signed-by=$(KR)] ${url} ${cn} nginx"
-    check "${label}: plan says it is not the ${label} package" contains "$OUT" "not ${label}'s package, not the mainline branch"
+    check "${label}: short progress line" contains "$OUT" "Installing nginx (stable, nginx.org)..."
     check "${label}: apt source is exactly the ${distro}/${cn} stable line" file_has "$(LST)" "deb [signed-by=$(KR)] ${url} ${cn} nginx"
     check "${label}: apt source has no ${other} repository" file_lacks "$(LST)" "packages/${other}"
     check "${label}: apt source is never mainline" file_lacks "$(LST)" "mainline"
