@@ -31,6 +31,7 @@ rejected.
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | Backpack, ctunnel, Lazyports (x86_64 and aarch64 only) | yes | yes | yes | yes | yes |
 | Firewall (whichever of ufw, firewalld, nftables, iptables is present) | yes | yes | yes | yes | yes |
+| Backup, Check For Updates, Uninstall (ezvps itself) | yes | yes | yes | yes | yes |
 | L2TP | see below | yes | see below | see below | see below |
 
 **L2TP is gated separately.** The L2TP menu item launches the separate ezl2tp
@@ -39,11 +40,9 @@ currently **Debian 13 only**. ezvps does not port ezl2tp. On every other
 system in the table the L2TP item prints a clear message, installs and
 launches nothing, and returns to the menu.
 
-> **Status: v0.0.1 in development.** **L2TP**, **3x-ui**, **Backpack**,
-> **ctunnel**, **Nginx**, **Certificates**, **Lazyports**, **SSH and Users** and **Firewall** work so far. The other
-> menu items (Backup, Check For Updates, Uninstall) are still pending:
-> they print "not implemented yet" and return to the menu. They arrive in
-> later releases, one module per PR. See [SPEC.md](SPEC.md).
+> **Status: v0.0.1 in development. The panel is complete: all twelve menu items work.** **L2TP**, **3x-ui**,
+> **Backpack**, **ctunnel**, **Nginx**, **Certificates**, **Lazyports**, **SSH and Users**, **Firewall**,
+> **Backup**, **Check For Updates** and **Uninstall**. See [SPEC.md](SPEC.md).
 
 ## Install
 
@@ -57,7 +56,9 @@ sudo bash install.sh
 copies the script to `/usr/local/bin/ezvps`. It is safe to
 re-run: an identical install is left alone, a changed one is backed up to
 `/var/backups/ezvps/` before being replaced. An existing ezl2tp install is
-never touched.
+never touched. It also records what it installed (version, commit, the
+repository the checkout came from, a checksum) in `/var/lib/ezvps/install.state`,
+so Check For Updates can tell whether you are current.
 
 ## Use
 
@@ -378,6 +379,65 @@ only: ezvps does not rewrite their saved configuration, so save them the way you
 
 Details and limits are in [SPEC.md](SPEC.md) section 6.9.
 
+### Backup, Check For Updates and Uninstall
+
+These three manage **ezvps itself and nothing else**. They never install, update or remove nginx, 3x-ui,
+Backpack, ctunnel, Lazyports or ezl2tp, and never touch those tools' own configs, users or SSH settings.
+Each one checks first that you are root, that the system is supported, and (when it writes) that
+`/var/backups/ezvps` is writable. After a backup, update, restore or uninstall, the result is checked on
+the file system and reported from that, not from the copy command's success.
+
+`ezvps` -> `10` opens the **Backup** submenu:
+
+```
+ 1) Create backup
+ 2) List backups
+ 3) Restore backup
+ 0) Back
+```
+
+* **Create backup** makes `/var/backups/ezvps/ezvps-backup.<UTC time>-NN/` (mode 700) holding the ezvps
+  script, the ezvps state files (`/var/lib/ezvps`), the **ezvps-made** nginx sites from `/etc/nginx/conf.d`
+  (hand-written sites are not included) and the certificate store `/etc/ssl/ezvps` if present, **private
+  keys included** (copied, mode 600, never printed). It lists exactly what went in, compares every file with
+  its source, and prints the backup path. The other tools' own configs are not part of it.
+* **List backups** shows each backup newest first with its UTC timestamp, size, reason and a summary of its
+  contents.
+* **Restore backup** lists the backups, asks which one, and requires typing `YES`. It checks the backup
+  first, **backs up the current state**, then restores and verifies the files. If nginx sites are restored,
+  `nginx -t` must pass before nginx is reloaded; a failing test rolls the certificates and sites back and
+  nothing is reloaded. A restore never deletes anything that is not in the backup, and never overwrites a
+  hand-written nginx site.
+
+`ezvps` -> `11` opens **Check For Updates**:
+
+```
+ 1) Check for updates
+ 2) Update ezvps
+ 0) Back
+```
+
+* The latest version is fetched with **`git` from the private ezvps repository your checkout came from**,
+  using your own authentication (GitHub CLI login, SSH key, or a token typed at git's prompt), the same way you
+  cloned it for `install.sh`. ezvps never uses an anonymous or public URL for it, and no repository address is
+  hardcoded: `install.sh` records the checkout's `origin` (with any user name or token removed), and ezvps
+  asks once if none is recorded.
+* **Check for updates** compares the installed version and commit with the latest `main` and reports
+  installed versus latest. An install with no recorded version or commit (for example one made before
+  `install.sh` recorded it, or whose script was edited since) is reported as **unknown**, never as up to date.
+* **Update ezvps** shows the plan, asks for a yes, backs up the current script and state, replaces
+  `/usr/local/bin/ezvps` with the latest `main`, and checks the new script (`bash -n` and `--version`) before
+  and after installing it. If the check after the install fails, the previous script is put back from the
+  backup. Tool configs, sites, certificates, users and other state are not touched. Restart ezvps afterwards.
+
+`ezvps` -> `12` is **Uninstall**. It lists what it will remove, requires typing `YES`, makes a backup first
+and prints its path, then removes **only `/usr/local/bin/ezvps` and the ezvps state files**, checks that they
+are gone, and reports what was removed and what was left untouched (nginx, 3x-ui, Backpack, ctunnel,
+Lazyports, their configs, sites, certificates, users). **Backups are never deleted.** To bring ezvps back, run
+`install.sh` again or copy `bin/ezvps` out of the backup.
+
+Details are in [SPEC.md](SPEC.md) sections 6.10 to 6.12.
+
 ## Principles
 
 Check before installing. Back up before overwriting. Idempotent re-runs. No
@@ -388,7 +448,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports, SSH and Users, Firewall against fakes, pending modules, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports, SSH and Users, Firewall, Backup/Update/Uninstall against fakes, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway VPS on each

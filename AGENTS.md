@@ -30,8 +30,9 @@ managing a Debian (12, 13) or Ubuntu LTS (22.04, 24.04, 26.04) VPS as root. `ins
    prints `git clone` instructions with private auth. `install.sh` must
    never modify an existing ezl2tp install.
 7. **Never fail the menu.** Modules return 0 to the menu; show a clear
-   message instead of crashing. Unbuilt modules print
-   `<Label> is not implemented yet.` and return.
+   message instead of crashing. A module added to the registry before it is
+   built prints `<Label> is not implemented yet.` and returns
+   (`module_not_implemented`); all twelve are built as of PR 12.
 8. **Menu labels are clean:** just the item name, no description text.
 
 ## Layout
@@ -66,7 +67,10 @@ SPEC.md  README.md  AGENTS.md
   no `sed`/`awk`/`grep`/`ssh-keygen`: passwd, group and sshd_config are parsed in bash; Firewall:
   only the one detected backend's own command (`ufw`, `firewall-cmd`, `nft` or `iptables`), plus
   `ss` and `sshd` when present, `date`/`mkdir`/`chmod` for the rule listing copy, and no
-  `sed`/`awk`/`grep`: backend output is parsed in bash). Shared
+  `sed`/`awk`/`grep`: backend output is parsed in bash; Backup, Check For Updates, Uninstall:
+  `cp`, `mv`, `rm`, `rmdir`, `mkdir`, `mktemp`, `date`, `chmod`, `stat`, `du`, `cmp`, `sha256sum`, `bash`
+  (`-n` and `--version` checks), `git` (updates only), and for restoring nginx sites `nginx` and
+  `systemctl`; no `sed`/`awk`/`grep`/`curl`). Shared
   helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_supported_os`,
   `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
@@ -75,7 +79,8 @@ SPEC.md  README.md  AGENTS.md
   in `ngx_fetch_key` (the nginx.org signing key), in `acme_fetch_script`
   (the pinned acme.sh script) and in `lc_fetch_installer` (the pinned Backpack and
   Lazyports installers); git may touch the network only in `lc_fetch_source` (the
-  pinned ctunnel commit, https only). Lint enforces both.
+  pinned ctunnel commit, https only) and in `upd_fetch_latest` (a shallow clone of `main` of the user's own
+  private ezvps repository, https/ssh only, with the user's own authentication). Lint enforces both.
   Download to a temp file, show URL and hash, verify, ask, then run. Never
   pipe or process-substitute a download into a shell. Pin a tag/version plus
   a SHA-256 (the nginx.org key is pinned by fingerprint); never
@@ -136,12 +141,25 @@ SPEC.md  README.md  AGENTS.md
   rules from the backend afterwards; removing a rule that allows SSH needs its own warning and
   second confirmation, and the rules are re-read to make sure the chosen rule is still the same.
   nftables/iptables changes are runtime only and say so; do not rewrite their saved configuration.
+* Backup, Check For Updates and Uninstall (SPEC 6.10-6.12) manage ezvps itself and nothing else: never
+  install, update, restart or remove nginx, 3x-ui, Backpack, ctunnel, Lazyports or ezl2tp, or touch their
+  configs, users, SSH settings or firewall rules. A backup is `ezvps-backup.<UTC time>-NN` (mode 700) holding
+  the script, `/var/lib/ezvps`, the ezvps-made nginx sites and `/etc/ssl/ezvps` (keys included, copied, never
+  read or printed); ezvps never deletes a backup. Every item runs `ezb_preflight` first (root, supported
+  system, commands, and a writable backup dir for anything that writes), asks for the exact word `YES` where
+  the spec says so (`IFS= read`), backs up **before** it writes, and **verifies the result on the file system**
+  (byte compare, modes, `bash -n`, `--version`), never on a copy's success alone. Update fetches only with
+  `git` and the user's own authentication from the address `install.sh` recorded (`install.state`), never an
+  anonymous URL, never `curl`; a refused address is never echoed (it may hold a token). An install whose
+  commit is not recorded and verified is **unknown**, never "up to date". Restore never overwrites a
+  hand-written nginx site, runs `nginx -t` before any reload and rolls back on a failure. Uninstall removes
+  only the script and the `*.state` files.
 * Output goes through `info` / `warn` / `err`. Colour only on a TTY and
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`
   section 7a (`EZVPS_ALLOW_NONROOT`, `EZVPS_XUI_DIR`, `EZVPS_ACME_HOME`,
   `EZVPS_CERT_DIR`, `EZVPS_TOOL_PREFIX`, `EZVPS_BACKPACK_CONF_DIR`, `EZVPS_PASSWD_FILE`,
-  `EZVPS_SSHD_CONFIG`, ...). Do not add switches that weaken real behaviour.
+  `EZVPS_SSHD_CONFIG`, `EZVPS_BIN_DIR`, `EZVPS_STATE_DIR`, ...). Do not add switches that weaken real behaviour.
 
 ## Adding a module
 

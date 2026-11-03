@@ -59,7 +59,9 @@ done
 #      (ngx_fetch_key), the pinned acme.sh download (acme_fetch_script) and the
 #      pinned Backpack/Lazyports installer download (lc_fetch_installer); never
 #      from L2TP or anywhere else.
-#    - git may touch the network only in lc_fetch_source (the pinned ctunnel commit).
+#    - git may touch the network only in lc_fetch_source (the pinned ctunnel commit) and
+#      upd_fetch_latest (main of the user's private ezvps repository, with the user's own
+#      authentication; never an anonymous URL).
 #    - Nothing is ever piped or process-substituted from the network into a shell.
 #    - install.sh downloads nothing.
 bad_curl="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
@@ -71,9 +73,9 @@ if [[ -n "$bad_curl" ]]; then
 fi
 bad_git="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
     !/^[[:space:]]*#/ && /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && /"\$\{g\[@\]\}"|git[[:space:]]+-/ {
-        if (fn != "lc_fetch_source()") print NR": "$0 }' ezvps)"
+        if (fn != "lc_fetch_source()" && fn != "upd_fetch_latest()") print NR": "$0 }' ezvps)"
 if [[ -n "$bad_git" ]]; then
-    bad "ezvps: git network access outside lc_fetch_source:"
+    bad "ezvps: git network access outside lc_fetch_source/upd_fetch_latest:"
     printf '%s\n' "$bad_git" >&2
 fi
 for f in ezvps install.sh; do
@@ -163,6 +165,30 @@ if grep -qE '^[[:space:]]*(ufw|nft|iptables|firewall-cmd)[[:space:]]+[^|)]' <<<"
 fi
 if ! grep -qE '^FW_BACKENDS=\(ufw firewalld nftables iptables\)' ezvps; then
     bad "ezvps: the firewall detection order must be ufw, firewalld, nftables, iptables (SPEC 6.9)"
+fi
+# Backup, Check For Updates and Uninstall (ezvps itself): nothing is downloaded except through git
+# with the user's own authentication (the repository is private), nothing is removed recursively
+# except this run's own discarded backup and the update's temp directory, Uninstall removes only the
+# script and the *.state files and touches no other tool, and no private key is ever printed.
+ezb_code="$(awk '/^(ezb_[a-z_]+|upd_[a-z_]+|module_uninstall)\(\) \{/ {on=1} on {print} /^}/ {on=0}' ezvps | grep -vE '^[[:space:]]*#')"
+if [[ -z "$ezb_code" ]]; then
+    bad "ezvps: the Backup / Check For Updates / Uninstall code (ezb_*, upd_*, module_uninstall) is missing"
+fi
+if grep -qE 'curl|wget|raw\.githubusercontent|get\.acme\.sh|http://' <<<"$ezb_code"; then
+    bad "ezvps: Backup, Check For Updates and Uninstall must not download anything (the repository is private: git with the user's own authentication only)"
+fi
+if [[ "$(grep -c 'rm -rf' <<<"$ezb_code")" != 2 ]]; then
+    bad "ezvps: rm -rf is allowed only for a discarded incomplete backup and the update temp directory"
+fi
+un_code="$(awk '/^module_uninstall\(\) \{/ {on=1} on {print} /^}/ {on=0}' ezvps | grep -vE '^[[:space:]]*#|info |err |warn |kept=')"
+if grep -qE 'rm -[a-z]*r|systemctl|apt-get|dpkg|userdel|usermod|nginx|x-ui' <<<"$un_code"; then
+    bad "ezvps: Uninstall must remove only the ezvps script and its state files, never another tool, service, package or user"
+fi
+if grep -qE '(cat|printf|info|echo|err|warn)[^|]*privkey|<[^<]*privkey' <<<"$ezb_code"; then
+    bad "ezvps: a private key must never be printed or read by Backup/Restore"
+fi
+if ! grep -qF 'git -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always' ezvps; then
+    bad "ezvps: the update fetch must allow https and ssh only"
 fi
 # Nginx must come from the nginx.org STABLE repository: the repo URL has no
 # "mainline", the key URL is https, the pin is priority 900, and the key
