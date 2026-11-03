@@ -71,21 +71,36 @@ OS_ALLOWLIST=(
 OS_SUPPORTED_TEXT="Debian 12 (bookworm), Debian 13 (trixie), Ubuntu 22.04 LTS (jammy), Ubuntu 24.04 LTS (noble) or Ubuntu 26.04 LTS (resolute)"
 
 detect_os() {
-    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line v
+    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line v key invalid=0 LC_ALL=C # C locale: the character ranges below are plain ASCII
     OS_ID="" OS_VERSION="" OS_CODENAME=""
     if [[ -r "$f" ]]; then
         while IFS= read -r line; do
-            v="${line#*=}"
-            # Keep only characters that can appear in these fields: the values
-            # end up in messages, so no control characters get through.
-            v="${v//[^A-Za-z0-9._-]/}"
             case "$line" in
-                ID=*) OS_ID="${v,,}" ;;
-                VERSION_ID=*) OS_VERSION="$v" ;;
-                VERSION_CODENAME=*) OS_CODENAME="${v,,}" ;;
+                ID=*) key=ID ;;
+                VERSION_ID=*) key=VERSION_ID ;;
+                VERSION_CODENAME=*) key=VERSION_CODENAME ;;
+                *) continue ;;
+            esac
+            v="${line#*=}"
+            # One pair of surrounding quotes is os-release syntax, not part of the value.
+            if [[ "$v" == \"*\" || "$v" == \'*\' ]]; then
+                v="${v:1:${#v}-2}"
+            fi
+            # Validate the raw value; never edit it into a match. Any character outside
+            # [A-Za-z0-9._-] (a space, a control character, anything else) makes the whole
+            # file invalid, so the system is refused and nothing is changed.
+            if [[ ! "$v" =~ ^[A-Za-z0-9._-]*$ ]]; then
+                invalid=1
+                break
+            fi
+            case "$key" in
+                ID) OS_ID="${v,,}" ;;
+                VERSION_ID) OS_VERSION="$v" ;;
+                VERSION_CODENAME) OS_CODENAME="${v,,}" ;;
             esac
         done <"$f"
     fi
+    ((invalid)) && OS_ID="" OS_VERSION="" OS_CODENAME=""
     return 0
 }
 

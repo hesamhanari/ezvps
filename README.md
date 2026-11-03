@@ -30,6 +30,7 @@ rejected.
 | Nginx (nginx.org stable 1.30+) | yes (`packages/debian`, `bookworm`) | yes (`packages/debian`, `trixie`) | yes (`packages/ubuntu`, `jammy`) | yes (`packages/ubuntu`, `noble`) | yes (`packages/ubuntu`, `resolute`) |
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | Backpack, ctunnel, Lazyports (x86_64 and aarch64 only) | yes | yes | yes | yes | yes |
+| SSH and Users | yes | yes | yes | yes | yes |
 | Firewall (whichever of ufw, firewalld, nftables, iptables is present) | yes | yes | yes | yes | yes |
 | Backup, Check For Updates, Uninstall (ezvps itself) | yes | yes | yes | yes | yes |
 | L2TP | see below | yes | see below | see below | see below |

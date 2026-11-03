@@ -55,6 +55,11 @@ Per module:
 * **One shared check.** `detect_os` reads `/etc/os-release` (the `ID`,
   `VERSION_ID` and `VERSION_CODENAME` lines; the file is parsed, never sourced,
   and `ID_LIKE` is ignored) and sets `OS_ID`, `OS_VERSION`, `OS_CODENAME`.
+  Each of the three raw values (after removing one pair of surrounding quotes)
+  is validated, never edited into a match: a value with any character outside
+  `[A-Za-z0-9._-]` (a space, a control character, ...) makes the whole file
+  invalid, all three values are cleared and the system is rejected with the
+  supported-systems message, changing nothing.
   `os_is_supported` accepts a system only when **all three** values form one of
   the five allowlist entries above, so Ubuntu 24.04 with codename `jammy`,
   Debian 13 with `bookworm`, or Ubuntu 22.04 with no codename are rejected (a
@@ -1513,9 +1518,13 @@ says it reports no rules. Nothing is guessed from files on disk.
    session ezvps is running in (`SSH_CONNECTION`). A removal is treated as an SSH removal when the rule
    **allows** traffic and it (a) covers an SSH port (a port, a range, a list, an application profile or
    a service such as `OpenSSH`/`ssh`), (b) is the SSH service or profile by name when its ports cannot
-   be read, or (c) has **no port and no protocol restriction at all** (for example a source-only allow,
-   an established-connections rule, or a loopback rule), which may be what keeps SSH or the current
-   session working. Then ezvps prints `WARNING: rule <id> <why>.`, that removing it can lock the user out
+   be read, (c) has **no port and no protocol restriction at all** (for example a source-only allow,
+   an established-connections rule, or a loopback rule), or (d) allows **tcp or any protocol with no
+   port restriction** (an allow-all-TCP rule), which may be what keeps SSH or the current session
+   working. A **jump or goto to another chain** (nftables `jump`/`goto`, iptables `-j <chain>`/`-g <chain>`)
+   is flagged too, with the reason that ezvps did not resolve the target chain, which may lead to a chain
+   that accepts SSH; a jump whose match cannot be SSH (a non-SSH port list, or a protocol other than
+   tcp or any) is not. A rule that only allows a non-SSH port, such as port 80, is not flagged. Then ezvps prints `WARNING: rule <id> <why>.`, that removing it can lock the user out
    of the server including the current session and cannot be undone remotely, and (when connected over
    SSH) that the session appears to be an SSH one, and asks `Remove this SSH-related rule anyway?`
    (default no). One yes to the first question is not enough. Removing a block rule is not an SSH
