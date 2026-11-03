@@ -4816,9 +4816,11 @@ case "$1 ${2:-}" in
         n="$3"
         if [[ "${FAKE_UFW_DEL_FAIL:-0}" == 1 ]]; then echo "ERROR: Could not delete rule" >&2; exit 1; fi
         if ! [[ "$n" =~ ^[0-9]+$ ]] || ((n < 1 || n > ${#rules[@]})); then echo "ERROR: Could not find rule '$n'" >&2; exit 1; fi
-        unset "rules[$((n - 1))]"
-        rules=("${rules[@]}")
-        save
+        if [[ "${FAKE_UFW_DEL_NOOP:-0}" != 1 ]]; then
+            unset "rules[$((n - 1))]"
+            rules=("${rules[@]}")
+            save
+        fi
         echo "Rule deleted"
         ;;
     "app list")
@@ -5086,7 +5088,7 @@ fw_new() { # a fresh fake system; exports what the stubs and the module read
     : >"$FW_LISTEN"
     : >"$EZVPS_SSHD_CONFIG"
     FW_ENV=()
-    unset SSH_CONNECTION FAKE_UFW_SHIFT FAKE_UFW_DEL_FAIL FAKE_UFW_APPINFO_FAIL FAKE_UFW_ADD_FAIL FAKE_UFW_ADD_NOOP FAKE_FWD_PERM_FAIL FAKE_NFT_FAIL FAKE_NFT_ADD_NOOP FAKE_IPT_FAIL FAKE_IPT_ADD_NOOP
+    unset SSH_CONNECTION FAKE_UFW_SHIFT FAKE_UFW_DEL_NOOP FAKE_UFW_DEL_FAIL FAKE_UFW_APPINFO_FAIL FAKE_UFW_ADD_FAIL FAKE_UFW_ADD_NOOP FAKE_FWD_PERM_FAIL FAKE_NFT_FAIL FAKE_NFT_ADD_NOOP FAKE_IPT_FAIL FAKE_IPT_ADD_NOOP
 }
 fw_ufw_fixture() {
     printf '%s\n' '22/tcp|ALLOW IN|Anywhere' '80/tcp|ALLOW IN|Anywhere' '6000:6010/tcp|ALLOW IN|Anywhere' \
@@ -5438,6 +5440,13 @@ run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
 check "ufw refuses the removal: the error is shown" contains "$OUT" "ufw could not remove the rule: ERROR: Could not delete rule"
 check "ufw refuses the removal: ezvps still exits 0" equals "$RC" 0
 unset FAKE_UFW_DEL_FAIL
+fw_new
+fw_ufw_fixture
+export FAKE_UFW_DEL_NOOP=1
+run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
+check "a removal that the backend does not carry out is not claimed as done" contains "$OUT" "ufw still lists the rule you removed."
+check "a removal that did not happen is not summarised as removed" not_contains "$OUT" "Only that rule was removed"
+unset FAKE_UFW_DEL_NOOP
 fw_new
 fw_ufw_fixture
 export FAKE_UFW_SHIFT=1
