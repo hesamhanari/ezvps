@@ -5789,6 +5789,76 @@ check "iptables failing: the error is shown and the menu goes on" contains "$OUT
 check "iptables failing: exits 0" equals "$RC" 0
 unset FAKE_IPT_FAIL
 
+echo "-- Firewall: SSH warning for allow-all-TCP rules and jumps to other chains"
+# fw_ssh_case <ipt|nft> <rule id> <warn|plain> <label> [text the warning must contain]
+# Removes one rule of a fixture. "warn": the SSH warning appears, declining the second question deletes
+# nothing, and two yes answers delete that one rule. "plain": no SSH warning, deleted after the first yes.
+fw_ssh_case() {
+    local be="$1" id="$2" want="$3" label="$4" why="${5:-}" bin del
+    if [[ "$be" == ipt ]]; then bin="$FWBIN_IPT1" del="iptables -w -D"; else bin="$FWBIN_NFT1" del="nft delete"; fi
+    fw_new
+    if [[ "$be" == ipt ]]; then
+        echo DROP >"$FW_STATE_DIR/ipt.policy"
+        printf '%s\n' '-p tcp -j ACCEPT' \
+            '-p tcp -j CUSTOMCHAIN' \
+            '-g OTHERCHAIN' \
+            '-p tcp -m tcp --dport 80 -j ACCEPT' \
+            '-p udp -j ACCEPT' \
+            '-p tcp -m tcp --dport 80 -j WEBCHAIN' \
+            '-p tcp -m tcp --dport 20:30 -j ACCEPT' \
+            '-p tcp -m tcp --dport 22 -j ACCEPT' \
+            '-j LOG' >"$FW_STATE_DIR/ipt.rules"
+    else
+        printf '%s\n' 'inet|filter|input|type filter hook input priority filter; policy drop;' >"$FW_STATE_DIR/nft.chains"
+        printf '%s\n' 'inet|filter|input|31|jump custom_chain' \
+            'inet|filter|input|32|goto other_chain' \
+            'inet|filter|input|33|tcp dport 80 accept' \
+            'inet|filter|input|34|tcp dport 80 jump web_chain' \
+            'inet|filter|input|35|udp dport 53 accept' \
+            'inet|filter|input|36|tcp dport 22 accept' \
+            'inet|filter|input|37|tcp dport 20-30 accept' >"$FW_STATE_DIR/nft.rules"
+    fi
+    if [[ "$want" == warn ]]; then
+        run_fw "$bin" "4\n${id}\ny\nn\n0\n"
+        check "${label}: the SSH warning is shown" contains "$OUT" "WARNING: rule ${id} ${why}"
+        check "${label}: declining the second question deletes nothing" equals "$(flog_count "$del")" 0
+        check "${label}: the answers were consumed by the two questions" not_contains "$OUT" "Invalid choice"
+        run_fw "$bin" "4\n${id}\ny\ny\n0\n"
+        check "${label}: two yes answers remove exactly that rule" equals "$(flog_count "$del")" 1
+    else
+        run_fw "$bin" "4\n${id}\ny\n0\n"
+        check "${label}: no SSH warning" not_contains "$OUT" "WARNING"
+        check "${label}: removed after the generic confirmation only" equals "$(flog_count "$del")" 1
+    fi
+}
+WHY_ALLTCP="allows all TCP ports, which includes SSH (port 22)"
+WHY_JUMP="jumps to another chain; ezvps did not resolve the target chain, so it may lead to a chain that accepts SSH"
+fw_ssh_case ipt 1 warn "iptables allow-all-TCP (-p tcp -j ACCEPT)" "$WHY_ALLTCP"
+fw_ssh_case ipt 2 warn "iptables jump to a custom chain (-j CUSTOMCHAIN)" "$WHY_JUMP"
+fw_ssh_case ipt 3 warn "iptables goto (-g OTHERCHAIN)" "$WHY_JUMP"
+fw_ssh_case ipt 7 warn "iptables range 20:30 includes the SSH port" "allows SSH (port 22/tcp)"
+fw_ssh_case ipt 8 warn "iptables SSH port rule" "allows SSH (port 22/tcp)"
+fw_ssh_case ipt 4 plain "iptables port 80 only"
+fw_ssh_case ipt 5 plain "iptables udp with no port"
+fw_ssh_case ipt 6 plain "iptables jump limited to port 80"
+fw_ssh_case ipt 9 plain "iptables -j LOG is not a chain"
+fw_ssh_case nft 31 warn "nft jump to a custom chain" "$WHY_JUMP"
+fw_ssh_case nft 32 warn "nft goto another chain" "$WHY_JUMP"
+fw_ssh_case nft 36 warn "nft SSH port rule" "allows SSH (port 22/tcp)"
+fw_ssh_case nft 37 warn "nft range 20-30 includes the SSH port" "allows SSH (port 22/tcp)"
+fw_ssh_case nft 33 plain "nft port 80 only"
+fw_ssh_case nft 34 plain "nft jump limited to port 80"
+fw_ssh_case nft 35 plain "nft udp port 53"
+# a ufw rule with no port and no protocol stays flagged; port 80 only is not
+fw_new
+fw_ufw_fixture
+printf '%s\n' 'Anywhere|ALLOW IN|198.51.100.7' '80/tcp|ALLOW IN|Anywhere' >"$FW_STATE_DIR/ufw.rules"
+run_fw "$FWBIN_UFW" "4\n1\ny\nn\n0\n"
+check "ufw: an allow with no port and no protocol is still flagged" contains "$OUT" "WARNING: rule 1 has no port or protocol restriction"
+run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
+check "ufw: port 80 only is not flagged" not_contains "$OUT" "WARNING"
+check "ufw: port 80 only is removed after the first yes" flog_has "ufw --force delete 2"
+
 echo "-- Firewall: supported systems and root"
 fw_new
 fw_ufw_fixture
@@ -7148,6 +7218,57 @@ for c in "${OS_CASES[@]}"; do
         check "install.sh on ${f}: nothing installed" test ! -e "$OSBIN/ezvps"
     fi
 done
+
+# os-release values are validated raw, never edited into a match: any character outside
+# [A-Za-z0-9._-] rejects the whole file (ezvps and install.sh).
+echo "-- os-release: values with characters outside [A-Za-z0-9._-] are rejected, not sanitised"
+mk_os() { printf '%b' "$2" >"$OSD/$1"; }
+mk_os spaced-id 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nID="ubu ntu"\n'
+mk_os spaced-id-match 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nID="ubuntu x"\n'
+mk_os spaced-version 'NAME="Ubuntu"\nVERSION_ID="24 .04"\nVERSION_CODENAME=noble\nID=ubuntu\n'
+mk_os spaced-codename 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME="no ble"\nID=ubuntu\n'
+mk_os trailing-space-id 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nID=ubuntu \n'
+mk_os control-char-id 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nID=ubu\033ntu\n'
+mk_os control-char-version 'NAME="Ubuntu"\nVERSION_ID="24.04\001"\nVERSION_CODENAME=noble\nID=ubuntu\n'
+mk_os crlf-codename 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\r\nID=ubuntu\n'
+mk_os dollar-id 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nID="ubuntu$x"\n'
+mk_os bad-last 'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nVERSION_ID="24 04"\n'
+mk_os valid-single-quotes "NAME='Ubuntu'\nVERSION_ID='24.04'\nVERSION_CODENAME='noble'\nID='ubuntu'\n"
+mk_os valid-upper-id 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\nID=Ubuntu\n'
+BAD_OS=(spaced-id spaced-id-match spaced-version spaced-codename trailing-space-id control-char-id control-char-version crlf-codename dollar-id bad-last)
+for f in "${BAD_OS[@]}"; do
+    new_scn "os-bad-$f"
+    run_os "$OSD/$f" "$SBOX" "2\n1\nn\n\n0\n\n0\n"
+    check "ezvps rejects ${f}" contains "$OUT" "3x-ui install needs a supported system: ${OS_LIST_TEXT}; found 'unknown unknown unknown'. Nothing was changed."
+    check "ezvps ${f}: nothing downloaded or installed" no_download
+    check "ezvps ${f}: menu survives" equals "$RC" 0
+    os_install "$OSD/$f"
+    check "install.sh refuses ${f}" test "$RC" -ne 0
+    check "install.sh refuses ${f} with the shared message" contains "$OUT" "ezvps install needs a supported system: ${OS_LIST_TEXT}; found 'unknown unknown unknown'. Nothing was changed."
+    check "install.sh on ${f}: nothing installed" test ! -e "$OSBIN/ezvps"
+done
+for f in valid-single-quotes valid-upper-id ubuntu2404 ubuntu2404-quoted debian13 debian12 ubuntu2204 ubuntu2604; do
+    new_scn "os-good-$f"
+    run_os "$OSD/$f" "$SBOX" "2\n1\nn\n\n0\n\n0\n"
+    check "ezvps still accepts ${f}" not_contains "$OUT" "needs a supported system"
+    os_install "$OSD/$f"
+    check "install.sh still accepts ${f}" equals "$RC" 0
+    check "install.sh on ${f}: ezvps is installed" test -x "$OSBIN/ezvps"
+done
+check "detect_os never strips characters to make a value match (ezvps)" bash -c '! grep -qF "v//[^A-Za-z0-9._-]/" "$1"' _ "$EZVPS"
+check "detect_os never strips characters to make a value match (install.sh)" bash -c '! grep -qF "v//[^A-Za-z0-9._-]/" "$1"' _ "$INSTALL"
+
+echo "-- README"
+readme_has_ssh_row() { # the SSH and Users row sits in the per-module table, yes on all five systems
+    local x t=0 l=0
+    while IFS= read -r x; do
+        [[ "$x" == "### Per module" ]] && t=1
+        [[ $t == 1 && "$x" == "| SSH and Users | yes | yes | yes | yes | yes |" ]] && l=1
+        [[ $t == 1 && "$x" == "**L2TP is gated separately.**"* ]] && break
+    done <"$1"
+    ((l))
+}
+check "README per-module table has the SSH and Users row (yes on all five systems)" readme_has_ssh_row "$ROOT/README.md"
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAILS"

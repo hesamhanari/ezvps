@@ -407,21 +407,36 @@ OS_ALLOWLIST=(
 OS_SUPPORTED_TEXT="Debian 12 (bookworm), Debian 13 (trixie), Ubuntu 22.04 LTS (jammy), Ubuntu 24.04 LTS (noble) or Ubuntu 26.04 LTS (resolute)"
 
 detect_os() {
-    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line v
+    local f="${EZVPS_OS_RELEASE:-/etc/os-release}" line v key invalid=0 LC_ALL=C # C locale: the character ranges below are plain ASCII
     OS_ID="" OS_VERSION="" OS_CODENAME=""
     if [[ -r "$f" ]]; then
         while IFS= read -r line; do
-            v="${line#*=}"
-            # Keep only characters that can appear in these fields: the values
-            # end up in messages, so no control characters get through.
-            v="${v//[^A-Za-z0-9._-]/}"
             case "$line" in
-                ID=*) OS_ID="${v,,}" ;;
-                VERSION_ID=*) OS_VERSION="$v" ;;
-                VERSION_CODENAME=*) OS_CODENAME="${v,,}" ;;
+                ID=*) key=ID ;;
+                VERSION_ID=*) key=VERSION_ID ;;
+                VERSION_CODENAME=*) key=VERSION_CODENAME ;;
+                *) continue ;;
+            esac
+            v="${line#*=}"
+            # One pair of surrounding quotes is os-release syntax, not part of the value.
+            if [[ "$v" == \"*\" || "$v" == \'*\' ]]; then
+                v="${v:1:${#v}-2}"
+            fi
+            # Validate the raw value; never edit it into a match. Any character outside
+            # [A-Za-z0-9._-] (a space, a control character, anything else) makes the whole
+            # file invalid, so the system is refused and nothing is changed.
+            if [[ ! "$v" =~ ^[A-Za-z0-9._-]*$ ]]; then
+                invalid=1
+                break
+            fi
+            case "$key" in
+                ID) OS_ID="${v,,}" ;;
+                VERSION_ID) OS_VERSION="$v" ;;
+                VERSION_CODENAME) OS_CODENAME="${v,,}" ;;
             esac
         done <"$f"
     fi
+    ((invalid)) && OS_ID="" OS_VERSION="" OS_CODENAME=""
     return 0
 }
 
@@ -5715,7 +5730,7 @@ fw_nftables_remove() { # fw_nftables_remove <index>
 # iptables -w -D INPUT <number>. The INPUT chain of the filter table, IPv4 only.
 
 fw_iptables_load() {
-    local l n=0 re_p re_dport re_s re_j t
+    local l n=0 re_p re_dport re_s re_j re_g t
     fw_rules_clear
     FW_IPT_POLICY=""
     if ! fw_run iptables -w -S INPUT; then
@@ -5727,6 +5742,7 @@ fw_iptables_load() {
     re_dport=' --dports? ([0-9:,]+)'
     re_s=' -s ([^ ]+)'
     re_j=' -j ([^ ]+)'
+    re_g=' -g ([^ ]+)'
     while IFS= read -r l; do
         case "$l" in
             "-P INPUT "*) FW_IPT_POLICY="${l#-P INPUT }" ;;
@@ -5743,6 +5759,8 @@ fw_iptables_load() {
                 if [[ "$l" =~ $re_j ]]; then
                     t="${BASH_REMATCH[1]}"
                     case "$t" in ACCEPT | DROP | REJECT | RETURN) FW_P_ACTION="${t,,}" ;; *) FW_P_ACTION="$t" ;; esac
+                elif [[ "$l" =~ $re_g ]]; then
+                    FW_P_ACTION="goto" # -g <chain>: a goto, like nftables
                 fi
                 fw_rule_add "$n" "$FW_P_ACTION" "$FW_P_PROTO" "$FW_P_PORT" "$FW_P_SRC" "$l" "$n" "$FW_P_COVER" "INPUT"
                 ;;
@@ -5871,21 +5889,56 @@ fw_ssh_ports() {
     return 0
 }
 
-# fw_rule_affects_ssh <index>: true (and FW_SSH_WHY says why) when removing this allow rule could
-# cut SSH: it covers an SSH port, it is a service/profile named for SSH, or it has no port and no
-# protocol restriction at all (so it may be what lets SSH or the current session through).
+# fw_act_jumps <action>: a jump or goto to another chain, whose target ezvps does not resolve.
+# nftables reports the keyword (jump, goto); iptables reports the target name (-j <target>), and a
+# target that is not a built-in terminal or extension target is a user chain; -g shows as "goto".
+fw_act_jumps() {
+    case "$1" in jump | goto) return 0 ;; esac
+    [[ "$FW_BACKEND" == iptables ]] || return 1
+    case "$1" in
+        "" | - | accept | drop | reject | return) return 1 ;;
+        LOG | ULOG | NFLOG | MARK | CONNMARK | TCPMSS | NFQUEUE | CT | TRACE | NOTRACK | AUDIT | TOS | TTL | DSCP | ECN | CLASSIFY | SECMARK | CONNSECMARK | SET | TEE | REDIRECT | DNAT | SNAT | MASQUERADE | NETMAP) return 1 ;;
+    esac
+    return 0
+}
+
+# fw_rule_affects_ssh <index>: true (and FW_SSH_WHY says why) when removing this rule could cut SSH:
+#   * an allow rule whose ports cover an SSH port (a range counts);
+#   * an allow rule for an SSH-named service/profile;
+#   * an allow rule for tcp or any protocol with no port restriction (allow-all-TCP included);
+#   * a jump or goto to another chain (nftables, iptables), because the target chain is not
+#     resolved and may accept SSH (a jump whose match provably cannot be SSH, such as port 80
+#     only, is not flagged).
+# A rule that only allows a non-SSH port is not flagged.
 fw_rule_affects_ssh() {
-    local i="$1" p name
+    local i="$1" p name jump=0
     FW_SSH_WHY=""
-    fw_act_allows "${FW_ACTION[$i]}" || return 1
+    if fw_act_jumps "${FW_ACTION[$i]}"; then
+        jump=1
+    else
+        fw_act_allows "${FW_ACTION[$i]}" || return 1
+    fi
     fw_ssh_ports
     if [[ -n "${FW_COVER[$i]}" ]]; then
         for p in "${FW_SSH_PORTS[@]}"; do
             if fw_cover_has "${FW_COVER[$i]}" "$p" tcp; then
-                FW_SSH_WHY="allows SSH (port ${p}/tcp)"
+                if ((jump)); then
+                    FW_SSH_WHY="jumps to another chain for SSH traffic (port ${p}/tcp); ezvps did not resolve the target chain, so it may lead to a chain that accepts SSH"
+                else
+                    FW_SSH_WHY="allows SSH (port ${p}/tcp)"
+                fi
                 return 0
             fi
         done
+        return 1
+    fi
+    if ((jump)); then
+        case "${FW_PROTO[$i]}" in
+            - | any | tcp)
+                FW_SSH_WHY="jumps to another chain; ezvps did not resolve the target chain, so it may lead to a chain that accepts SSH (port ${FW_SSH_PORTS[*]})"
+                return 0
+                ;;
+        esac
         return 1
     fi
     name="${FW_PORT[$i]%% (*}"
@@ -5896,9 +5949,17 @@ fw_rule_affects_ssh() {
             return 0
             ;;
     esac
-    if [[ "${FW_PORT[$i]}" == - && "${FW_PROTO[$i]}" == - ]]; then
-        FW_SSH_WHY="has no port or protocol restriction, so it may be what keeps SSH (port ${FW_SSH_PORTS[*]}) or your current connection working"
-        return 0
+    if [[ "${FW_PORT[$i]}" == - ]]; then
+        case "${FW_PROTO[$i]}" in
+            -)
+                FW_SSH_WHY="has no port or protocol restriction, so it may be what keeps SSH (port ${FW_SSH_PORTS[*]}) or your current connection working"
+                return 0
+                ;;
+            any | tcp)
+                FW_SSH_WHY="allows all TCP ports, which includes SSH (port ${FW_SSH_PORTS[*]}), so it may be what keeps SSH or your current connection working"
+                return 0
+                ;;
+        esac
     fi
     return 1
 }
