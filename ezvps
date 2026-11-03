@@ -1385,7 +1385,6 @@ ngx_verify_key() {
         err "Cannot create a temporary directory."
         return 1
     }
-    info "Downloading the signing key: ${NGX_ORG_KEY_URL}"
     if ! ngx_fetch_key "${NGX_KEY_TMP}/key.asc"; then
         err "Download failed: ${NGX_ORG_KEY_URL}. Nothing was changed."
         return 1
@@ -1432,14 +1431,14 @@ ngx_same_keyring() { # <new> <existing>: same set of primary fingerprints
     [[ "$mine" == "${NGX_KEY_FPS[*]}" ]]
 }
 
-# ngx_put_file <src> <dest> <mode> <same-function>: install <src> as <dest>;
+# ngx_put_file <src> <dest> <mode> <same-function> <label>: install <src> as <dest>;
 # an identical file is left alone, a different one is backed up first. What was
 # done is recorded so ngx_repo_undo can put it back.
 ngx_put_file() {
-    local src="$1" dst="$2" mode="$3" same="$4" bk="" tmp
+    local src="$1" dst="$2" mode="$3" same="$4" label="$5" bk="" tmp
     if [[ -e "$dst" || -L "$dst" ]]; then
         if "$same" "$src" "$dst"; then
-            info "  ${dst}: already up to date"
+            info "  ${label}: already up to date"
             return 0
         fi
         backup_file "$dst" "apt-${dst##*/}" || return 1
@@ -1457,7 +1456,7 @@ ngx_put_file() {
     fi
     NGX_REPO_UNDO_PATH+=("$dst")
     NGX_REPO_UNDO_BK+=("$bk")
-    info "  ${dst}: written${bk:+ (old file backed up to ${bk})}"
+    [[ -n "$bk" ]] && info "  ${label}: replaced (old file backed up to ${bk})"
     return 0
 }
 
@@ -1479,9 +1478,9 @@ ngx_setup_repo() {
     NGX_REPO_UNDO_PATH=() NGX_REPO_UNDO_BK=()
     printf '%s\n' "deb [signed-by=${NGX_KEYRING}] ${NGX_ORG_REPO_URL} ${NGX_CODENAME} nginx" >"${NGX_KEY_TMP}/nginx.list" || return 1
     printf '%s\n' "Package: *" "Pin: origin nginx.org" "Pin-Priority: 900" >"${NGX_KEY_TMP}/99nginx" || return 1
-    ngx_put_file "${NGX_KEY_TMP}/key.gpg" "$NGX_KEYRING" 644 ngx_same_keyring || return 1
-    ngx_put_file "${NGX_KEY_TMP}/nginx.list" "$NGX_APT_LIST" 644 ngx_same_text || return 1
-    ngx_put_file "${NGX_KEY_TMP}/99nginx" "$NGX_APT_PREF" 644 ngx_same_text || return 1
+    ngx_put_file "${NGX_KEY_TMP}/key.gpg" "$NGX_KEYRING" 644 ngx_same_keyring "signing key" || return 1
+    ngx_put_file "${NGX_KEY_TMP}/nginx.list" "$NGX_APT_LIST" 644 ngx_same_text "apt source" || return 1
+    ngx_put_file "${NGX_KEY_TMP}/99nginx" "$NGX_APT_PREF" 644 ngx_same_text "apt pin" || return 1
     return 0
 }
 
@@ -1651,13 +1650,7 @@ ngx_install_plan() { # ngx_install_plan <replace 0|1> <tools to install...>
     local replace="$1" pkg
     shift
     info ""
-    info "ezvps will install nginx ONLY from the official nginx.org STABLE repository"
-    info "(not ${OS_ID^}'s package, not the mainline branch; stable ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR} or newer):"
-    info "  repository: deb [signed-by=${NGX_KEYRING}] ${NGX_ORG_REPO_URL} ${NGX_CODENAME} nginx"
-    info "  signing key: ${NGX_ORG_KEY_URL} (checked against pinned fingerprints, stored in ${NGX_KEYRING})"
-    info "  apt pin:     ${NGX_APT_PREF} (origin nginx.org, priority 900), so upgrades stay on nginx.org stable"
-    info "  then 'apt-get install nginx', a check with 'nginx -v' (abort if below ${NGX_MIN_MAJOR}.${NGX_MIN_MINOR}, mainline or a ${OS_ID^} build),"
-    info "  enable at boot and start. The firewall is not changed."
+    info "Installing nginx (stable, nginx.org)..."
     if (($# > 0)); then
         info "  first: apt-get install ${*} (needed to fetch and check the key)"
     fi
@@ -1745,7 +1738,6 @@ ngx_install() {
         ngx_cleanup_key_tmp
         return 0
     fi
-    info "Setting up the nginx.org stable repository:"
     if ! ngx_setup_repo; then
         ngx_cleanup_key_tmp
         ngx_repo_undo
@@ -1791,7 +1783,9 @@ ngx_install() {
         ((replace == 1)) && err "Your previous /etc/nginx is backed up in ${etc_bk:-n/a}."
         return 0
     fi
+    local enable_ok=1
     if ! systemctl enable --now "$NGX_SERVICE_NAME"; then
+        enable_ok=0
         err "systemctl enable --now ${NGX_SERVICE_NAME} failed."
     fi
     info ""
@@ -1808,11 +1802,12 @@ ngx_install() {
     fi
     ngx_verify_response
     info ""
-    info "Nginx is installed ($(ngx_version)) from the nginx.org stable repository."
-    info "Upgrades stay on nginx.org stable through the apt pin ${NGX_APT_PREF}."
-    info "Add reverse-proxy sites with 'Add site' (they live in ${NGX_CONFD})."
-    info "Sites added here serve plain HTTP. For HTTPS use the Certificates module"
-    info "(Issue certificate, then enable HTTPS for the site)."
+    info "Installed $(ngx_version)."
+    if ((enable_ok == 1)) && [[ "$(ngx_service_state)" == "running" ]]; then
+        info "nginx is enabled and running."
+    else
+        warn "nginx is not confirmed enabled and running; check: systemctl status ${NGX_SERVICE_NAME}"
+    fi
     return 0
 }
 
