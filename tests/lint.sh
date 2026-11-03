@@ -144,6 +144,26 @@ fi
 if grep -qE 'read[^|]*-s[^|]*(pass|pw)' <<<"$ssh_users_code"; then
     bad "ezvps: the SSH and Users module must not read a password itself (use the system's passwd prompt)"
 fi
+# Firewall: only the one detected backend's documented commands, and never a command that enables,
+# disables, resets or flushes a firewall, reloads firewalld, changes a default policy or zone, or
+# creates/deletes an nftables table or chain. Rules are parsed in bash (no sed/awk/grep), nothing is
+# downloaded.
+fw_code="$(awk '/^(fw_[a-z_]+|module_firewall)\(\) \{/ {on=1} on {print} /^}/ {on=0}' ezvps | grep -vE '^[[:space:]]*#')"
+if [[ -z "$fw_code" ]]; then
+    bad "ezvps: the Firewall module (fw_* functions) is missing"
+fi
+if grep -qE '(ufw|nft|iptables|firewall-cmd)[^"]* (enable|disable|reset|flush)|ufw --force (enable|disable|reset)|iptables[^"]* -[FXZP] |nft (add|create|delete) (table|chain)|--reload|--complete-reload|--panic|--runtime-to-permanent|--set-default-zone' <<<"$fw_code"; then
+    bad "ezvps: the Firewall module must never enable, disable, reset or flush a firewall, reload firewalld, or change a default policy/zone/table/chain"
+fi
+if grep -qE '(^|[|;&( ])(sed|awk|grep|curl|wget)[ ]' <<<"$fw_code"; then
+    bad "ezvps: the Firewall module must parse in bash and download nothing (no sed, awk, grep, curl, wget)"
+fi
+if grep -qE '^[[:space:]]*(ufw|nft|iptables|firewall-cmd)[[:space:]]+[^|)]' <<<"$fw_code"; then
+    bad "ezvps: Firewall backend commands must go through fw_run (C locale, output captured)"
+fi
+if ! grep -qE '^FW_BACKENDS=\(ufw firewalld nftables iptables\)' ezvps; then
+    bad "ezvps: the firewall detection order must be ufw, firewalld, nftables, iptables (SPEC 6.9)"
+fi
 # Nginx must come from the nginx.org STABLE repository: the repo URL has no
 # "mainline", the key URL is https, the pin is priority 900, and the key
 # fingerprints are pinned (40 hex digits each).

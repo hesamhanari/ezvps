@@ -166,7 +166,7 @@ check "'ezvps l2tp' without ezl2tp exits 0" equals "$RC" 0
 
 echo "== not-yet-implemented modules"
 for i in "${!KEYS[@]}"; do
-    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" || "${KEYS[$i]}" == "backpack" || "${KEYS[$i]}" == "ctunnel" || "${KEYS[$i]}" == "lazyports" || "${KEYS[$i]}" == "ssh" ]] && continue
+    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" || "${KEYS[$i]}" == "backpack" || "${KEYS[$i]}" == "ctunnel" || "${KEYS[$i]}" == "lazyports" || "${KEYS[$i]}" == "ssh" || "${KEYS[$i]}" == "firewall" ]] && continue
     n=$((i + 1))
     label="${LABELS[$i]}"
     run_ezvps "$STUB_BIN" "${n}\n\n0\n"
@@ -4749,6 +4749,1097 @@ export EZVPS_NO_PAUSE="${SSH_SAVED_PAUSE:-0}"
 unset EZVPS_PASSWD_FILE EZVPS_GROUP_FILE EZVPS_SHELLS_FILE EZVPS_PROC_DIR EZVPS_HOME_BASE EZVPS_SSHD_CONFIG EZVPS_SSH_WAIT_SECONDS \
     FAKE_LOG FAKE_LISTEN FAKE_BUSY FAKE_SSHD SUDO_USER SSH_CONNECTION
 if [[ -n "${LC_SAVED_BACKUP-}" ]]; then export EZVPS_BACKUP_DIR="$LC_SAVED_BACKUP"; else unset EZVPS_BACKUP_DIR; fi
+
+echo "== Firewall module (fake ufw/firewall-cmd/nft/iptables/ss/sshd with file-backed state, no real firewall)"
+
+FWW="$WORK/fw"
+FW_STUBS="$FWW/stubs"
+mkdir -p "$FW_STUBS"
+FW_SAVED_PAUSE="${EZVPS_NO_PAUSE-}"
+export EZVPS_NO_PAUSE=1
+
+# --- fake ufw: rules live in $FW_STATE_DIR/ufw.rules as "TO|ACTION|FROM"; active when ufw.active exists --------------
+mkstub "$FW_STUBS/ufw" <<'EOF'
+echo "ufw $*" >>"$FW_LOG"
+D="$FW_STATE_DIR"
+rules=()
+[[ -f "$D/ufw.rules" ]] && mapfile -t rules <"$D/ufw.rules"
+save() { if ((${#rules[@]})); then printf '%s\n' "${rules[@]}" >"$D/ufw.rules"; else : >"$D/ufw.rules"; fi; }
+active=0
+[[ -f "$D/ufw.active" ]] && active=1
+case "$1 ${2:-}" in
+    "status verbose")
+        if ((active)); then
+            echo "Status: active"
+            echo "Logging: on (low)"
+            echo "Default: deny (incoming), allow (outgoing), disabled (routed)"
+            echo "New profiles: skip"
+        else
+            echo "Status: inactive"
+        fi
+        ;;
+    "status numbered")
+        c=0
+        [[ -f "$D/ufw.numbered" ]] && read -r c <"$D/ufw.numbered"
+        c=$((c + 1))
+        echo "$c" >"$D/ufw.numbered"
+        # a concurrent change between the listing and the removal: the first rule disappears
+        if [[ "${FAKE_UFW_SHIFT:-0}" == 1 && "$c" == 2 && ${#rules[@]} -gt 0 ]]; then
+            rules=("${rules[@]:1}")
+            save
+        fi
+        if ((active)); then
+            echo "Status: active"
+            echo
+            printf '     %-26s  %-10s  %s\n' To Action From
+            printf '     %-26s  %-10s  %s\n' -- ------ ----
+            n=0
+            for r in "${rules[@]}"; do
+                n=$((n + 1))
+                IFS='|' read -r to act from <<<"$r"
+                printf '[%2d] %-26s  %-10s  %s\n' "$n" "$to" "$act" "$from"
+            done
+        else
+            echo "Status: inactive"
+        fi
+        ;;
+    "allow "*)
+        if [[ "${FAKE_UFW_ADD_FAIL:-0}" == 1 ]]; then echo "ERROR: Could not update running firewall" >&2; exit 1; fi
+        if [[ "${FAKE_UFW_ADD_NOOP:-0}" != 1 ]]; then
+            rules+=("$2|ALLOW IN|Anywhere" "$2 (v6)|ALLOW IN|Anywhere (v6)")
+            save
+        fi
+        echo "Rule added"
+        echo "Rule added (v6)"
+        ;;
+    "--force delete")
+        n="$3"
+        if [[ "${FAKE_UFW_DEL_FAIL:-0}" == 1 ]]; then echo "ERROR: Could not delete rule" >&2; exit 1; fi
+        if ! [[ "$n" =~ ^[0-9]+$ ]] || ((n < 1 || n > ${#rules[@]})); then echo "ERROR: Could not find rule '$n'" >&2; exit 1; fi
+        unset "rules[$((n - 1))]"
+        rules=("${rules[@]}")
+        save
+        echo "Rule deleted"
+        ;;
+    "app list")
+        printf 'Available applications:\n  Nginx Full\n  OpenSSH\n'
+        ;;
+    "app info")
+        case "$3" in
+            "Nginx Full") printf 'Profile: Nginx Full\nTitle: Web Server (Nginx, HTTP + HTTPS)\nDescription: Small, but very powerful web server\n\nPorts:\n  80,443/tcp\n' ;;
+            OpenSSH) [[ "${FAKE_UFW_APPINFO_FAIL:-0}" == 1 ]] && { echo "ERROR: Could not find profile '$3'" >&2; exit 1; }
+                printf 'Profile: OpenSSH\nTitle: Secure shell server, an rshd replacement\nDescription: OpenSSH is a free implementation\n\nPort:\n  22/tcp\n' ;;
+            *) echo "ERROR: Could not find profile '$3'" >&2; exit 1 ;;
+        esac
+        ;;
+    *)
+        echo "ERROR: unexpected arguments: $*" >&2
+        exit 1
+        ;;
+esac
+exit 0
+EOF
+
+# --- fake firewall-cmd: runtime and permanent config per zone, plain files --------------------------------------------
+mkstub "$FW_STUBS/firewall-cmd" <<'EOF'
+echo "firewall-cmd $*" >>"$FW_LOG"
+D="$FW_STATE_DIR/fwd"
+perm=0 zone="" act=""
+for a in "$@"; do
+    case "$a" in
+        --permanent) perm=1 ;;
+        --zone=*) zone="${a#--zone=}" ;;
+        *) act="$a" ;;
+    esac
+done
+sfx=""
+((perm)) && sfx=".perm"
+readf() { lines=(); [[ -f "$1" ]] && mapfile -t lines <"$1"; }
+writef() { local f="$1"; shift; if (($#)); then printf '%s\n' "$@" >"$f"; else : >"$f"; fi; }
+modify() { # modify <file> <add|remove> <value>
+    local f="$D/$zone.$1$sfx" v="$3" x out=() found=0
+    if [[ "${FAKE_FWD_PERM_FAIL:-0}" == 1 && $perm == 1 ]]; then echo "Error: could not write the permanent configuration" >&2; exit 1; fi
+    readf "$f"
+    for x in "${lines[@]}"; do
+        if [[ "$x" == "$v" ]]; then found=1; [[ "$2" == remove ]] && continue; fi
+        out+=("$x")
+    done
+    if [[ "$2" == add ]]; then
+        ((found)) && { echo "Warning: ALREADY_ENABLED: $v"; exit 0; }
+        out+=("$v")
+    else
+        ((found)) || { echo "Warning: NOT_ENABLED: $v"; exit 0; }
+    fi
+    writef "$f" "${out[@]}"
+    echo success
+}
+case "$act" in
+    --state)
+        if [[ -f "$D/running" ]]; then echo running; exit 0; fi
+        echo "not running" >&2
+        exit 252
+        ;;
+    --get-default-zone) [[ -f "$D/running" ]] || exit 252; cat_zone=""; read -r cat_zone <"$D/default"; echo "$cat_zone" ;;
+    --get-active-zones)
+        readf "$D/zones"
+        for z in "${lines[@]}"; do printf '%s\n  interfaces: eth0\n' "$z"; done
+        ;;
+    --list-ports) readf "$D/$zone.ports$sfx"; echo "${lines[*]}" ;;
+    --list-services) readf "$D/$zone.services$sfx"; echo "${lines[*]}" ;;
+    --list-rich-rules) readf "$D/$zone.rich$sfx"; for l in "${lines[@]}"; do echo "$l"; done ;;
+    --list-sources) readf "$D/$zone.sources"; echo "${lines[*]}" ;;
+    --list-all) printf '%s (default, active)\n  target: default\n  icmp-block-inversion: no\n' "$zone" ;;
+    --info-service=*)
+        svc="${act#--info-service=}"
+        case "$svc" in
+            ssh) p="22/tcp" ;;
+            http) p="80/tcp" ;;
+            https) p="443/tcp" ;;
+            dhcpv6-client) p="" ;;
+            *) echo "Error: INVALID_SERVICE: $svc" >&2; exit 101 ;;
+        esac
+        printf '%s\n  ports: %s\n  protocols: \n  source-ports: \n  modules: \n  destination: \n  includes: \n  helpers: \n' "$svc" "$p"
+        ;;
+    --add-port=*) modify ports add "${act#--add-port=}" ;;
+    --remove-port=*) modify ports remove "${act#--remove-port=}" ;;
+    --remove-service=*) modify services remove "${act#--remove-service=}" ;;
+    --remove-rich-rule=*) modify rich remove "${act#--remove-rich-rule=}" ;;
+    *) echo "Error: unexpected arguments: $*" >&2; exit 2 ;;
+esac
+exit 0
+EOF
+
+# --- fake nft: chains and rules in two files; `nft -a list ruleset` renders them like the real tool ------------------
+mkstub "$FW_STUBS/nft" <<'EOF'
+echo "nft $*" >>"$FW_LOG"
+D="$FW_STATE_DIR"
+chains=() rules=()
+[[ -f "$D/nft.chains" ]] && mapfile -t chains <"$D/nft.chains"
+[[ -f "$D/nft.rules" ]] && mapfile -t rules <"$D/nft.rules"
+if [[ "${FAKE_NFT_FAIL:-0}" == 1 ]]; then echo "Error: Operation not permitted" >&2; exit 1; fi
+saver() { if ((${#rules[@]})); then printf '%s\n' "${rules[@]}" >"$D/nft.rules"; else : >"$D/nft.rules"; fi; }
+if [[ "$1 $2 $3" == "-a list ruleset" ]]; then
+    seen="" first=1
+    for c in "${chains[@]}"; do
+        IFS='|' read -r fam tbl chain spec <<<"$c"
+        [[ " $seen " == *" $fam/$tbl "* ]] && continue
+        seen+=" $fam/$tbl"
+        printf 'table %s %s { # handle 1\n' "$fam" "$tbl"
+        if ((first)); then
+            printf '\tset blocklist { # handle 2\n\t\ttype ipv4_addr\n\t\telements = { 192.0.2.66 }\n\t}\n\n'
+            first=0
+        fi
+        for c2 in "${chains[@]}"; do
+            IFS='|' read -r f2 t2 c2n spec2 <<<"$c2"
+            [[ "$f2/$t2" == "$fam/$tbl" ]] || continue
+            printf '\tchain %s { # handle 3\n' "$c2n"
+            [[ -n "$spec2" ]] && printf '\t\t%s\n' "$spec2"
+            for r in "${rules[@]}"; do
+                IFS='|' read -r rf rt rc rh rtxt <<<"$r"
+                [[ "$rf/$rt/$rc" == "$f2/$t2/$c2n" ]] && printf '\t\t%s # handle %s\n' "$rtxt" "$rh"
+            done
+            printf '\t}\n'
+        done
+        printf '}\n'
+    done
+    exit 0
+fi
+if [[ "$1 $2" == "insert rule" ]]; then
+    fam="$3" tbl="$4" chain="$5"
+    shift 5
+    next=100
+    [[ -f "$D/nft.next" ]] && read -r next <"$D/nft.next"
+    echo $((next + 1)) >"$D/nft.next"
+    [[ "${FAKE_NFT_ADD_NOOP:-0}" == 1 ]] && exit 0
+    rules=("$fam|$tbl|$chain|$next|$*" "${rules[@]}")
+    saver
+    exit 0
+fi
+if [[ "$1 $2" == "delete rule" && "$6" == handle ]]; then
+    fam="$3" tbl="$4" chain="$5" h="$7"
+    out=() found=0
+    for r in "${rules[@]}"; do
+        IFS='|' read -r rf rt rc rh rtxt <<<"$r"
+        if [[ "$rf/$rt/$rc" == "$fam/$tbl/$chain" && "$rh" == "$h" ]]; then found=1; continue; fi
+        out+=("$r")
+    done
+    ((found)) || { echo "Error: No such file or directory" >&2; exit 1; }
+    rules=("${out[@]}")
+    saver
+    exit 0
+fi
+echo "Error: unexpected arguments: $*" >&2
+exit 1
+EOF
+
+# --- fake iptables: the INPUT chain only; the real tool normalises -p tcp --dport to -p tcp -m tcp --dport -----------
+mkstub "$FW_STUBS/iptables" <<'EOF'
+echo "iptables $*" >>"$FW_LOG"
+D="$FW_STATE_DIR"
+rules=()
+[[ -f "$D/ipt.rules" ]] && mapfile -t rules <"$D/ipt.rules"
+pol=ACCEPT
+[[ -f "$D/ipt.policy" ]] && read -r pol <"$D/ipt.policy"
+if [[ "${FAKE_IPT_FAIL:-0}" == 1 ]]; then echo "iptables: Permission denied (you must be root)." >&2; exit 4; fi
+[[ "${1:-}" == -w ]] && shift
+savei() { if ((${#rules[@]})); then printf '%s\n' "${rules[@]}" >"$D/ipt.rules"; else : >"$D/ipt.rules"; fi; }
+case "$1 ${2:-}" in
+    "-S INPUT")
+        echo "-P INPUT $pol"
+        for r in "${rules[@]}"; do echo "-A INPUT $r"; done
+        ;;
+    "-I INPUT")
+        shift 3 # -I INPUT 1
+        [[ "${FAKE_IPT_ADD_NOOP:-0}" == 1 ]] && exit 0
+        spec="$*"
+        spec="${spec/-p tcp --dport/-p tcp -m tcp --dport}"
+        spec="${spec/-p udp --dport/-p udp -m udp --dport}"
+        rules=("$spec" "${rules[@]}")
+        savei
+        ;;
+    "-D INPUT")
+        n="$3"
+        if [[ "${FAKE_UFW_DEL_FAIL:-0}" == 1 ]]; then echo "ERROR: Could not delete rule" >&2; exit 1; fi
+        if ! [[ "$n" =~ ^[0-9]+$ ]] || ((n < 1 || n > ${#rules[@]})); then echo "iptables: Index of deletion too big." >&2; exit 1; fi
+        unset "rules[$((n - 1))]"
+        rules=("${rules[@]}")
+        savei
+        ;;
+    *)
+        echo "iptables: unexpected arguments: $*" >&2
+        exit 2
+        ;;
+esac
+exit 0
+EOF
+
+# --- fake ss and sshd -------------------------------------------------------------------------------------------------------
+mkstub "$FW_STUBS/ss" <<'EOF'
+echo "ss $*" >>"$FW_LOG"
+port="${!#}"
+port="${port##*:}"
+port="${port%% *}"
+port="${port%)}"
+want=tcp
+for a in "$@"; do [[ "$a" == -lunp ]] && want=udp; done
+[[ -f "$FW_LISTEN" ]] || exit 0
+while read -r proto p proc addr; do
+    [[ "$proto" == "$want" && "$p" == "$port" ]] || continue
+    if [[ "$want" == tcp ]]; then state=LISTEN; else state=UNCONN; fi
+    echo "$state 0 128 $addr:$p 0.0.0.0:* users:((\"$proc\",pid=7,fd=3))"
+done <"$FW_LISTEN"
+exit 0
+EOF
+mkstub "$FW_STUBS/sshd" <<'EOF'
+echo "sshd $*" >>"$FW_LOG"
+for p in ${FW_SSHD_PORTS:-22}; do echo "port $p"; done
+echo "permitrootlogin prohibit-password"
+echo "passwordauthentication yes"
+exit 0
+EOF
+
+# sandbox PATH: coreutils the module needs + the chosen stubs
+mk_fw_bin() { # mk_fw_bin <dir> <stub names...>
+    local dir="$1" c s
+    shift
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    for c in bash mkdir chmod date; do ln -sf "$(command -v "$c")" "$dir/$c"; done
+    for s in "$@"; do ln -sf "$FW_STUBS/$s" "$dir/$s"; done
+}
+FWBIN_ALL="$FWW/bin-all"
+FWBIN_NOUFW="$FWW/bin-noufw"
+FWBIN_FWD="$FWW/bin-fwd" # firewalld + nft + iptables
+FWBIN_NFT="$FWW/bin-nft" # nft + iptables
+FWBIN_IPT="$FWW/bin-ipt"
+FWBIN_NONE="$FWW/bin-none"
+FWBIN_UFW="$FWW/bin-ufw"
+FWBIN_NFT1="$FWW/bin-nft1"
+FWBIN_FWD1="$FWW/bin-fwd1"
+FWBIN_IPT1="$FWW/bin-ipt1"
+FWBIN_UFW_NOSS="$FWW/bin-ufw-noss"
+FWBIN_UFW_NOSSHD="$FWW/bin-ufw-nosshd"
+mk_fw_bin "$FWBIN_ALL" ufw firewall-cmd nft iptables ss sshd
+mk_fw_bin "$FWBIN_NOUFW" firewall-cmd nft iptables ss sshd
+mk_fw_bin "$FWBIN_FWD" firewall-cmd nft iptables ss sshd
+mk_fw_bin "$FWBIN_NFT" nft iptables ss sshd
+mk_fw_bin "$FWBIN_IPT" iptables ss sshd
+mk_fw_bin "$FWBIN_NONE" ss sshd
+mk_fw_bin "$FWBIN_UFW" ufw ss sshd
+mk_fw_bin "$FWBIN_NFT1" nft ss sshd
+mk_fw_bin "$FWBIN_FWD1" firewall-cmd ss sshd
+mk_fw_bin "$FWBIN_IPT1" iptables ss sshd
+mk_fw_bin "$FWBIN_UFW_NOSS" ufw sshd
+mk_fw_bin "$FWBIN_UFW_NOSSHD" ufw ss
+
+# --- fixtures ----------------------------------------------------------------------------------------------------------------------
+FW_N=0
+FW_ENV=()
+fw_new() { # a fresh fake system; exports what the stubs and the module read
+    FW_N=$((FW_N + 1))
+    FWX="$FWW/s$FW_N"
+    rm -rf "$FWX"
+    mkdir -p "$FWX/state/fwd" "$FWX/backup"
+    export FW_STATE_DIR="$FWX/state" FW_LOG="$FWX/log" FW_LISTEN="$FWX/listen" EZVPS_BACKUP_DIR="$FWX/backup"
+    export EZVPS_SSHD_CONFIG="$FWX/sshd_config" FW_SSHD_PORTS=22
+    : >"$FW_LOG"
+    : >"$FW_LISTEN"
+    : >"$EZVPS_SSHD_CONFIG"
+    FW_ENV=()
+    unset SSH_CONNECTION FAKE_UFW_SHIFT FAKE_UFW_DEL_FAIL FAKE_UFW_APPINFO_FAIL FAKE_UFW_ADD_FAIL FAKE_UFW_ADD_NOOP FAKE_FWD_PERM_FAIL FAKE_NFT_FAIL FAKE_NFT_ADD_NOOP FAKE_IPT_FAIL FAKE_IPT_ADD_NOOP
+}
+fw_ufw_fixture() {
+    printf '%s\n' '22/tcp|ALLOW IN|Anywhere' '80/tcp|ALLOW IN|Anywhere' '6000:6010/tcp|ALLOW IN|Anywhere' \
+        'Nginx Full|ALLOW IN|Anywhere' '7000/tcp|DENY IN|Anywhere' '9090/tcp|ALLOW IN|192.0.2.0/24' \
+        '22/tcp (v6)|ALLOW IN|Anywhere (v6)' '53|ALLOW IN|198.51.100.7' >"$FW_STATE_DIR/ufw.rules"
+    : >"$FW_STATE_DIR/ufw.active"
+}
+fw_fwd_fixture() {
+    local D="$FW_STATE_DIR/fwd"
+    : >"$D/running"
+    echo public >"$D/default"
+    printf '%s\n' public internal >"$D/zones"
+    printf '%s\n' 8080/tcp 5000-5010/udp >"$D/public.ports"
+    cp "$D/public.ports" "$D/public.ports.perm"
+    printf '%s\n' ssh http >"$D/public.services"
+    cp "$D/public.services" "$D/public.services.perm"
+    printf '%s\n' 'rule family="ipv4" source address="192.0.2.0/24" port port="9443" protocol="tcp" accept' >"$D/public.rich"
+    cp "$D/public.rich" "$D/public.rich.perm"
+    printf '%s\n' 3000/tcp >"$D/internal.ports"
+    cp "$D/internal.ports" "$D/internal.ports.perm"
+    printf '%s\n' 198.51.100.0/24 >"$D/internal.sources"
+}
+fw_nft_fixture() {
+    printf '%s\n' 'inet|filter|input|type filter hook input priority filter; policy drop;' \
+        'inet|filter|forward|type filter hook forward priority filter; policy drop;' >"$FW_STATE_DIR/nft.chains"
+    printf '%s\n' 'inet|filter|input|4|ct state established,related accept' \
+        'inet|filter|input|5|tcp dport 22 accept' \
+        'inet|filter|input|6|ip saddr 192.0.2.0/24 tcp dport { 80, 443 } accept' \
+        'inet|filter|input|7|udp dport 5000-5010 counter packets 3 bytes 180 accept' \
+        'inet|filter|input|8|tcp dport 7000 drop' \
+        'inet|filter|input|9|iif "lo" accept' \
+        'inet|filter|forward|20|tcp dport 22 accept' >"$FW_STATE_DIR/nft.rules"
+}
+fw_ipt_fixture() {
+    echo DROP >"$FW_STATE_DIR/ipt.policy"
+    printf '%s\n' '-i lo -j ACCEPT' \
+        '-p tcp -m tcp --dport 22 -j ACCEPT' \
+        '-p tcp -m multiport --dports 80,443 -j ACCEPT' \
+        '-s 192.0.2.0/24 -p tcp -m tcp --dport 9090 -j ACCEPT' \
+        '-p udp -m udp --dport 6000:6010 -j ACCEPT' \
+        '-p tcp -m tcp --dport 7000 -j DROP' \
+        '-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' >"$FW_STATE_DIR/ipt.rules"
+}
+run_fw() { # run_fw <path-dir> <stdin> [ezvps args]; the environment comes from the caller (FW_ENV adds variables)
+    local pathdir="$1" input="$2"
+    shift 2
+    OUT="$(printf '%b' "$input" | env "${FW_ENV[@]}" PATH="$pathdir" "$BASH_BIN" "$EZVPS" "${@:-firewall}" 2>&1)"
+    RC=$?
+}
+flog_has() { grep -qF -- "$1" "$FW_LOG"; }
+flog_lacks() { ! grep -qF -- "$1" "$FW_LOG"; }
+flog_count() { grep -cF -- "$1" "$FW_LOG"; }
+# rows of the rule table: the five parsed columns (the backend's own text follows)
+fw_rowp() { printf '%-6s %-9s %-6s %-22s %-20s ' "$@"; }
+# a appears before b in the text
+before_in() { local x="${1%%"$2"*}" y="${1%%"$3"*}"; [[ "$1" == *"$2"* && "$1" == *"$3"* ]] && ((${#x} < ${#y})); }
+backup_listings() { local f n=0; for f in "$EZVPS_BACKUP_DIR"/firewall-"$1".*; do [[ -f "$f" ]] && n=$((n + 1)); done; printf '%d' "$n"; }
+first_backup() { local f; for f in "$EZVPS_BACKUP_DIR"/firewall-"$1".*; do [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }; done; return 1; }
+file_mode() { # prints the octal mode of a file (GNU stat), empty if unknown
+    stat -c '%a' "$1" 2>/dev/null
+}
+
+flog_after() { # flog_after <first> <second>: both logged, the first before the second
+    local a b
+    a="$(grep -nF -- "$1" "$FW_LOG" | head -1 | cut -d: -f1)" b="$(grep -nF -- "$2" "$FW_LOG" | tail -1 | cut -d: -f1)"
+    [[ -n "$a" && -n "$b" ]] && ((a < b))
+}
+only_reads() { # every logged backend call is a read (status / list / app / ss / sshd)
+    local l
+    while IFS= read -r l; do
+        case "$l" in
+            "ufw status"* | "ufw app "* | "ss "* | "sshd "* | "firewall-cmd --state" | "firewall-cmd --get-"* | "firewall-cmd --zone="*" --list-"* | "firewall-cmd --info-service="* | "nft -a list ruleset" | "iptables -w -S INPUT") ;;
+            *) echo "write or unexpected call: $l" >&2; return 1 ;;
+        esac
+    done <"$FW_LOG"
+}
+
+echo "-- Firewall: backend detection (ufw, firewalld, nftables, iptables, in this order)"
+fw_new
+fw_ufw_fixture
+fw_fwd_fixture
+fw_nft_fixture
+fw_ipt_fixture
+run_fw "$FWBIN_ALL" "1\n0\n"
+check "all four present: ufw is chosen" contains "$OUT" "Firewall backend: ufw (command: ufw)"
+check "the submenu names the backend" contains "$OUT" "Backend: ufw"
+check "ufw chosen: no firewall-cmd, nft or iptables call" bash -c '! grep -qE "^(firewall-cmd|nft|iptables)" "$1"' _ "$FW_LOG"
+fw_new
+fw_fwd_fixture
+fw_nft_fixture
+fw_ipt_fixture
+run_fw "$FWBIN_NOUFW" "1\n0\n"
+check "no ufw: firewalld is chosen" contains "$OUT" "Firewall backend: firewalld (command: firewall-cmd)"
+check "firewalld chosen: no nft or iptables call" bash -c '! grep -qE "^(nft|iptables|ufw)" "$1"' _ "$FW_LOG"
+fw_new
+fw_nft_fixture
+fw_ipt_fixture
+run_fw "$FWBIN_NFT" "1\n0\n"
+check "no ufw or firewalld: nftables is chosen" contains "$OUT" "Firewall backend: nftables (command: nft)"
+check "nftables chosen: no iptables call" bash -c '! grep -qE "^iptables" "$1"' _ "$FW_LOG"
+fw_new
+fw_ipt_fixture
+run_fw "$FWBIN_IPT" "1\n0\n"
+check "only iptables: iptables is chosen" contains "$OUT" "Firewall backend: iptables (command: iptables)"
+fw_new
+run_fw "$FWBIN_NONE" "0\n" firewall
+check "no backend: says so clearly" contains "$OUT" "No firewall backend found (looked for, in this order: ufw, firewalld, nftables, iptables)."
+check "no backend: nothing was changed" contains "$OUT" "Nothing was changed."
+check "no backend: does not offer to install one" contains "$OUT" "does not install a firewall tool"
+check "no backend: returns without a submenu" not_contains "$OUT" "Show firewall status"
+check "no backend: exits 0" equals "$RC" 0
+check "no backend: no backend command ran at all" test ! -s "$FW_LOG"
+run_fw "$FWBIN_NONE" "9\n\n0\n" menu
+check "no backend via the main menu: back at the main menu" at_least_menus "$OUT" 2
+check "no backend via the main menu: message shown" contains "$OUT" "No firewall backend found"
+check "no backend via the main menu: exits 0" equals "$RC" 0
+
+echo "-- Firewall: submenu"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "0\n"
+for line in " 1) Show firewall status" " 2) List rules" " 3) Allow port" " 4) Remove rule" " 0) Back"; do
+    check "submenu line '${line}' is exact (clean label)" has_line "$OUT" "$line"
+done
+check "submenu has exactly 5 numbered entries" equals "$(printf '%s\n' "$OUT" | grep -cE '^ *[0-9]+\) ')" 5
+run_fw "$FWBIN_UFW" "9\n0\n0\n" menu
+check "main menu item 9 opens the Firewall submenu" contains "$OUT" "Allow port"
+check "Firewall is no longer 'not implemented'" not_contains "$OUT" "is not implemented yet"
+run_fw "$FWBIN_UFW" "7\nabc\n0\n"
+check "invalid submenu input is reported" contains "$OUT" "Invalid choice: 7"
+check "non-numeric submenu input is reported" contains "$OUT" "Invalid choice: abc"
+run_fw "$FWBIN_UFW" ""
+check "EOF in the submenu exits 0" equals "$RC" 0
+
+echo "-- Firewall: ufw status and list (read-only)"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "1\n0\n"
+check "ufw enabled: status line" contains "$OUT" "Status         : enabled"
+check "ufw enabled: default policy as ufw reports it" contains "$OUT" "Default policy : deny (incoming), allow (outgoing), disabled (routed)"
+check "ufw status is read-only" only_reads
+fw_new
+fw_ufw_fixture
+rm -f "$FW_STATE_DIR/ufw.active"
+run_fw "$FWBIN_UFW" "1\n0\n"
+check "ufw inactive: reported as disabled" contains "$OUT" "Status         : disabled"
+check "ufw inactive: no default policy is claimed" contains "$OUT" "not reported while ufw is inactive"
+run_fw "$FWBIN_UFW" "2\n0\n"
+check "ufw inactive: list says it reports no rules" contains "$OUT" "does not report any rules"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "2\n0\n"
+check "list: header" contains "$OUT" "ID     ACTION    PROTO  PORT/SERVICE           SOURCE               RULE (as ufw reports it)"
+check "list: rule 1 (22/tcp allow)" contains "$OUT" "$(fw_rowp 1 'allow in' tcp 22 Anywhere)22/tcp"
+check "list: rule 2 (80/tcp allow)" contains "$OUT" "$(fw_rowp 2 'allow in' tcp 80 Anywhere)80/tcp"
+check "list: rule 3 (port range)" contains "$OUT" "$(fw_rowp 3 'allow in' tcp 6000:6010 Anywhere)6000:6010/tcp"
+check "list: rule 4 (application profile with its ports)" contains "$OUT" "$(fw_rowp 4 'allow in' - 'Nginx Full (80,443/tcp)' Anywhere)Nginx Full"
+check "list: rule 5 (deny)" contains "$OUT" "$(fw_rowp 5 'deny in' tcp 7000 Anywhere)7000/tcp"
+check "list: rule 6 (source shown)" contains "$OUT" "$(fw_rowp 6 'allow in' tcp 9090 192.0.2.0/24)9090/tcp"
+check "list: rule 7 (IPv6 twin keeps its own number)" contains "$OUT" "$(fw_rowp 7 'allow in' tcp 22 'Anywhere (v6)')22/tcp (v6)"
+check "list: rule 8 (no protocol given)" contains "$OUT" "$(fw_rowp 8 'allow in' any 53 198.51.100.7)53"
+check "list: 1 before 2" before_in "$OUT" "$(fw_rowp 1 'allow in' tcp 22 Anywhere)" "$(fw_rowp 2 'allow in' tcp 80 Anywhere)"
+check "list: 6 before 8" before_in "$OUT" "$(fw_rowp 6 'allow in' tcp 9090 192.0.2.0/24)" "$(fw_rowp 8 'allow in' any 53 198.51.100.7)"
+check "list: count line" contains "$OUT" "8 rule(s), in the order ufw reports them."
+check "list is read-only (only status / app / ss / sshd calls)" only_reads
+check "list: no backup is made for a read" equals "$(backup_listings ufw)" 0
+run_fw "$FWBIN_UFW" "2\n0\n" 
+check "list twice: still no change" only_reads
+
+echo "-- Firewall: allow port, validation"
+fw_new
+fw_ufw_fixture
+for bad in 0 65536 080 8x -1 80:90 80,443 1e3 99999 "80 90" "8080/tcp" "0x50" ":80" "٨٠"; do
+    run_fw "$FWBIN_UFW" "3\n${bad}\n0\n"
+    check "port '${bad}' is refused" contains "$OUT" "Invalid port"
+    check "port '${bad}': ufw was not asked to allow anything" flog_lacks "ufw allow"
+done
+run_fw "$FWBIN_UFW" "3\n\n0\n"
+check "empty port cancels" contains "$OUT" "Cancelled. Nothing was changed."
+for badp in icmp both "tcp udp" any "" "tcp/udp" "tc"; do
+    run_fw "$FWBIN_UFW" "3\n8080\n${badp}\n0\n"
+    check "protocol '${badp}' is refused" contains "$OUT" "it must be tcp or udp"
+    check "protocol '${badp}': ufw was not asked to allow anything" flog_lacks "ufw allow"
+done
+check "nothing was written to the backup dir by refusals" equals "$(backup_listings ufw)" 0
+run_fw "$FWBIN_UFW" "3\n65535\ntcp\nn\n0\n"
+check "port 65535 is valid" contains "$OUT" "Rule to add: allow 65535/tcp (ufw)"
+run_fw "$FWBIN_UFW" "3\n1\nudp\nn\n0\n"
+check "port 1 is valid" contains "$OUT" "Rule to add: allow 1/udp (ufw)"
+run_fw "$FWBIN_UFW" "3\n  8080  \n  TCP \nn\n0\n"
+check "surrounding spaces and upper case are accepted" contains "$OUT" "Rule to add: allow 8080/tcp (ufw)"
+
+echo "-- Firewall: allow port, ufw"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+check "allow: shows the rule and the exact command first" contains "$OUT" "Rule to add: allow 8080/tcp (ufw)"
+check "allow: only ufw allow <port>/<proto> is run" flog_has "ufw allow 8080/tcp"
+check "allow: exactly one allow call" equals "$(flog_count 'ufw allow')" 1
+check "allow: the backend's own answer is shown" contains "$OUT" "Rule added"
+check "allow: rules are re-read after the change" flog_after "ufw allow 8080/tcp" "ufw status numbered"
+check "allow: the new rule is listed (v4)" contains "$OUT" "$(fw_rowp 9 'allow in' tcp 8080 Anywhere)8080/tcp"
+check "allow: the new rule is listed (v6)" contains "$OUT" "$(fw_rowp 10 'allow in' tcp 8080 'Anywhere (v6)')8080/tcp (v6)"
+check "allow: the rule is shown as ufw reports it" contains "$OUT" "The rule as ufw reports it:"
+check "allow: no enable/disable/reset" bash -c '! grep -qE "ufw (enable|disable|reset)|--force (enable|disable|reset)" "$1"' _ "$FW_LOG"
+check "allow: a text copy of the previous rules is saved" equals "$(backup_listings ufw)" 1
+bk="$(first_backup ufw)"
+check "allow: the saved copy is the listing from before the change" bash -c 'grep -q "22/tcp" "$1" && ! grep -q "8080/tcp" "$1"' _ "$bk"
+check "allow: the saved copy is private (mode 600)" equals "$(file_mode "$bk")" 600
+check "allow: the backup dir is private (mode 700)" equals "$(file_mode "$EZVPS_BACKUP_DIR")" 700
+check "allow: a ufw rule needs no persistence warning" not_contains "$OUT" "lost at the next reboot"
+check "allow: exits 0" equals "$RC" 0
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "3\n5353\nUDP\ny\n0\n"
+check "allow udp (upper case accepted): ufw allow 5353/udp" flog_has "ufw allow 5353/udp"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\nn\n0\n"
+check "declined: nothing is allowed" flog_lacks "ufw allow"
+check "declined: says so" contains "$OUT" "Cancelled. Nothing was changed."
+check "declined: no backup is made" equals "$(backup_listings ufw)" 0
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\n"
+check "EOF at the confirmation counts as no" flog_lacks "ufw allow"
+
+echo "-- Firewall: allow port, duplicates and blocking rules"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "3\n22\ntcp\ny\n0\n"
+check "duplicate 22/tcp is refused" contains "$OUT" "Port 22/tcp is already allowed by:"
+check "duplicate: names the rules" contains "$OUT" "ID 1: 22/tcp"
+check "duplicate: names the IPv6 twin too" contains "$OUT" "ID 7: 22/tcp (v6)"
+check "duplicate: nothing is added" flog_lacks "ufw allow"
+check "duplicate: nothing was changed" contains "$OUT" "Nothing was changed."
+check "duplicate: no backup is made" equals "$(backup_listings ufw)" 0
+run_fw "$FWBIN_UFW" "3\n80\ntcp\ny\n0\n"
+check "duplicate 80/tcp is refused" contains "$OUT" "Port 80/tcp is already allowed by:"
+run_fw "$FWBIN_UFW" "3\n6005\ntcp\ny\n0\n"
+check "a port inside an allowed range is refused" contains "$OUT" "Port 6005/tcp is already allowed by:"
+run_fw "$FWBIN_UFW" "3\n443\ntcp\ny\n0\n"
+check "a port covered by an application profile is refused" contains "$OUT" "ID 4: Nginx Full"
+check "none of those added anything" flog_lacks "ufw allow"
+run_fw "$FWBIN_UFW" "3\n22\nudp\nn\n0\n"
+check "same port, other protocol is not a duplicate" contains "$OUT" "Rule to add: allow 22/udp (ufw)"
+run_fw "$FWBIN_UFW" "3\n6011\ntcp\nn\n0\n"
+check "a port just outside the range is not a duplicate" contains "$OUT" "Rule to add: allow 6011/tcp (ufw)"
+run_fw "$FWBIN_UFW" "3\n9090\ntcp\nn\n0\n"
+check "an allow limited to one source does not count as allowed for everyone" contains "$OUT" "Rule to add: allow 9090/tcp (ufw)"
+run_fw "$FWBIN_UFW" "3\n53\nudp\nn\n0\n"
+check "an allow for one source address does not count either" contains "$OUT" "Rule to add: allow 53/udp (ufw)"
+run_fw "$FWBIN_UFW" "3\n7000\ntcp\ny\n0\n"
+check "an existing deny rule is warned about" contains "$OUT" "A rule that blocks 7000/tcp already exists"
+check "the deny rule is named" contains "$OUT" "ID 5: 7000/tcp"
+check "the warning does not stop the user: the rule is added after the yes" flog_has "ufw allow 7000/tcp"
+# the same second add of the same port is now a duplicate (idempotent)
+run_fw "$FWBIN_UFW" "3\n7000\ntcp\ny\n0\n"
+check "adding the same port twice: the second time it is refused" contains "$OUT" "Port 7000/tcp is already allowed by:"
+check "adding the same port twice: only one allow call in total" equals "$(flog_count 'ufw allow')" 1
+
+echo "-- Firewall: allow port, a port already in use"
+fw_new
+fw_ufw_fixture
+printf '%s\n' 'tcp 9100 nginx 0.0.0.0' 'udp 5353 avahi-daemon 0.0.0.0' >"$FW_LISTEN"
+run_fw "$FWBIN_UFW" "3\n9100\ntcp\nn\n0\n"
+check "port in use: warns and names the service and address" contains "$OUT" "9100/tcp is already in use on this server by:"
+check "port in use: process and address" contains "$OUT" "nginx on 0.0.0.0:9100"
+check "port in use: declining adds nothing" flog_lacks "ufw allow"
+run_fw "$FWBIN_UFW" "3\n9100\ntcp\ny\n0\n"
+check "port in use: one yes is enough, the rule is added (the user is not blocked)" flog_has "ufw allow 9100/tcp"
+check "port in use: the check used ss for tcp" flog_has "ss -H -ltnp"
+run_fw "$FWBIN_UFW" "3\n5353\nudp\ny\n0\n"
+check "udp in use: warns" contains "$OUT" "avahi-daemon on 0.0.0.0:5353"
+check "udp in use: the check used ss for udp" flog_has "ss -H -lunp"
+check "udp in use: the rule is added after the yes" flog_has "ufw allow 5353/udp"
+run_fw "$FWBIN_UFW" "3\n5353\ntcp\nn\n0\n"
+check "a udp listener does not warn about the same tcp port" not_contains "$OUT" "already in use"
+run_fw "$FWBIN_UFW" "3\n9200\ntcp\nn\n0\n"
+check "a free port: no in-use warning" not_contains "$OUT" "already in use"
+run_fw "$FWBIN_UFW_NOSS" "3\n5354\nudp\nn\n0\n"
+check "no ss: udp in use cannot be checked, and the user is told" contains "$OUT" "ss is not installed, so ezvps could not check whether something listens on 5354/udp."
+run_fw "$FWBIN_UFW_NOSS" "3\n9201\ntcp\nn\n0\n"
+check "no ss: tcp falls back to a connect test and still works" contains "$OUT" "Rule to add: allow 9201/tcp (ufw)"
+
+echo "-- Firewall: allow and remove need an enabled firewall, and report failures"
+fw_new
+fw_ufw_fixture
+rm -f "$FW_STATE_DIR/ufw.active"
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+check "ufw disabled: allow is refused" contains "$OUT" "ufw is disabled. ezvps does not enable or disable a firewall"
+check "ufw disabled: nothing was asked of ufw" flog_lacks "ufw allow"
+run_fw "$FWBIN_UFW" "4\n0\n"
+check "ufw disabled: remove is refused too" contains "$OUT" "ufw is disabled."
+check "ufw disabled: no delete" flog_lacks "delete"
+check "ufw is never enabled by ezvps" bash -c '! grep -qE "enable" "$1"' _ "$FW_LOG"
+fw_new
+fw_ufw_fixture
+export FAKE_UFW_ADD_FAIL=1
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+check "ufw refuses the rule: the error is shown" contains "$OUT" "ufw could not add the rule: ERROR: Could not update running firewall"
+check "ufw refuses the rule: ezvps says nothing else was changed" contains "$OUT" "Nothing else was changed."
+check "ufw refuses the rule: ezvps still exits 0 and the menu goes on" equals "$RC" 0
+unset FAKE_UFW_ADD_FAIL
+export FAKE_UFW_ADD_NOOP=1
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+check "a rule that the backend does not report afterwards is not claimed as added" contains "$OUT" "ufw does not list an allow rule for 8080/tcp after the change"
+unset FAKE_UFW_ADD_NOOP
+
+echo "-- Firewall: remove rule, ufw"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
+check "remove: the rules are listed first" before_in "$OUT" "Current rules:" "Rule to remove (only this one):"
+check "remove: the listing shows the ids" contains "$OUT" "$(fw_rowp 2 'allow in' tcp 80 Anywhere)80/tcp"
+check "remove: shows the exact command" contains "$OUT" "ufw --force delete 2"
+check "remove: only that rule is deleted (one delete call)" equals "$(flog_count 'ufw --force delete')" 1
+check "remove: ufw --force delete 2" flog_has "ufw --force delete 2"
+check "remove: no reset, disable or interactive delete" bash -c '! grep -qE "ufw (reset|disable|enable|delete)|--force (reset|disable|enable)" "$1"' _ "$FW_LOG"
+check "remove: the rules are re-read afterwards" flog_after "ufw --force delete 2" "ufw status numbered"
+check "remove: the list afterwards has one rule less" contains "$OUT" "7 rule(s), in the order ufw reports them."
+check "remove: it says what was removed" contains "$OUT" "Removed: 80/tcp"
+check "remove: it says the firewall stays enabled" contains "$OUT" "the firewall was not disabled."
+check "remove: the other rules are untouched" equals "$(<"$FW_STATE_DIR/ufw.rules")" "$(printf '%s\n' '22/tcp|ALLOW IN|Anywhere' '6000:6010/tcp|ALLOW IN|Anywhere' 'Nginx Full|ALLOW IN|Anywhere' '7000/tcp|DENY IN|Anywhere' '9090/tcp|ALLOW IN|192.0.2.0/24' '22/tcp (v6)|ALLOW IN|Anywhere (v6)' '53|ALLOW IN|198.51.100.7')"
+check "remove: a text copy of the previous rules is saved" equals "$(backup_listings ufw)" 1
+check "remove: exits 0" equals "$RC" 0
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "4\n2\nn\n0\n"
+check "remove declined: nothing is deleted" flog_lacks "delete"
+check "remove declined: says so" contains "$OUT" "Cancelled. Nothing was changed."
+run_fw "$FWBIN_UFW" "4\n2\n"
+check "remove: EOF at the confirmation counts as no" flog_lacks "delete"
+for badid in 99 abc 0 -1 "1 2" "1;2" all "*" 08x; do
+    run_fw "$FWBIN_UFW" "4\n${badid}\ny\n0\n"
+    check "remove: id '${badid}' is not in the list" contains "$OUT" "There is no rule with ID"
+    check "remove: id '${badid}' deletes nothing" flog_lacks "delete"
+done
+run_fw "$FWBIN_UFW" "4\n\n0\n"
+check "remove: an empty id cancels" contains "$OUT" "Cancelled. Nothing was changed."
+check "remove: there is no remove-all: the ids are the only way in" flog_lacks "delete"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "4\n5\ny\n0\n"
+check "removing a deny rule needs no SSH warning" not_contains "$OUT" "WARNING"
+check "removing a deny rule works" flog_has "ufw --force delete 5"
+fw_new
+export FAKE_UFW_DEL_FAIL=1
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
+check "ufw refuses the removal: the error is shown" contains "$OUT" "ufw could not remove the rule: ERROR: Could not delete rule"
+check "ufw refuses the removal: ezvps still exits 0" equals "$RC" 0
+unset FAKE_UFW_DEL_FAIL
+fw_new
+fw_ufw_fixture
+export FAKE_UFW_SHIFT=1
+run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
+check "rules that change between listing and removal: nothing is deleted" flog_lacks "delete"
+check "rules that change between listing and removal: the user is told" contains "$OUT" "The rules changed while you were choosing"
+unset FAKE_UFW_SHIFT
+
+echo "-- Firewall: removing an SSH rule needs a separate warning and confirmation"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW" "4\n1\ny\nn\n0\n"
+check "ssh rule: explicit warning naming the rule and the port" contains "$OUT" "WARNING: rule 1 allows SSH (port 22/tcp)."
+check "ssh rule: warns that it can lock the user out" contains "$OUT" "can lock you out of this server, including the session you are using now"
+check "ssh rule: declining the second question deletes nothing" flog_lacks "delete"
+check "ssh rule: the answers were consumed by the two questions (no stray menu input)" not_contains "$OUT" "Invalid choice"
+run_fw "$FWBIN_UFW" "4\n1\ny\n"
+check "ssh rule: one yes is not enough (EOF at the second question)" flog_lacks "delete"
+run_fw "$FWBIN_UFW" "4\n1\nn\n0\n"
+check "ssh rule: declining the first question stops before the warning" not_contains "$OUT" "WARNING"
+check "ssh rule: ...and deletes nothing" flog_lacks "delete"
+run_fw "$FWBIN_UFW" "4\n7\ny\nn\n0\n"
+check "ssh rule: the IPv6 twin is protected too" contains "$OUT" "WARNING: rule 7 allows SSH (port 22/tcp)."
+run_fw "$FWBIN_UFW" "4\n1\ny\ny\n0\n"
+check "ssh rule: two yes answers remove exactly that rule" flog_has "ufw --force delete 1"
+check "ssh rule: one delete call only" equals "$(flog_count 'ufw --force delete')" 1
+fw_new
+fw_ufw_fixture
+printf '%s\n' '2222/tcp|ALLOW IN|Anywhere' >>"$FW_STATE_DIR/ufw.rules"
+export FW_SSHD_PORTS=2222
+run_fw "$FWBIN_UFW" "4\n9\ny\nn\n0\n"
+check "ssh on another port: that port's rule is protected (read from sshd)" contains "$OUT" "WARNING: rule 9 allows SSH (port 2222/tcp)."
+run_fw "$FWBIN_UFW" "4\n1\ny\n0\n"
+check "ssh on another port: 22/tcp is no longer special, one yes removes it" flog_has "ufw --force delete 1"
+check "ssh on another port: ... without a warning" not_contains "$OUT" "WARNING"
+export FW_SSHD_PORTS=22
+fw_new
+fw_ufw_fixture
+printf '%s\n' '2200/tcp|ALLOW IN|Anywhere' >>"$FW_STATE_DIR/ufw.rules"
+export SSH_CONNECTION="192.0.2.50 51000 192.0.2.10 2200"
+run_fw "$FWBIN_UFW" "4\n9\ny\nn\n0\n"
+check "the port of the current SSH session is protected" contains "$OUT" "WARNING: rule 9 allows SSH (port 2200/tcp)."
+check "connected over SSH: the user is told" contains "$OUT" "You appear to be connected over SSH right now."
+check "...and nothing was deleted" flog_lacks "delete"
+unset SSH_CONNECTION
+fw_new
+fw_ufw_fixture
+export FW_SSHD_PORTS=6005
+run_fw "$FWBIN_UFW" "4\n3\ny\nn\n0\n"
+check "a range that covers the ssh port is protected" contains "$OUT" "WARNING: rule 3 allows SSH (port 6005/tcp)."
+export FW_SSHD_PORTS=22
+fw_new
+fw_ufw_fixture
+printf '%s\n' 'OpenSSH|ALLOW IN|Anywhere' >>"$FW_STATE_DIR/ufw.rules"
+run_fw "$FWBIN_UFW" "4\n9\ny\nn\n0\n"
+check "the OpenSSH application profile is protected (via its ports)" contains "$OUT" "WARNING: rule 9 allows SSH (port 22/tcp)."
+export FAKE_UFW_APPINFO_FAIL=1
+run_fw "$FWBIN_UFW" "4\n9\ny\nn\n0\n"
+check "the OpenSSH profile is protected by name when its ports are unknown" contains "$OUT" "WARNING: rule 9 is the SSH rule (SSH port 22)."
+unset FAKE_UFW_APPINFO_FAIL
+check "...and nothing was deleted" flog_lacks "delete"
+fw_new
+fw_ufw_fixture
+printf '%s\n' 'Anywhere|ALLOW IN|192.0.2.5' >>"$FW_STATE_DIR/ufw.rules"
+run_fw "$FWBIN_UFW" "4\n9\ny\nn\n0\n"
+check "an allow without a port may be what carries SSH: warned about" contains "$OUT" "has no port or protocol restriction, so it may be what keeps SSH (port 22) or your current connection working"
+run_fw "$FWBIN_UFW" "4\n3\ny\n0\n"
+check "an unrelated port range is removed with one yes" flog_has "ufw --force delete 3"
+fw_new
+fw_ufw_fixture
+run_fw "$FWBIN_UFW_NOSSHD" "4\n1\ny\nn\n0\n"
+check "no sshd command: the default port 22 is still protected" contains "$OUT" "WARNING: rule 1 allows SSH (port 22/tcp)."
+fw_new
+fw_ufw_fixture
+printf 'Include /etc/ssh/sshd_config.d/*.conf\n#Port 22\nPort 2022\n' >"$EZVPS_SSHD_CONFIG"
+printf '%s\n' '2022/tcp|ALLOW IN|Anywhere' >>"$FW_STATE_DIR/ufw.rules"
+run_fw "$FWBIN_UFW_NOSSHD" "4\n9\ny\nn\n0\n"
+check "no sshd command: the Port line of sshd_config is used" contains "$OUT" "WARNING: rule 9 allows SSH (port 2022/tcp)."
+
+echo "-- Firewall: firewalld"
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "1\n0\n"
+check "firewalld running: enabled" contains "$OUT" "Status         : enabled"
+check "firewalld: default zone and its target as reported" contains "$OUT" "Default policy : default zone public (target: default)"
+check "firewalld status is read-only" only_reads
+rm -f "$FW_STATE_DIR/fwd/running"
+run_fw "$FWBIN_FWD1" "1\n0\n"
+check "firewalld not running: disabled" contains "$OUT" "Status         : disabled"
+check "firewalld not running: no policy claimed" contains "$OUT" "not reported while firewalld is not running"
+run_fw "$FWBIN_FWD1" "2\n0\n"
+check "firewalld not running: list says it reports no rules" contains "$OUT" "does not report any rules"
+run_fw "$FWBIN_FWD1" "3\n8081\ntcp\ny\n0\n"
+check "firewalld not running: allow is refused" contains "$OUT" "firewalld is disabled."
+check "firewalld not running: nothing was added" flog_lacks "--add-port"
+run_fw "$FWBIN_FWD1" "4\n0\n"
+check "firewalld not running: remove is refused" contains "$OUT" "firewalld is disabled."
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "2\n0\n"
+check "firewalld list: header names the backend" contains "$OUT" "RULE (as firewalld reports it)"
+check "firewalld list: port 8080/tcp" contains "$OUT" "$(fw_rowp 1 allow tcp 8080 -)zone public: port 8080/tcp"
+check "firewalld list: port range with udp" contains "$OUT" "$(fw_rowp 2 allow udp 5000-5010 -)zone public: port 5000-5010/udp"
+check "firewalld list: service with the ports firewalld reports for it" contains "$OUT" "$(fw_rowp 3 allow - 'ssh (22/tcp)' -)zone public: service ssh"
+check "firewalld list: second service" contains "$OUT" "$(fw_rowp 4 allow - 'http (80/tcp)' -)zone public: service http"
+check "firewalld list: rich rule with action, protocol, port and source" contains "$OUT" "$(fw_rowp 5 accept tcp 9443 192.0.2.0/24)zone public: rich rule rule family=\"ipv4\" source address=\"192.0.2.0/24\" port port=\"9443\" protocol=\"tcp\" accept"
+check "firewalld list: other active zones are shown" contains "$OUT" "$(fw_rowp 6 allow tcp 3000 -)zone internal: port 3000/tcp"
+check "firewalld list: zone sources are reported" contains "$OUT" "Zone internal applies only to these sources: 198.51.100.0/24"
+check "firewalld list: numbering note" contains "$OUT" "firewalld has no rule numbers"
+check "firewalld list: the default zone comes first" before_in "$OUT" "zone public: port 8080/tcp" "zone internal: port 3000/tcp"
+check "firewalld list is read-only" only_reads
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "3\n8081\ntcp\ny\n0\n"
+check "firewalld allow: shows both commands first" contains "$OUT" "firewall-cmd --permanent --zone=public --add-port=8081/tcp"
+check "firewalld allow: runtime rule added in the default zone" flog_has "firewall-cmd --zone=public --add-port=8081/tcp"
+check "firewalld allow: permanent rule added too" flog_has "firewall-cmd --permanent --zone=public --add-port=8081/tcp"
+check "firewalld allow: no reload (it would drop unsaved runtime changes)" bash -c '! grep -qE "reload|panic|runtime-to-permanent" "$1"' _ "$FW_LOG"
+check "firewalld allow: re-read afterwards" flog_after "--add-port=8081/tcp" "--list-ports"
+check "firewalld allow: the new rule is listed" contains "$OUT" "zone public: port 8081/tcp"
+check "firewalld allow: a text copy of the previous rules is saved" equals "$(backup_listings firewalld)" 1
+check "firewalld allow: saved to the permanent configuration too, so no persistence warning" not_contains "$OUT" "lost at the next reboot"
+for dup in "8080 tcp" "80 tcp" "22 tcp" "443 tcp" "5003 udp"; do
+    read -r dport dproto <<<"$dup"
+    run_fw "$FWBIN_FWD1" "3\n${dport}\n${dproto}\nn\n0\n"
+    if [[ "$dup" == "443 tcp" ]]; then
+        check "firewalld: ${dup} is NOT a duplicate (no service covers it)" contains "$OUT" "Rule to add: allow 443/tcp (firewalld)"
+    else
+        check "firewalld: ${dup} is already allowed (port, service or range)" contains "$OUT" "Port ${dport}/${dproto} is already allowed by:"
+    fi
+done
+check "firewalld duplicates added nothing (only 8081 from before)" equals "$(flog_count '--add-port')" 2
+run_fw "$FWBIN_FWD1" "3\n9443\ntcp\nn\n0\n"
+check "firewalld: a source-limited rich rule does not count" contains "$OUT" "Rule to add: allow 9443/tcp (firewalld)"
+run_fw "$FWBIN_FWD1" "3\n3000\ntcp\nn\n0\n"
+check "firewalld: a port open only in another zone is not a duplicate in the default zone" contains "$OUT" "Rule to add: allow 3000/tcp (firewalld)"
+fw_new
+fw_fwd_fixture
+export FAKE_FWD_PERM_FAIL=1
+run_fw "$FWBIN_FWD1" "3\n8082\ntcp\ny\n0\n"
+check "firewalld: permanent write fails after the runtime one: said clearly" contains "$OUT" "added to the running firewall, but the permanent configuration could not be changed"
+check "firewalld: ...and the menu goes on" equals "$RC" 0
+unset FAKE_FWD_PERM_FAIL
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "4\n1\ny\n0\n"
+check "firewalld remove port: runtime" flog_has "firewall-cmd --zone=public --remove-port=8080/tcp"
+check "firewalld remove port: permanent" flog_has "firewall-cmd --permanent --zone=public --remove-port=8080/tcp"
+check "firewalld remove: no reload, no panic" bash -c '! grep -qE "reload|panic" "$1"' _ "$FW_LOG"
+check "firewalld remove: the other rules stay (5 left in the list)" contains "$OUT" "5 rule(s), in the order firewalld reports them."
+check "firewalld remove: says the firewall was not disabled" contains "$OUT" "the firewall was not disabled."
+check "firewalld remove: exactly one remove call per config" equals "$(flog_count '--remove-')" 2
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "4\n6\ny\n0\n"
+check "firewalld remove from another zone: uses that zone" flog_has "firewall-cmd --zone=internal --remove-port=3000/tcp"
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "4\n5\ny\n0\n"
+check "firewalld remove rich rule: exactly the listed rule" flog_has 'firewall-cmd --zone=public --remove-rich-rule=rule family="ipv4" source address="192.0.2.0/24" port port="9443" protocol="tcp" accept'
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "4\n4\ny\n0\n"
+check "firewalld remove service: --remove-service" flog_has "firewall-cmd --zone=public --remove-service=http"
+fw_new
+fw_fwd_fixture
+run_fw "$FWBIN_FWD1" "4\n3\ny\nn\n0\n"
+check "firewalld ssh service: warned" contains "$OUT" "WARNING: rule 3 allows SSH (port 22/tcp)."
+check "firewalld ssh service: declining the second question deletes nothing" flog_lacks "--remove-"
+run_fw "$FWBIN_FWD1" "4\n3\ny\ny\n0\n"
+check "firewalld ssh service: two yes answers remove it" flog_has "firewall-cmd --zone=public --remove-service=ssh"
+fw_new
+fw_fwd_fixture
+export FAKE_FWD_PERM_FAIL=1
+run_fw "$FWBIN_FWD1" "4\n1\ny\n0\n"
+check "firewalld remove: permanent failure after the runtime removal is said clearly" contains "$OUT" "removed from the running firewall, but the permanent configuration could not be changed"
+unset FAKE_FWD_PERM_FAIL
+
+echo "-- Firewall: nftables"
+fw_new
+fw_nft_fixture
+run_fw "$FWBIN_NFT1" "1\n0\n"
+check "nftables: enabled (the input chain has a drop policy)" contains "$OUT" "Status         : enabled"
+check "nftables: default policy of the input chain as nft reports it" contains "$OUT" "Default policy : inet filter input: policy drop"
+check "nftables: the forward chain is not the input policy" not_contains "$OUT" "forward: policy"
+check "nftables: explains the on/off meaning" contains "$OUT" "nftables has no on/off switch"
+check "nftables status is read-only" only_reads
+fw_new
+printf '%s\n' 'inet|filter|input|type filter hook input priority filter; policy accept;' >"$FW_STATE_DIR/nft.chains"
+: >"$FW_STATE_DIR/nft.rules"
+run_fw "$FWBIN_NFT1" "1\n0\n"
+check "nftables: accept policy and no rules: disabled" contains "$OUT" "Status         : disabled"
+fw_new
+: >"$FW_STATE_DIR/nft.chains"
+run_fw "$FWBIN_NFT1" "1\n0\n"
+check "nftables: nothing loaded: disabled, no policy claimed" contains "$OUT" "not reported: no input filter chain is loaded"
+run_fw "$FWBIN_NFT1" "3\n8080\ntcp\ny\n0\n"
+check "nftables: no input chain: allow is refused, no table or chain is created" contains "$OUT" "No nftables input chain (type filter, hook input) is loaded, and ezvps does not create tables or chains."
+check "nftables: ...and nothing was inserted" flog_lacks "nft insert"
+fw_new
+fw_nft_fixture
+run_fw "$FWBIN_NFT1" "2\n0\n"
+check "nft list: ct state rule (no port)" contains "$OUT" "$(fw_rowp 4 accept - - -)inet filter input: ct state established,related accept"
+check "nft list: plain port rule" contains "$OUT" "$(fw_rowp 5 accept tcp 22 -)inet filter input: tcp dport 22 accept"
+check "nft list: set of ports and a source" contains "$OUT" "$(fw_rowp 6 accept tcp 80,443 192.0.2.0/24)inet filter input: ip saddr 192.0.2.0/24 tcp dport { 80, 443 } accept"
+check "nft list: udp range with a counter" contains "$OUT" "$(fw_rowp 7 accept udp 5000-5010 -)inet filter input: udp dport 5000-5010 counter packets 3 bytes 180 accept"
+check "nft list: drop rule" contains "$OUT" "$(fw_rowp 8 drop tcp 7000 -)inet filter input: tcp dport 7000 drop"
+check "nft list: interface rule" contains "$OUT" "$(fw_rowp 9 accept - - -)inet filter input: iif \"lo\" accept"
+check "nft list: ids are the handles, in nft's own order" before_in "$OUT" "$(fw_rowp 4 accept - - -)" "$(fw_rowp 9 accept - - -)"
+check "nft list: rules of the forward chain are not shown" not_contains "$OUT" "inet filter forward:"
+check "nft list: a set definition is not mistaken for a rule" not_contains "$OUT" "192.0.2.66"
+check "nft list: count" contains "$OUT" "6 rule(s), in the order nftables reports them."
+check "nft list: scope note" contains "$OUT" "ID is the nftables rule handle"
+check "nft list is read-only" only_reads
+fw_new
+fw_nft_fixture
+run_fw "$FWBIN_NFT1" "3\n8080\ntcp\ny\n0\n"
+check "nft allow: shows the command first" contains "$OUT" "nft insert rule inet filter input tcp dport 8080 accept"
+check "nft allow: inserts into the existing input chain" flog_has "nft insert rule inet filter input tcp dport 8080 accept"
+check "nft allow: no table or chain is created, nothing is flushed" bash -c '! grep -qE "nft (add|create|flush|delete table|delete chain)" "$1"' _ "$FW_LOG"
+check "nft allow: re-read afterwards" flog_after "nft insert rule" "nft -a list ruleset"
+check "nft allow: the new rule is listed with its handle" contains "$OUT" "$(fw_rowp 100 accept tcp 8080 -)inet filter input: tcp dport 8080 accept"
+check "nft allow: warns that the change is not persistent" contains "$OUT" "nftables changes apply to the running firewall only"
+check "nft allow: a text copy of the previous ruleset is saved" equals "$(backup_listings nftables)" 1
+check "nft allow: the saved copy is the ruleset from before the change" bash -c 'grep -q "tcp dport 22 accept" "$1" && ! grep -q "dport 8080" "$1"' _ "$(first_backup nftables)"
+for dup in "22 tcp" "5003 udp"; do
+    read -r dport dproto <<<"$dup"
+    run_fw "$FWBIN_NFT1" "3\n${dport}\n${dproto}\ny\n0\n"
+    check "nft: ${dup} is already allowed" contains "$OUT" "Port ${dport}/${dproto} is already allowed by:"
+done
+run_fw "$FWBIN_NFT1" "3\n80\ntcp\nn\n0\n"
+check "nft: a port allowed only for one source is not a duplicate" contains "$OUT" "Rule to add: allow 80/tcp (nftables)"
+run_fw "$FWBIN_NFT1" "3\n7000\ntcp\nn\n0\n"
+check "nft: an existing drop rule is warned about" contains "$OUT" "A rule that blocks 7000/tcp already exists"
+fw_new
+fw_nft_fixture
+printf '%s\n' 'ip|filter|INPUT|type filter hook input priority filter; policy accept;' >>"$FW_STATE_DIR/nft.chains"
+run_fw "$FWBIN_NFT1" "3\n8080\ntcp\n2\ny\n0\n"
+check "nft: two input chains: the user is asked, never guessed" contains "$OUT" "More than one nftables input chain is loaded:"
+check "nft: the chosen chain is used" flog_has "nft insert rule ip filter INPUT tcp dport 8080 accept"
+run_fw "$FWBIN_NFT1" "3\n8081\ntcp\n9\n0\n"
+check "nft: a bad chain choice changes nothing" contains "$OUT" "No chain chosen. Nothing was changed."
+check "nft: ...no second insert" equals "$(flog_count 'nft insert')" 1
+fw_new
+fw_nft_fixture
+export FAKE_NFT_FAIL=1
+run_fw "$FWBIN_NFT1" "3\n8080\ntcp\ny\n0\n"
+check "nft failing: the error is shown, nothing is inserted" contains "$OUT" "nft list ruleset failed: Error: Operation not permitted"
+check "nft failing: the menu goes on" equals "$RC" 0
+unset FAKE_NFT_FAIL
+export FAKE_NFT_ADD_NOOP=1
+run_fw "$FWBIN_NFT1" "3\n8080\ntcp\ny\n0\n"
+check "nft: a rule that nft does not report afterwards is not claimed as added" contains "$OUT" "nftables does not list an allow rule for 8080/tcp after the change"
+unset FAKE_NFT_ADD_NOOP
+fw_new
+fw_nft_fixture
+run_fw "$FWBIN_NFT1" "4\n8\ny\n0\n"
+check "nft remove: by handle, in the rule's own chain" flog_has "nft delete rule inet filter input handle 8"
+check "nft remove: one delete call, nothing flushed" equals "$(flog_count 'nft delete')" 1
+check "nft remove: the forward chain rule is untouched" bash -c 'grep -q "^inet|filter|forward|20|" "$1"' _ "$FW_STATE_DIR/nft.rules"
+check "nft remove: the other input rules are untouched" equals "$(grep -c '|input|' "$FW_STATE_DIR/nft.rules")" 5
+check "nft remove: 5 rules listed afterwards" contains "$OUT" "5 rule(s), in the order nftables reports them."
+check "nft remove: persistence note" contains "$OUT" "lost at the next reboot or reload"
+run_fw "$FWBIN_NFT1" "4\n5\ny\nn\n0\n"
+check "nft ssh rule: warned" contains "$OUT" "WARNING: rule 5 allows SSH (port 22/tcp)."
+check "nft ssh rule: declining deletes nothing more" equals "$(flog_count 'nft delete')" 1
+for gen in 4 9; do
+    run_fw "$FWBIN_NFT1" "4\n${gen}\ny\nn\n0\n"
+    check "nft rule ${gen} has no port: warned that it may carry SSH" contains "$OUT" "WARNING: rule ${gen} has no port or protocol restriction"
+done
+check "nft: none of those deleted anything" equals "$(flog_count 'nft delete')" 1
+
+echo "-- Firewall: iptables"
+fw_new
+fw_ipt_fixture
+run_fw "$FWBIN_IPT1" "1\n0\n"
+check "iptables: enabled (INPUT policy DROP)" contains "$OUT" "Status         : enabled"
+check "iptables: default policy as iptables reports it" contains "$OUT" "Default policy : INPUT policy DROP"
+check "iptables: explains the on/off meaning" contains "$OUT" "iptables has no on/off switch"
+check "iptables status is read-only" only_reads
+fw_new
+echo ACCEPT >"$FW_STATE_DIR/ipt.policy"
+: >"$FW_STATE_DIR/ipt.rules"
+run_fw "$FWBIN_IPT1" "1\n0\n"
+check "iptables: accept policy and no rules: disabled" contains "$OUT" "Status         : disabled"
+check "iptables: ...with the policy shown" contains "$OUT" "Default policy : INPUT policy ACCEPT"
+printf '%s\n' '-p tcp -m tcp --dport 22 -j ACCEPT' >"$FW_STATE_DIR/ipt.rules"
+run_fw "$FWBIN_IPT1" "1\n0\n"
+check "iptables: accept policy but a rule: enabled" contains "$OUT" "Status         : enabled"
+fw_new
+fw_ipt_fixture
+run_fw "$FWBIN_IPT1" "2\n0\n"
+check "iptables list: interface rule" contains "$OUT" "$(fw_rowp 1 accept - - -)-A INPUT -i lo -j ACCEPT"
+check "iptables list: ssh rule" contains "$OUT" "$(fw_rowp 2 accept tcp 22 -)-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT"
+check "iptables list: multiport rule" contains "$OUT" "$(fw_rowp 3 accept tcp 80,443 -)-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT"
+check "iptables list: source shown" contains "$OUT" "$(fw_rowp 4 accept tcp 9090 192.0.2.0/24)-A INPUT -s 192.0.2.0/24"
+check "iptables list: udp range" contains "$OUT" "$(fw_rowp 5 accept udp 6000:6010 -)-A INPUT -p udp"
+check "iptables list: drop rule" contains "$OUT" "$(fw_rowp 6 drop tcp 7000 -)-A INPUT -p tcp -m tcp --dport 7000 -j DROP"
+check "iptables list: connection tracking rule" contains "$OUT" "$(fw_rowp 7 accept - - -)-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+check "iptables list: the policy line is not a rule" contains "$OUT" "7 rule(s), in the order iptables reports them."
+check "iptables list: scope note (INPUT chain, IPv4)" contains "$OUT" "INPUT chain of the iptables filter table (IPv4 only)"
+check "iptables list is read-only" only_reads
+fw_new
+fw_ipt_fixture
+run_fw "$FWBIN_IPT1" "3\n8080\ntcp\ny\n0\n"
+check "iptables allow: shows the command first" contains "$OUT" "iptables -w -I INPUT 1 -p tcp --dport 8080 -j ACCEPT"
+check "iptables allow: the documented insert is run" flog_has "iptables -w -I INPUT 1 -p tcp --dport 8080 -j ACCEPT"
+check "iptables allow: no flush, no policy change" bash -c '! grep -qE "iptables( -w)? -(F|X|Z|P)( |$)" "$1"' _ "$FW_LOG"
+check "iptables allow: re-read afterwards" flog_after "iptables -w -I INPUT" "iptables -w -S INPUT"
+check "iptables allow: the new rule is first in the list" contains "$OUT" "$(fw_rowp 1 accept tcp 8080 -)-A INPUT -p tcp -m tcp --dport 8080 -j ACCEPT"
+check "iptables allow: the old first rule moved to number 2" contains "$OUT" "$(fw_rowp 2 accept - - -)-A INPUT -i lo -j ACCEPT"
+check "iptables allow: warns that the change is not persistent" contains "$OUT" "iptables changes apply to the running firewall only"
+check "iptables allow: a text copy of the previous rules is saved" equals "$(backup_listings iptables)" 1
+for dup in "22 tcp" "443 tcp" "6005 udp"; do
+    read -r dport dproto <<<"$dup"
+    run_fw "$FWBIN_IPT1" "3\n${dport}\n${dproto}\ny\n0\n"
+    check "iptables: ${dup} is already allowed" contains "$OUT" "Port ${dport}/${dproto} is already allowed by:"
+done
+check "iptables duplicates added nothing (only 8080 from before)" equals "$(flog_count 'iptables -w -I')" 1
+run_fw "$FWBIN_IPT1" "3\n9090\ntcp\nn\n0\n"
+check "iptables: a port allowed only for one source is not a duplicate" contains "$OUT" "Rule to add: allow 9090/tcp (iptables)"
+run_fw "$FWBIN_IPT1" "3\n7000\ntcp\nn\n0\n"
+check "iptables: an existing DROP rule is warned about" contains "$OUT" "A rule that blocks 7000/tcp already exists"
+fw_new
+fw_ipt_fixture
+run_fw "$FWBIN_IPT1" "4\n3\ny\n0\n"
+check "iptables remove: by number" flog_has "iptables -w -D INPUT 3"
+check "iptables remove: one delete call, no flush" equals "$(flog_count 'iptables -w -D')" 1
+check "iptables remove: 6 rules listed afterwards" contains "$OUT" "6 rule(s), in the order iptables reports them."
+check "iptables remove: the policy is untouched" equals "$(<"$FW_STATE_DIR/ipt.policy")" DROP
+fw_new
+fw_ipt_fixture
+run_fw "$FWBIN_IPT1" "4\n2\ny\nn\n0\n"
+check "iptables ssh rule: warned" contains "$OUT" "WARNING: rule 2 allows SSH (port 22/tcp)."
+for gen in 1 7; do
+    run_fw "$FWBIN_IPT1" "4\n${gen}\ny\nn\n0\n"
+    check "iptables rule ${gen} has no port: warned that it may carry SSH" contains "$OUT" "WARNING: rule ${gen} has no port or protocol restriction"
+done
+check "iptables: none of the declined removals deleted anything" equals "$(flog_count 'iptables -w -D')" 0
+run_fw "$FWBIN_IPT1" "4\n6\ny\n0\n"
+check "iptables: a DROP rule is removed without an SSH warning" flog_has "iptables -w -D INPUT 6"
+fw_new
+fw_ipt_fixture
+export FAKE_IPT_FAIL=1
+run_fw "$FWBIN_IPT1" "2\n0\n"
+check "iptables failing: the error is shown and the menu goes on" contains "$OUT" "iptables -S INPUT failed: iptables: Permission denied"
+check "iptables failing: exits 0" equals "$RC" 0
+unset FAKE_IPT_FAIL
+
+echo "-- Firewall: supported systems and root"
+fw_new
+fw_ufw_fixture
+FW_ENV=(EZVPS_SKIP_OS_CHECK=0 "EZVPS_OS_RELEASE=$OSD/ubuntu2510")
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+check "unsupported system: allow is refused with the shared message" contains "$OUT" "Firewall needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'. Nothing was changed."
+check "unsupported system: nothing was asked of ufw" test ! -s "$FW_LOG"
+run_fw "$FWBIN_UFW" "4\n2\ny\n0\n"
+check "unsupported system: remove is refused" contains "$OUT" "Firewall needs a supported system"
+check "unsupported system: no delete" flog_lacks "delete"
+run_fw "$FWBIN_UFW" "1\n2\n0\n"
+check "unsupported system: status still works (read-only)" contains "$OUT" "Status         : enabled"
+check "unsupported system: list still works (read-only)" contains "$OUT" "8 rule(s)"
+FW_ENV=(EZVPS_SKIP_OS_CHECK=0 "EZVPS_OS_RELEASE=$OSD/ubuntu2404-jammy")
+run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+check "codename mismatch is refused too" contains "$OUT" "the codename does not match the version"
+for osf in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    fw_new
+    fw_ufw_fixture
+    FW_ENV=(EZVPS_SKIP_OS_CHECK=0 "EZVPS_OS_RELEASE=$OSD/$osf")
+    run_fw "$FWBIN_UFW" "3\n8080\ntcp\ny\n0\n"
+    check "supported system ${osf}: allow works" flog_has "ufw allow 8080/tcp"
+done
+FW_ENV=()
+if [[ "$(id -u)" != 0 ]]; then
+    fw_new
+    fw_ufw_fixture
+    FW_ENV=(-u EZVPS_ALLOW_NONROOT)
+    run_fw "$FWBIN_UFW" "" firewall
+    check "not root: the module is refused" contains "$OUT" "ezvps must be run as root."
+    check "not root: nothing was asked of ufw" test ! -s "$FW_LOG"
+    FW_ENV=()
+fi
+
+echo "-- Firewall: source rules"
+fw_body() { awk '/^(fw_[a-z_]+|module_firewall)\(\) \{/ {on=1} on {print} /^}/ {on=0}' "$EZVPS" | grep -vE '^[[:space:]]*#'; }
+fw_fn() { awk -v f="$1" '$0 ~ "^"f"\\(\\) \\{" {on=1} on {print} /^}/ {on=0}' "$EZVPS" | grep -vE '^[[:space:]]*#'; }
+FWCODE="$(fw_body)"
+check "the Firewall code exists" test -n "$FWCODE"
+check "the detection order is fixed: ufw, firewalld, nftables, iptables" equals "$(grep -c '^FW_BACKENDS=(ufw firewalld nftables iptables)' "$EZVPS")" 1
+check "no enable, disable, reset or flush of any firewall" bash -c '! grep -qE "(ufw|nft|iptables|firewall-cmd)[^\"]* (enable|disable|reset|flush)|ufw --force (enable|disable|reset)|iptables[^\"]* -[FXZP] |nft (add|create|delete) (table|chain)|--reload|--complete-reload|--panic|--runtime-to-permanent|--set-default-zone" <<<"$1"' _ "$FWCODE"
+check "no sed, awk, grep, curl or wget in the Firewall code" bash -c '! grep -qE "(^|[|;&( ])(sed|awk|grep|curl|wget)[ ]" <<<"$1"' _ "$FWCODE"
+check "every backend command goes through fw_run (no bare invocation)" bash -c '! grep -qE "^[[:space:]]*(ufw|nft|iptables|firewall-cmd)[[:space:]]+[^|)]" <<<"$1"' _ "$FWCODE"
+check "a single rule is removed per call (no loop around fw_do_remove)" equals "$(printf '%s\n' "$FWCODE" | grep -c 'fw_do_remove "\$idx"')" 1
+check "list and status code never call the changing functions" bash -c '! grep -qE "fw_do_add|fw_do_remove|fw_backup_rules" <<<"$1"' _ "$(fw_fn fw_list_rules; fw_fn fw_show_status)"
+check "the changing flows check root, system and backend first" bash -c 'grep -q "require_root" <<<"$1" && grep -q "require_supported_os \"Firewall\"" <<<"$1" && grep -q "fw_need_backend" <<<"$1"' _ "$(fw_fn fw_change_preflight)"
+check "allow and remove both start with the preflight" bash -c 'grep -q "fw_change_preflight || return 1" <<<"$1" && grep -q "fw_change_preflight || return 1" <<<"$2"' _ "$(fw_fn fw_allow_port)" "$(fw_fn fw_remove_rule)"
+check "backend output is parsed in the C locale" contains "$(fw_fn fw_run)" "LC_ALL=C"
+check "only the documented ufw commands are used" bash -c 'bad="$(grep -oE "fw_run ufw [a-z-]+( [a-z-]+)?" <<<"$1" | LC_ALL=C sort -u | tr "\n" ";")"; [[ "$bad" == "fw_run ufw --force delete;fw_run ufw allow;fw_run ufw app info;fw_run ufw app list;fw_run ufw status numbered;fw_run ufw status verbose;" ]]' _ "$FWCODE"
+
+FW_ENV=()
+export EZVPS_NO_PAUSE="${FW_SAVED_PAUSE:-0}"
+[[ -z "$FW_SAVED_PAUSE" ]] && unset EZVPS_NO_PAUSE
 
 echo "== source rules"
 # curl may appear only in the 3x-ui functions that need it; never in the L2TP

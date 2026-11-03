@@ -2,8 +2,8 @@
 # ezvps - bash TUI/CLI VPS manager for Debian 12/13 and Ubuntu 22.04/24.04/26.04 LTS (run as root).
 #
 # Implemented modules: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3), Certificates
-# (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9) and SSH
-# and Users (PR 10).
+# (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH
+# and Users (PR 10) and Firewall (PR 11).
 # Every other module prints a clean "not implemented yet" message and returns
 # without failing.
 #
@@ -16,8 +16,10 @@
 # gcc (ctunnel build), go (Lazyports) and optionally systemctl (Backpack
 # services) and apt-get. The SSH and Users module needs coreutils, useradd,
 # usermod, userdel, passwd, chown, sshd, systemctl and optionally ss and
-# apt-get (to offer the sudo package). Each is checked with `command -v` before
-# use and the module degrades with a clear message.
+# apt-get (to offer the sudo package). The Firewall module needs coreutils and
+# the one backend it finds (ufw, firewall-cmd, nft or iptables), plus ss and
+# sshd when present. Each is checked with `command -v` before use and the
+# module degrades with a clear message.
 
 set -uo pipefail
 
@@ -5140,6 +5142,1133 @@ module_ssh() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Firewall module (PR 11)
+#
+# Show status, list rules, allow a port and remove a rule through the ONE
+# firewall backend that is present on the system: ufw, then firewalld, then
+# nftables, then iptables (the first one found wins; SPEC 6.9). Only that
+# backend's documented commands are used. ezvps never installs a firewall, never
+# enables, disables, resets or flushes one, never removes more than the single
+# rule the user picked, and warns and asks separately before it removes a rule
+# that keeps SSH reachable. Backend output is parsed in pure bash (no sed, awk or
+# grep) with LC_ALL=C so translated output cannot break the parsing. Helpers are
+# prefixed fw_.
+# ---------------------------------------------------------------------------
+
+FW_BACKENDS=(ufw firewalld nftables iptables) # detection order: the first one present wins
+FW_BACKEND=""
+FW_STATE="" FW_DEFAULT=""
+FW_OUT=""
+
+# The parsed rule list: parallel arrays, one entry per rule, in the backend's own order.
+#   ID     what the user types (ufw/iptables: rule number; nftables: handle; firewalld: row number)
+#   ACTION the backend's own word (allow, deny, accept, drop, ...); PROTO/PORT/SOURCE as reported, "-" if none
+#   RAW    the rule as the backend reports it;  KEY identifies it for the backend's remove command
+#   COVER  "ports[/proto]" tokens the rule opens (used for duplicate and SSH checks)
+#   GROUP  where the rule lives (firewalld zone, nftables "family table chain", iptables chain)
+FW_ID=() FW_ACTION=() FW_PROTO=() FW_PORT=() FW_SRC=() FW_RAW=() FW_KEY=() FW_COVER=() FW_GROUP=()
+FW_NOTES=()
+FW_RULES_TEXT=""
+FW_UFW_APPS=()
+FW_ZONES=() FW_ZONE_DEFAULT=""
+FW_NFT_CHAINS=() FW_NFT_POLICIES=()
+FW_IPT_POLICY=""
+FW_P_ACTION="" FW_P_PROTO="" FW_P_PORT="" FW_P_SRC="" FW_P_COVER=""
+FW_REQ_PORT="" FW_REQ_PROTO="" FW_ADD_GROUP=""
+FW_MATCH=() FW_LISTENERS=() FW_LISTEN_NOTE=""
+FW_SSH_PORTS=() FW_SSH_WHY=""
+FW_PARTIAL=0 # 1 when a firewalld change reached the running firewall but not the permanent configuration
+
+fw_clean() { printf '%s' "${1//[^[:print:]]/?}"; } # input echoed back in a message: no control characters
+
+# Runs a backend command in the C locale; output (stdout + stderr) in FW_OUT, status returned.
+fw_run() { FW_OUT="$(LC_ALL=C "$@" 2>&1)"; }
+
+# --- detection -----------------------------------------------------------------
+
+fw_backend_cmd() { # fw_backend_cmd <backend>: the command that proves the backend is present
+    case "$1" in
+        ufw) printf 'ufw' ;;
+        firewalld) printf 'firewall-cmd' ;;
+        nftables) printf 'nft' ;;
+        iptables) printf 'iptables' ;;
+    esac
+}
+
+# Sets FW_BACKEND to the first backend, in the fixed order, whose command exists.
+fw_detect() {
+    local b
+    FW_BACKEND=""
+    for b in "${FW_BACKENDS[@]}"; do
+        if have_cmd "$(fw_backend_cmd "$b")"; then
+            FW_BACKEND="$b"
+            return 0
+        fi
+    done
+    return 1
+}
+
+fw_need_backend() {
+    if ! fw_detect; then
+        warn "No firewall backend found (looked for, in this order: ufw, firewalld, nftables, iptables)."
+        info "ezvps does not install a firewall tool. Nothing was changed."
+        return 1
+    fi
+    info "Firewall backend: ${FW_BACKEND} (command: $(fw_backend_cmd "$FW_BACKEND"))"
+    return 0
+}
+
+# --- validation ------------------------------------------------------------------
+
+fw_valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 <= 65535)); } # digits only, no leading zero, 1-65535
+fw_norm_proto() { # fw_norm_proto <text>: prints tcp or udp (any case), nothing else is accepted
+    local p="${1,,}"
+    case "$p" in
+        tcp | udp) printf '%s' "$p" ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- the parsed rule list ----------------------------------------------------------
+
+fw_rules_clear() {
+    FW_ID=() FW_ACTION=() FW_PROTO=() FW_PORT=() FW_SRC=() FW_RAW=() FW_KEY=() FW_COVER=() FW_GROUP=()
+    FW_NOTES=() FW_RULES_TEXT=""
+}
+
+fw_rule_add() { # fw_rule_add <id> <action> <proto> <port> <src> <raw> <key> <cover> <group>
+    FW_ID+=("$1") FW_ACTION+=("$2") FW_PROTO+=("$3") FW_PORT+=("$4") FW_SRC+=("$5")
+    FW_RAW+=("$6") FW_KEY+=("$7") FW_COVER+=("$8") FW_GROUP+=("$9")
+}
+
+fw_act_allows() { # an action that lets traffic in (ufw "limit" is an allow with rate limiting)
+    case "$1" in allow | "allow in" | accept | limit | "limit in") return 0 ;; esac
+    return 1
+}
+fw_act_blocks() {
+    case "$1" in deny | "deny in" | reject | "reject in" | drop) return 0 ;; esac
+    return 1
+}
+fw_src_open() { # no source restriction
+    case "$1" in "" | - | Anywhere* | anywhere* | 0.0.0.0/0 | ::/0) return 0 ;; esac
+    return 1
+}
+
+# fw_cover_has <tokens> <port> <proto>: does one of the "<ports>[/<proto>]" tokens cover port/proto?
+# <ports> is a comma list of N, A:B or A-B; a token without /proto covers both protocols.
+fw_cover_has() {
+    local toks tok items item pr
+    read -ra toks <<<"$1"
+    for tok in "${toks[@]}"; do
+        pr=""
+        [[ "$tok" == */* ]] && pr="${tok#*/}"
+        [[ -z "$pr" || "$pr" == "$3" ]] || continue
+        IFS=, read -ra items <<<"${tok%%/*}"
+        for item in "${items[@]}"; do
+            if [[ "$item" =~ ^([0-9]+)[:-]([0-9]+)$ ]]; then
+                ((10#${BASH_REMATCH[1]} <= $2 && $2 <= 10#${BASH_REMATCH[2]})) && return 0
+            elif [[ "$item" =~ ^[0-9]+$ ]]; then
+                ((10#$item == $2)) && return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# fw_find_rows <allow|block> <port> <proto> [group]: FW_MATCH gets the indexes of rules that
+# already allow (from anywhere) or block that port. Non-zero when there are none.
+fw_find_rows() {
+    local mode="$1" i
+    FW_MATCH=()
+    for i in "${!FW_ID[@]}"; do
+        [[ -z "${4:-}" || "${FW_GROUP[$i]}" == "$4" ]] || continue
+        if [[ "$mode" == allow ]]; then
+            fw_act_allows "${FW_ACTION[$i]}" || continue
+            fw_src_open "${FW_SRC[$i]}" || continue
+        else
+            fw_act_blocks "${FW_ACTION[$i]}" || continue
+        fi
+        fw_cover_has "${FW_COVER[$i]}" "$2" "$3" && FW_MATCH+=("$i")
+    done
+    ((${#FW_MATCH[@]} > 0))
+}
+
+fw_print_rules() {
+    local i n
+    n="${#FW_ID[@]}"
+    if ((n == 0)); then
+        info "No rules."
+    else
+        printf '%-6s %-9s %-6s %-22s %-20s %s\n' "ID" "ACTION" "PROTO" "PORT/SERVICE" "SOURCE" "RULE (as ${FW_BACKEND} reports it)"
+        for i in "${!FW_ID[@]}"; do
+            printf '%-6s %-9s %-6s %-22s %-20s %s\n' "${FW_ID[$i]}" "${FW_ACTION[$i]}" "${FW_PROTO[$i]}" \
+                "${FW_PORT[$i]}" "${FW_SRC[$i]}" "${FW_RAW[$i]}"
+        done
+        info "${n} rule(s), in the order ${FW_BACKEND} reports them."
+    fi
+    for i in "${!FW_NOTES[@]}"; do
+        info "${FW_NOTES[$i]}"
+    done
+}
+
+fw_count_raw() { # fw_count_raw <raw>: how many listed rules read exactly like this one
+    local i n=0
+    for i in "${!FW_RAW[@]}"; do
+        [[ "${FW_RAW[$i]}" == "$1" ]] && n=$((n + 1))
+    done
+    printf '%d' "$n"
+}
+
+fw_print_rows() { # fw_print_rows <indexes...>
+    local i
+    for i in "$@"; do
+        printf '  ID %s: %s\n' "${FW_ID[$i]}" "${FW_RAW[$i]}"
+    done
+}
+
+# --- ufw ---------------------------------------------------------------------------
+# Documented commands: ufw status verbose / status numbered / app list / app info <profile>,
+# ufw allow <port>/<proto>, ufw --force delete <number>.
+
+fw_ufw_status() {
+    local l
+    FW_STATE="" FW_DEFAULT=""
+    if ! fw_run ufw status verbose; then
+        err "ufw status failed: ${FW_OUT}"
+        return 1
+    fi
+    while IFS= read -r l; do
+        case "$l" in
+            "Status: active") FW_STATE=enabled ;;
+            "Status: inactive") FW_STATE=disabled ;;
+            "Default: "*) FW_DEFAULT="${l#Default: }" ;;
+        esac
+    done <<<"$FW_OUT"
+    if [[ -z "$FW_STATE" ]]; then
+        err "Could not read the ufw status from: ${FW_OUT}"
+        return 1
+    fi
+    if [[ -z "$FW_DEFAULT" ]]; then
+        FW_DEFAULT="not reported"
+        [[ "$FW_STATE" == disabled ]] && FW_DEFAULT="not reported while ufw is inactive"
+    fi
+    return 0
+}
+
+fw_ufw_apps() { # the application profile names, from `ufw app list`
+    local l
+    FW_UFW_APPS=()
+    fw_run ufw app list || return 0
+    while IFS= read -r l; do
+        [[ "$l" == "  "* ]] && FW_UFW_APPS+=("$(usr_trim "$l")")
+    done <<<"$FW_OUT"
+    return 0
+}
+
+fw_ufw_app_cover() { # fw_ufw_app_cover <profile>: its port tokens, from `ufw app info`
+    local l inports=0 out=""
+    fw_run ufw app info "$1" || return 0
+    while IFS= read -r l; do
+        if [[ "$l" == "Ports:" || "$l" == "Port:" ]]; then # ufw says "Port:" for a profile with one port
+            inports=1
+            continue
+        fi
+        if ((inports)); then
+            l="$(usr_trim "$l")"
+            [[ -z "$l" ]] && break
+            out+="${out:+ }${l}"
+        fi
+    done <<<"$FW_OUT"
+    printf '%s' "$out"
+}
+
+fw_in_list() { # fw_in_list <word> <list...>
+    local w="$1" x
+    shift
+    for x in "$@"; do
+        [[ "$x" == "$w" ]] && return 0
+    done
+    return 1
+}
+
+fw_ufw_load() {
+    local l text rest to body act src t port proto cover re num app_cover
+    fw_rules_clear
+    if ! fw_run ufw status numbered; then
+        err "ufw status failed: ${FW_OUT}"
+        return 1
+    fi
+    text="$FW_OUT"
+    FW_RULES_TEXT="$text"
+    fw_ufw_apps
+    re='^\[ *([0-9]+)\] (.*)$'
+    while IFS= read -r l; do
+        [[ "$l" =~ $re ]] || continue
+        num="${BASH_REMATCH[1]}"
+        rest="$(usr_trim "${BASH_REMATCH[2]}")"
+        to="${rest%%  *}"
+        body="$(usr_trim "${rest#"$to"}")"
+        act="${body%%  *}"
+        src="$(usr_trim "${body#"$act"}")"
+        t="${to% (v6)}"
+        port="-" proto="-" cover=""
+        if [[ "$t" =~ ^([0-9][0-9,:]*)(/(tcp|udp))?$ ]]; then
+            port="${BASH_REMATCH[1]}"
+            proto="${BASH_REMATCH[3]:-any}"
+            cover="${port}${BASH_REMATCH[3]:+/${BASH_REMATCH[3]}}"
+        elif [[ "$t" != Anywhere* ]]; then
+            port="$t" # an application profile (or a form ezvps does not split): shown as reported
+            if fw_in_list "$t" "${FW_UFW_APPS[@]}"; then
+                app_cover="$(fw_ufw_app_cover "$t")"
+                cover="$app_cover"
+                [[ -n "$app_cover" ]] && port="${t} (${app_cover})"
+            fi
+        fi
+        fw_rule_add "$num" "${act,,}" "$proto" "$port" "${src:--}" "$(usr_trim "$rest")" "$num" "$cover" ""
+    done <<<"$text"
+    return 0
+}
+
+fw_ufw_add() { fw_run ufw allow "${1}/${2}"; }
+fw_ufw_remove() { fw_run ufw --force delete "${FW_KEY[$1]}"; }
+
+# --- firewalld ---------------------------------------------------------------------
+# Documented commands: firewall-cmd --state, --get-default-zone, --get-active-zones,
+# --zone=<z> --list-all / --list-ports / --list-services / --list-rich-rules / --list-sources,
+# --info-service=<s>, --add-port / --remove-port / --remove-service / --remove-rich-rule
+# (each run for the runtime config and again with --permanent). No --reload: it would drop
+# unsaved runtime changes that are not ezvps's.
+
+fw_firewalld_zones() { # FW_ZONE_DEFAULT, and FW_ZONES = the default zone first, then the other active zones
+    local l z
+    FW_ZONES=() FW_ZONE_DEFAULT=""
+    if ! fw_run firewall-cmd --get-default-zone; then
+        err "firewall-cmd --get-default-zone failed: ${FW_OUT}"
+        return 1
+    fi
+    FW_ZONE_DEFAULT="$(usr_trim "$FW_OUT")"
+    FW_ZONES=("$FW_ZONE_DEFAULT")
+    if fw_run firewall-cmd --get-active-zones; then
+        while IFS= read -r l; do
+            [[ -n "$l" && "$l" != [[:space:]]* ]] || continue
+            z="${l%% *}"
+            fw_in_list "$z" "${FW_ZONES[@]}" || FW_ZONES+=("$z")
+        done <<<"$FW_OUT"
+    fi
+    return 0
+}
+
+fw_firewalld_status() {
+    local l t
+    FW_STATE="" FW_DEFAULT=""
+    if ! fw_run firewall-cmd --state; then
+        FW_STATE=disabled
+        FW_DEFAULT="not reported while firewalld is not running"
+        return 0
+    fi
+    FW_STATE=enabled
+    fw_firewalld_zones || return 1
+    FW_DEFAULT="default zone ${FW_ZONE_DEFAULT}"
+    if fw_run firewall-cmd "--zone=${FW_ZONE_DEFAULT}" --list-all; then
+        while IFS= read -r l; do
+            t="$(usr_trim "$l")"
+            [[ "$t" == "target: "* ]] && FW_DEFAULT+=" (target: ${t#target: })"
+        done <<<"$FW_OUT"
+    fi
+    return 0
+}
+
+fw_firewalld_load() {
+    local z l t p toks items n=0 text="" cover raw action proto port src svc
+    fw_rules_clear
+    fw_firewalld_zones || return 1
+    for z in "${FW_ZONES[@]}"; do
+        text+="zone ${z}"$'\n'
+        if ! fw_run firewall-cmd "--zone=${z}" --list-ports; then
+            err "firewall-cmd --list-ports failed: ${FW_OUT}"
+            return 1
+        fi
+        read -ra toks <<<"$FW_OUT"
+        for p in "${toks[@]}"; do
+            [[ "$p" =~ ^[0-9][0-9-]*/(tcp|udp|sctp|dccp)$ ]] || continue
+            n=$((n + 1))
+            text+="  port ${p}"$'\n'
+            fw_rule_add "$n" allow "${p#*/}" "${p%%/*}" - "zone ${z}: port ${p}" "port|${z}|${p}" "${p//-/:}" "$z"
+        done
+        if ! fw_run firewall-cmd "--zone=${z}" --list-services; then
+            err "firewall-cmd --list-services failed: ${FW_OUT}"
+            return 1
+        fi
+        read -ra toks <<<"$FW_OUT"
+        for svc in "${toks[@]}"; do
+            cover=""
+            if fw_run firewall-cmd "--info-service=${svc}"; then
+                while IFS= read -r l; do
+                    t="$(usr_trim "$l")"
+                    [[ "$t" == "ports: "* ]] && cover="${t#ports: }"
+                done <<<"$FW_OUT"
+            fi
+            n=$((n + 1))
+            text+="  service ${svc}"$'\n'
+            port="$svc"
+            [[ -n "$cover" ]] && port="${svc} (${cover//-/:})"
+            fw_rule_add "$n" allow - "$port" - "zone ${z}: service ${svc}" "service|${z}|${svc}" "${cover//-/:}" "$z"
+        done
+        if ! fw_run firewall-cmd "--zone=${z}" --list-rich-rules; then
+            err "firewall-cmd --list-rich-rules failed: ${FW_OUT}"
+            return 1
+        fi
+        while IFS= read -r raw; do
+            [[ -n "$raw" ]] || continue
+            raw="$(usr_trim "$raw")"
+            action="-" proto="-" port="-" src="-" cover=""
+            [[ "$raw" =~ (accept|reject|drop)$ ]] && action="${BASH_REMATCH[1]}"
+            [[ "$raw" =~ source\ address=\"([^\"]+)\" ]] && src="${BASH_REMATCH[1]}"
+            if [[ "$raw" =~ port\ port=\"([^\"]+)\"\ protocol=\"([a-z]+)\" ]]; then
+                port="${BASH_REMATCH[1]}"
+                proto="${BASH_REMATCH[2]}"
+                cover="${port//-/:}/${proto}"
+            elif [[ "$raw" =~ service\ name=\"([^\"]+)\" ]]; then
+                port="${BASH_REMATCH[1]}"
+            fi
+            n=$((n + 1))
+            text+="  rich ${raw}"$'\n'
+            fw_rule_add "$n" "$action" "$proto" "$port" "$src" "zone ${z}: rich rule ${raw}" "rich|${z}|${raw}" "$cover" "$z"
+        done <<<"$FW_OUT"
+        if fw_run firewall-cmd "--zone=${z}" --list-sources && [[ -n "$(usr_trim "$FW_OUT")" ]]; then
+            FW_NOTES+=("Zone ${z} applies only to these sources: $(usr_trim "$FW_OUT")")
+        fi
+    done
+    FW_RULES_TEXT="$text"
+    FW_NOTES+=("firewalld has no rule numbers: ID is the row number in this list. Ports, services and rich rules of the default and the active zones are shown.")
+    return 0
+}
+
+# FW_KEY of a firewalld rule is "<type>|<zone>|<value>".
+fw_firewalld_remove() {
+    local key="${FW_KEY[$1]}" type zone value opt
+    type="${key%%|*}"
+    value="${key#*|}"
+    zone="${value%%|*}"
+    value="${value#*|}"
+    case "$type" in
+        port) opt="--remove-port=${value}" ;;
+        service) opt="--remove-service=${value}" ;;
+        rich) opt="--remove-rich-rule=${value}" ;;
+        *)
+            FW_OUT="unknown rule type"
+            return 1
+            ;;
+    esac
+    fw_run firewall-cmd "--zone=${zone}" "$opt" || return 1
+    info "$FW_OUT"
+    if ! fw_run firewall-cmd --permanent "--zone=${zone}" "$opt"; then
+        FW_OUT="removed from the running firewall, but the permanent configuration could not be changed: ${FW_OUT}"
+        FW_PARTIAL=1
+    fi
+    return 0
+}
+
+fw_firewalld_add() { # fw_firewalld_add <port> <proto>  (zone: FW_ADD_GROUP)
+    fw_run firewall-cmd "--zone=${FW_ADD_GROUP}" "--add-port=${1}/${2}" || return 1
+    info "$FW_OUT"
+    if ! fw_run firewall-cmd --permanent "--zone=${FW_ADD_GROUP}" "--add-port=${1}/${2}"; then
+        FW_OUT="added to the running firewall, but the permanent configuration could not be changed: ${FW_OUT}"
+        FW_PARTIAL=1
+    fi
+    return 0
+}
+
+# --- nftables ----------------------------------------------------------------------
+# Documented commands: nft -a list ruleset, nft insert rule <family> <table> <chain> <rule>,
+# nft delete rule <family> <table> <chain> handle <handle>. Only chains of type filter hooked
+# to input are read and changed, and only when they exist: ezvps never creates a table or chain.
+
+# fw_nft_fields <rule text>: fills FW_P_*
+fw_nft_fields() {
+    local body="$1" toks tok ptxt re_port re_src re_icmp
+    FW_P_ACTION="-" FW_P_PROTO="-" FW_P_PORT="-" FW_P_SRC="-" FW_P_COVER=""
+    re_port='(tcp|udp|sctp|dccp) dport (\{[^}]*\}|[^ ]+)'
+    re_src='(ip|ip6) saddr (\{[^}]*\}|[^ ]+)'
+    re_icmp='(^| )(icmp|icmpv6) '
+    read -ra toks <<<"$body"
+    for tok in "${toks[@]}"; do
+        case "$tok" in accept | drop | reject | queue | return | continue | jump | goto) FW_P_ACTION="$tok" ;; esac
+    done
+    if [[ "$body" =~ $re_port ]]; then
+        FW_P_PROTO="${BASH_REMATCH[1]}"
+        ptxt="${BASH_REMATCH[2]}"
+        ptxt="${ptxt#\{}"
+        ptxt="${ptxt%\}}"
+        ptxt="${ptxt//[[:space:]]/}"
+        FW_P_PORT="$ptxt"
+        [[ "$ptxt" =~ ^[0-9][0-9,-]*$ ]] && FW_P_COVER="${ptxt//-/:}/${FW_P_PROTO}"
+    elif [[ "$body" =~ $re_icmp ]]; then
+        FW_P_PROTO="${BASH_REMATCH[2]}"
+    fi
+    if [[ "$body" =~ $re_src ]]; then
+        ptxt="${BASH_REMATCH[2]}"
+        ptxt="${ptxt#\{}"
+        ptxt="${ptxt%\}}"
+        FW_P_SRC="${ptxt//[[:space:]]/}"
+    fi
+    return 0
+}
+
+fw_nftables_load() {
+    local l t fam="" tbl="" chain="" in_input=0 stack=() top n re_open re_table re_chain re_type re_rule body handle pol
+    fw_rules_clear
+    FW_NFT_CHAINS=() FW_NFT_POLICIES=()
+    if ! fw_run nft -a list ruleset; then
+        err "nft list ruleset failed: ${FW_OUT}"
+        return 1
+    fi
+    FW_RULES_TEXT="$FW_OUT"
+    re_open='^(table|chain|set|map|flowtable|counter|quota|limit|synproxy|ct)[ ].*\{( # handle [0-9]+)?$'
+    re_table='^table ([a-z0-9]+) ([^ ]+) \{'
+    re_chain='^chain ([^ ]+) \{'
+    re_type='^type ([a-z]+) hook ([a-z]+) priority [^;]*;( policy ([a-z]+);)?'
+    re_rule='^(.*[^ ]) # handle ([0-9]+)$'
+    while IFS= read -r l; do
+        t="$(usr_trim "$l")"
+        [[ -n "$t" ]] || continue
+        if [[ "$t" == "}" ]]; then
+            n=${#stack[@]}
+            if ((n > 0)); then
+                [[ "${stack[$((n - 1))]}" == chain ]] && in_input=0
+                unset "stack[$((n - 1))]"
+                stack=("${stack[@]}")
+            fi
+            continue
+        fi
+        if [[ "$t" =~ $re_open ]]; then
+            if [[ "$t" =~ $re_table ]]; then
+                fam="${BASH_REMATCH[1]}"
+                tbl="${BASH_REMATCH[2]}"
+                stack+=(table)
+            elif [[ "$t" =~ $re_chain ]]; then
+                chain="${BASH_REMATCH[1]}"
+                in_input=0
+                stack+=(chain)
+            else
+                stack+=(other)
+            fi
+            continue
+        fi
+        n=${#stack[@]}
+        ((n > 0)) || continue
+        top="${stack[$((n - 1))]}"
+        [[ "$top" == chain ]] || continue
+        if [[ "$t" =~ $re_type ]]; then
+            if [[ "${BASH_REMATCH[1]}" == filter && "${BASH_REMATCH[2]}" == input ]]; then
+                in_input=1
+                pol="${BASH_REMATCH[4]:-accept}"
+                FW_NFT_CHAINS+=("${fam} ${tbl} ${chain}")
+                FW_NFT_POLICIES+=("${pol}")
+            fi
+            continue
+        fi
+        ((in_input)) || continue
+        [[ "$t" =~ $re_rule ]] || continue
+        body="${BASH_REMATCH[1]}"
+        handle="${BASH_REMATCH[2]}"
+        fw_nft_fields "$body"
+        fw_rule_add "$handle" "$FW_P_ACTION" "$FW_P_PROTO" "$FW_P_PORT" "$FW_P_SRC" "${fam} ${tbl} ${chain}: ${body}" \
+            "${fam} ${tbl} ${chain} ${handle}" "$FW_P_COVER" "${fam} ${tbl} ${chain}"
+    done <<<"$FW_RULES_TEXT"
+    FW_NOTES+=("Showing the input chains (type filter, hook input) of the loaded nftables ruleset; ID is the nftables rule handle.")
+    return 0
+}
+
+fw_nftables_status() {
+    local i filtering=0
+    FW_STATE="" FW_DEFAULT=""
+    fw_nftables_load || return 1
+    if ((${#FW_NFT_CHAINS[@]} == 0)); then
+        FW_STATE=disabled
+        FW_DEFAULT="not reported: no input filter chain is loaded"
+        return 0
+    fi
+    ((${#FW_ID[@]} > 0)) && filtering=1
+    for i in "${!FW_NFT_CHAINS[@]}"; do
+        FW_DEFAULT+="${FW_DEFAULT:+; }${FW_NFT_CHAINS[$i]}: policy ${FW_NFT_POLICIES[$i]}"
+        [[ "${FW_NFT_POLICIES[$i]}" != accept ]] && filtering=1
+    done
+    if ((filtering)); then FW_STATE=enabled; else FW_STATE=disabled; fi
+    return 0
+}
+
+fw_nftables_add() { # fw_nftables_add <port> <proto>  (chain: FW_ADD_GROUP = "family table chain")
+    local fam tbl chain
+    read -r fam tbl chain <<<"$FW_ADD_GROUP"
+    fw_run nft insert rule "$fam" "$tbl" "$chain" "$2" dport "$1" accept
+}
+
+fw_nftables_remove() { # fw_nftables_remove <index>
+    local fam tbl chain handle
+    read -r fam tbl chain handle <<<"${FW_KEY[$1]}"
+    fw_run nft delete rule "$fam" "$tbl" "$chain" handle "$handle"
+}
+
+# --- iptables ----------------------------------------------------------------------
+# Documented commands: iptables -w -S INPUT, iptables -w -I INPUT 1 -p <proto> --dport <port> -j ACCEPT,
+# iptables -w -D INPUT <number>. The INPUT chain of the filter table, IPv4 only.
+
+fw_iptables_load() {
+    local l n=0 re_p re_dport re_s re_j t
+    fw_rules_clear
+    FW_IPT_POLICY=""
+    if ! fw_run iptables -w -S INPUT; then
+        err "iptables -S INPUT failed: ${FW_OUT}"
+        return 1
+    fi
+    FW_RULES_TEXT="$FW_OUT"
+    re_p=' -p ([a-z0-9]+)'
+    re_dport=' --dports? ([0-9:,]+)'
+    re_s=' -s ([^ ]+)'
+    re_j=' -j ([^ ]+)'
+    while IFS= read -r l; do
+        case "$l" in
+            "-P INPUT "*) FW_IPT_POLICY="${l#-P INPUT }" ;;
+            "-A INPUT "*)
+                n=$((n + 1))
+                FW_P_ACTION="-" FW_P_PROTO="-" FW_P_PORT="-" FW_P_SRC="-" FW_P_COVER=""
+                [[ "$l" =~ $re_p ]] && FW_P_PROTO="${BASH_REMATCH[1]}"
+                if [[ "$l" =~ $re_dport ]]; then
+                    FW_P_PORT="${BASH_REMATCH[1]}"
+                    FW_P_COVER="${FW_P_PORT}"
+                    [[ "$FW_P_PROTO" == tcp || "$FW_P_PROTO" == udp ]] && FW_P_COVER="${FW_P_PORT}/${FW_P_PROTO}"
+                fi
+                [[ "$l" =~ $re_s ]] && FW_P_SRC="${BASH_REMATCH[1]}"
+                if [[ "$l" =~ $re_j ]]; then
+                    t="${BASH_REMATCH[1]}"
+                    case "$t" in ACCEPT | DROP | REJECT | RETURN) FW_P_ACTION="${t,,}" ;; *) FW_P_ACTION="$t" ;; esac
+                fi
+                fw_rule_add "$n" "$FW_P_ACTION" "$FW_P_PROTO" "$FW_P_PORT" "$FW_P_SRC" "$l" "$n" "$FW_P_COVER" "INPUT"
+                ;;
+        esac
+    done <<<"$FW_RULES_TEXT"
+    FW_NOTES+=("Showing the INPUT chain of the iptables filter table (IPv4 only); ID is the rule number in that chain.")
+    return 0
+}
+
+fw_iptables_status() {
+    FW_STATE="" FW_DEFAULT=""
+    fw_iptables_load || return 1
+    FW_DEFAULT="INPUT policy ${FW_IPT_POLICY:-not reported}"
+    if [[ "$FW_IPT_POLICY" != ACCEPT || ${#FW_ID[@]} -gt 0 ]]; then
+        FW_STATE=enabled
+    else
+        FW_STATE=disabled
+    fi
+    return 0
+}
+
+fw_iptables_add() { fw_run iptables -w -I INPUT 1 -p "$2" --dport "$1" -j ACCEPT; }
+fw_iptables_remove() { fw_run iptables -w -D INPUT "${FW_KEY[$1]}"; }
+
+# --- dispatch (literal names, so every function is visibly used) -------------------------
+
+fw_status_load() {
+    case "$FW_BACKEND" in
+        ufw) fw_ufw_status ;;
+        firewalld) fw_firewalld_status ;;
+        nftables) fw_nftables_status ;;
+        iptables) fw_iptables_status ;;
+        *) return 1 ;;
+    esac
+}
+
+fw_load() {
+    case "$FW_BACKEND" in
+        ufw) fw_ufw_load ;;
+        firewalld) fw_firewalld_load ;;
+        nftables) fw_nftables_load ;;
+        iptables) fw_iptables_load ;;
+        *) return 1 ;;
+    esac
+}
+
+fw_do_add() { # fw_do_add <port> <proto>: 0 or 1; the output is in FW_OUT, FW_PARTIAL=1 for a half-done firewalld change
+    FW_PARTIAL=0
+    case "$FW_BACKEND" in
+        ufw) fw_ufw_add "$1" "$2" || return 1 ;;
+        firewalld) fw_firewalld_add "$1" "$2" || return 1 ;;
+        nftables) fw_nftables_add "$1" "$2" || return 1 ;;
+        iptables) fw_iptables_add "$1" "$2" || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+fw_do_remove() { # fw_do_remove <index>: 0 or 1, like fw_do_add
+    FW_PARTIAL=0
+    case "$FW_BACKEND" in
+        ufw) fw_ufw_remove "$1" || return 1 ;;
+        firewalld) fw_firewalld_remove "$1" || return 1 ;;
+        nftables) fw_nftables_remove "$1" || return 1 ;;
+        iptables) fw_iptables_remove "$1" || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+fw_add_preview() { # fw_add_preview <port> <proto>: the exact command(s) that will run
+    case "$FW_BACKEND" in
+        ufw) info "  ufw allow ${1}/${2}" ;;
+        firewalld)
+            info "  firewall-cmd --zone=${FW_ADD_GROUP} --add-port=${1}/${2}"
+            info "  firewall-cmd --permanent --zone=${FW_ADD_GROUP} --add-port=${1}/${2}"
+            ;;
+        nftables) info "  nft insert rule ${FW_ADD_GROUP} ${2} dport ${1} accept" ;;
+        iptables) info "  iptables -w -I INPUT 1 -p ${2} --dport ${1} -j ACCEPT" ;;
+    esac
+}
+
+fw_remove_preview() { # fw_remove_preview <index>
+    local i="$1" type zone value
+    case "$FW_BACKEND" in
+        ufw) info "  ufw --force delete ${FW_KEY[$i]}" ;;
+        firewalld)
+            type="${FW_KEY[$i]%%|*}"
+            value="${FW_KEY[$i]#*|}"
+            zone="${value%%|*}"
+            value="${value#*|}"
+            info "  firewall-cmd --zone=${zone} --remove-${type//rich/rich-rule}=${value}"
+            info "  firewall-cmd --permanent --zone=${zone} --remove-${type//rich/rich-rule}=${value}"
+            ;;
+        nftables) info "  nft delete rule ${FW_KEY[$i]% *} handle ${FW_ID[$i]}" ;;
+        iptables) info "  iptables -w -D INPUT ${FW_KEY[$i]}" ;;
+    esac
+}
+
+# --- SSH protection ----------------------------------------------------------------------
+
+fw_add_ssh_port() { # fw_add_ssh_port <port>: numeric and not there yet
+    [[ "$1" =~ ^[0-9]+$ ]] || return 0
+    fw_in_list "$1" "${FW_SSH_PORTS[@]}" || FW_SSH_PORTS+=("$1")
+}
+
+# FW_SSH_PORTS: the sshd ports (sshd -T, else the Port lines of sshd_config), plus the port of the
+# SSH session this is running in (SSH_CONNECTION), else 22.
+fw_ssh_ports() {
+    local p l re
+    FW_SSH_PORTS=()
+    if have_cmd sshd && ssh_eff_load; then
+        while IFS= read -r p; do
+            fw_add_ssh_port "$p"
+        done < <(ssh_eff_get port)
+    fi
+    if ((${#FW_SSH_PORTS[@]} == 0)) && [[ -r "$SSH_CONFIG_FILE" ]]; then
+        re='^[[:space:]]*[Pp]ort[[:space:]]+([0-9]+)[[:space:]]*$'
+        while IFS= read -r l; do
+            [[ "$l" =~ $re ]] && fw_add_ssh_port "${BASH_REMATCH[1]}"
+        done <"$SSH_CONFIG_FILE"
+    fi
+    re='^[^ ]+ [0-9]+ [^ ]+ ([0-9]+)$'
+    [[ "${SSH_CONNECTION:-}" =~ $re ]] && fw_add_ssh_port "${BASH_REMATCH[1]}"
+    ((${#FW_SSH_PORTS[@]} > 0)) || FW_SSH_PORTS=(22)
+    return 0
+}
+
+# fw_rule_affects_ssh <index>: true (and FW_SSH_WHY says why) when removing this allow rule could
+# cut SSH: it covers an SSH port, it is a service/profile named for SSH, or it has no port and no
+# protocol restriction at all (so it may be what lets SSH or the current session through).
+fw_rule_affects_ssh() {
+    local i="$1" p name
+    FW_SSH_WHY=""
+    fw_act_allows "${FW_ACTION[$i]}" || return 1
+    fw_ssh_ports
+    if [[ -n "${FW_COVER[$i]}" ]]; then
+        for p in "${FW_SSH_PORTS[@]}"; do
+            if fw_cover_has "${FW_COVER[$i]}" "$p" tcp; then
+                FW_SSH_WHY="allows SSH (port ${p}/tcp)"
+                return 0
+            fi
+        done
+        return 1
+    fi
+    name="${FW_PORT[$i]%% (*}"
+    name="${name,,}"
+    case "$name" in
+        ssh | openssh | ssh-server)
+            FW_SSH_WHY="is the SSH rule (SSH port ${FW_SSH_PORTS[*]})"
+            return 0
+            ;;
+    esac
+    if [[ "${FW_PORT[$i]}" == - && "${FW_PROTO[$i]}" == - ]]; then
+        FW_SSH_WHY="has no port or protocol restriction, so it may be what keeps SSH (port ${FW_SSH_PORTS[*]}) or your current connection working"
+        return 0
+    fi
+    return 1
+}
+
+# --- port in use ---------------------------------------------------------------------------
+
+# fw_listeners <port> <proto>: FW_LISTENERS gets "<process> on <address>" per listener; when the
+# check is not possible FW_LISTEN_NOTE says so.
+fw_listeners() {
+    local flag f l proc addr re
+    FW_LISTENERS=() FW_LISTEN_NOTE=""
+    if have_cmd ss; then
+        if [[ "$2" == tcp ]]; then flag=-ltnp; else flag=-lunp; fi
+        if ! fw_run ss -H "$flag" "( sport = :$1 )"; then
+            FW_LISTEN_NOTE="ss failed, so ezvps could not check whether something listens on ${1}/${2}."
+            return 0
+        fi
+        re='users:\(\("([^"]+)"'
+        while IFS= read -r l; do
+            [[ -n "$l" ]] || continue
+            read -ra f <<<"$l"
+            addr="${f[3]:-?}"
+            proc="a process ezvps could not name"
+            [[ "$l" =~ $re ]] && proc="${BASH_REMATCH[1]}"
+            FW_LISTENERS+=("${proc} on ${addr}")
+        done <<<"$FW_OUT"
+        return 0
+    fi
+    if [[ "$2" == tcp ]]; then
+        port_in_use "$1" && FW_LISTENERS+=("a process on port ${1} (the ss command is needed to name it)")
+    else
+        FW_LISTEN_NOTE="ss is not installed, so ezvps could not check whether something listens on ${1}/${2}."
+    fi
+    return 0
+}
+
+# --- common checks and records -------------------------------------------------------------
+
+# Everything that must hold before ANY change: root, a supported system, a detected backend, and
+# (ufw, firewalld) a firewall that is actually running, because a disabled one cannot report the
+# rules back and ezvps never enables or disables a firewall.
+fw_change_preflight() {
+    require_root || return 1
+    require_supported_os "Firewall" || return 1
+    fw_need_backend || return 1
+    fw_status_load || return 1
+    if [[ "$FW_STATE" == disabled && ( "$FW_BACKEND" == ufw || "$FW_BACKEND" == firewalld ) ]]; then
+        warn "${FW_BACKEND} is disabled. ezvps does not enable or disable a firewall, and a disabled ${FW_BACKEND} cannot report its rules back, so it will not change anything."
+        info "Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
+# A text copy of the rule listing the backend reported, for reference before a change.
+fw_backup_rules() {
+    local dest
+    dest="${NGX_BACKUP_BASE}/firewall-${FW_BACKEND}.$(date +%Y%m%d-%H%M%S).$$"
+    if ! { mkdir -p "$NGX_BACKUP_BASE" && chmod 700 "$NGX_BACKUP_BASE" && printf '%s\n' "$FW_RULES_TEXT" >"$dest" && chmod 600 "$dest"; }; then
+        err "Could not save the current rules to ${dest}; stopping before any change."
+        return 1
+    fi
+    info "Saved a text copy of the current rules to ${dest}"
+    return 0
+}
+
+fw_persistence_note() {
+    case "$FW_BACKEND" in
+        nftables | iptables)
+            info "Note: ${FW_BACKEND} changes apply to the running firewall only. ezvps does not rewrite your saved ${FW_BACKEND} configuration, so this change is lost at the next reboot or reload unless you save it with your usual method."
+            ;;
+    esac
+}
+
+# --- 1) Show firewall status -----------------------------------------------------------------
+
+fw_show_status() {
+    fw_need_backend || return 0
+    fw_status_load || return 1
+    info ""
+    info "Status         : ${FW_STATE}"
+    info "Default policy : ${FW_DEFAULT}"
+    case "$FW_BACKEND" in
+        nftables | iptables)
+            info ""
+            info "${FW_BACKEND} has no on/off switch: 'enabled' means a filtering chain with rules or a restrictive default policy is loaded."
+            ;;
+    esac
+    return 0
+}
+
+# --- 2) List rules (read-only) ----------------------------------------------------------------
+
+fw_list_rules() {
+    fw_need_backend || return 0
+    case "$FW_BACKEND" in
+        ufw | firewalld)
+            fw_status_load || return 1
+            if [[ "$FW_STATE" == disabled ]]; then
+                info "${FW_BACKEND} is disabled, and a disabled ${FW_BACKEND} does not report any rules."
+                return 0
+            fi
+            ;;
+    esac
+    fw_load || return 1
+    info ""
+    fw_print_rules
+    return 0
+}
+
+# --- 3) Allow port ------------------------------------------------------------------------------
+
+# fw_ask_port_proto: sets FW_REQ_PORT and FW_REQ_PROTO; non-zero = cancelled or invalid (said so).
+fw_ask_port_proto() {
+    local p pr
+    FW_REQ_PORT="" FW_REQ_PROTO=""
+    if ! read -r -p "Port number to allow (1-65535, empty to cancel): " p; then
+        info ""
+        return 1
+    fi
+    p="$(usr_trim "$p")"
+    if [[ -z "$p" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 1
+    fi
+    if ! fw_valid_port "$p"; then
+        err "Invalid port '$(fw_clean "$p")': use a single number from 1 to 65535 (digits only, no leading zero, no range or list). Nothing was changed."
+        return 1
+    fi
+    if ! read -r -p "Protocol (tcp or udp): " pr; then
+        info ""
+        return 1
+    fi
+    if ! FW_REQ_PROTO="$(fw_norm_proto "$(usr_trim "$pr")")"; then
+        err "Invalid protocol '$(fw_clean "$pr")': it must be tcp or udp. Nothing was changed."
+        return 1
+    fi
+    FW_REQ_PORT="$p"
+    return 0
+}
+
+# nftables only: choose the input chain to add to (never guessed when there is more than one).
+fw_pick_nft_chain() {
+    local i n="${#FW_NFT_CHAINS[@]}" ans
+    if ((n == 0)); then
+        err "No nftables input chain (type filter, hook input) is loaded, and ezvps does not create tables or chains. Nothing was changed."
+        return 1
+    fi
+    if ((n == 1)); then
+        FW_ADD_GROUP="${FW_NFT_CHAINS[0]}"
+        return 0
+    fi
+    info "More than one nftables input chain is loaded:"
+    for i in "${!FW_NFT_CHAINS[@]}"; do
+        printf '%2d) %s (policy %s)\n' "$((i + 1))" "${FW_NFT_CHAINS[$i]}" "${FW_NFT_POLICIES[$i]}"
+    done
+    if ! read -r -p "Add the rule to which chain? (number, empty to cancel): " ans; then
+        info ""
+        return 1
+    fi
+    ans="$(usr_trim "$ans")"
+    if [[ ! "$ans" =~ ^[0-9]+$ ]] || ((10#$ans < 1 || 10#$ans > n)); then
+        info "No chain chosen. Nothing was changed."
+        return 1
+    fi
+    FW_ADD_GROUP="${FW_NFT_CHAINS[$((10#$ans - 1))]}"
+    return 0
+}
+
+fw_allow_port() {
+    local port proto i question
+    fw_change_preflight || return 1
+    fw_ask_port_proto || return 0
+    port="$FW_REQ_PORT"
+    proto="$FW_REQ_PROTO"
+    fw_load || return 1
+    case "$FW_BACKEND" in
+        nftables) fw_pick_nft_chain || return 0 ;;
+        firewalld) FW_ADD_GROUP="$FW_ZONE_DEFAULT" ;;
+        iptables) FW_ADD_GROUP="INPUT" ;;
+        *) FW_ADD_GROUP="" ;;
+    esac
+    if fw_find_rows allow "$port" "$proto" "$FW_ADD_GROUP"; then
+        warn "Port ${port}/${proto} is already allowed by:"
+        fw_print_rows "${FW_MATCH[@]}"
+        info "Nothing was changed."
+        return 0
+    fi
+    if fw_find_rows block "$port" "$proto" "$FW_ADD_GROUP"; then
+        warn "A rule that blocks ${port}/${proto} already exists. Rules are evaluated in the order ${FW_BACKEND} keeps them, so the new rule may not take effect:"
+        fw_print_rows "${FW_MATCH[@]}"
+    fi
+    fw_listeners "$port" "$proto"
+    question="Add this rule?"
+    if ((${#FW_LISTENERS[@]} > 0)); then
+        warn "${port}/${proto} is already in use on this server by:"
+        for i in "${!FW_LISTENERS[@]}"; do
+            info "  ${FW_LISTENERS[$i]}"
+        done
+        warn "Allowing it makes that service reachable according to its own listening address. Only continue if it is the service you mean to expose."
+        question="Port ${port}/${proto} is already in use. Allow it anyway?"
+    elif [[ -n "$FW_LISTEN_NOTE" ]]; then
+        warn "$FW_LISTEN_NOTE"
+    fi
+    info ""
+    info "Rule to add: allow ${port}/${proto} (${FW_BACKEND})"
+    info "Command(s):"
+    fw_add_preview "$port" "$proto"
+    if ! ask_yes_no "$question"; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    fw_backup_rules || return 1
+    if ! fw_do_add "$port" "$proto"; then
+        err "${FW_BACKEND} could not add the rule: ${FW_OUT}"
+        info "Nothing else was changed."
+        return 1
+    fi
+    if ((FW_PARTIAL)); then
+        warn "$FW_OUT"
+    elif [[ -n "$FW_OUT" ]]; then
+        info "$FW_OUT"
+    fi
+    info ""
+    info "Rules now (re-read from ${FW_BACKEND}):"
+    fw_load || return 1
+    fw_print_rules
+    if fw_find_rows allow "$port" "$proto" "$FW_ADD_GROUP"; then
+        info ""
+        info "The rule as ${FW_BACKEND} reports it:"
+        fw_print_rows "${FW_MATCH[@]}"
+    else
+        warn "${FW_BACKEND} does not list an allow rule for ${port}/${proto} after the change. Check the list above."
+        return 1
+    fi
+    fw_persistence_note
+    return 0
+}
+
+# --- 4) Remove rule -------------------------------------------------------------------------------
+
+fw_remove_rule() {
+    local id i idx="" want_raw want_key before after
+    fw_change_preflight || return 1
+    fw_load || return 1
+    info ""
+    info "Current rules:"
+    fw_print_rules
+    if ((${#FW_ID[@]} == 0)); then
+        info "There are no rules to remove."
+        return 0
+    fi
+    info ""
+    if ! read -r -p "ID of the rule to remove (empty to cancel): " id; then
+        info ""
+        return 0
+    fi
+    id="$(usr_trim "$id")"
+    if [[ -z "$id" ]]; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    for i in "${!FW_ID[@]}"; do
+        [[ "${FW_ID[$i]}" == "$id" ]] && idx="$i"
+    done
+    if [[ ! "$id" =~ ^[0-9]+$ || -z "$idx" ]]; then
+        err "There is no rule with ID '$(fw_clean "$id")' in the list. Nothing was changed."
+        return 0
+    fi
+    want_raw="${FW_RAW[$idx]}"
+    want_key="${FW_KEY[$idx]}"
+    before="$(fw_count_raw "$want_raw")"
+    info ""
+    info "Rule to remove (only this one):"
+    fw_print_rows "$idx"
+    info "Command(s):"
+    fw_remove_preview "$idx"
+    if ! ask_yes_no "Remove rule ${id}? The firewall stays enabled and every other rule stays as it is."; then
+        info "Cancelled. Nothing was changed."
+        return 0
+    fi
+    if fw_rule_affects_ssh "$idx"; then
+        warn "WARNING: rule ${id} ${FW_SSH_WHY}."
+        warn "Removing it can lock you out of this server, including the session you are using now, and ezvps cannot undo that remotely."
+        [[ -n "${SSH_CONNECTION:-}" ]] && warn "You appear to be connected over SSH right now."
+        if ! ask_yes_no "Remove this SSH-related rule anyway?"; then
+            info "Cancelled. Nothing was changed."
+            return 0
+        fi
+    fi
+    # The numbers can shift between listing and removing (ufw, iptables, firewalld): re-read first.
+    fw_load || return 1
+    idx=""
+    for i in "${!FW_ID[@]}"; do
+        [[ "${FW_ID[$i]}" == "$id" && "${FW_KEY[$i]}" == "$want_key" && "${FW_RAW[$i]}" == "$want_raw" ]] && idx="$i"
+    done
+    if [[ -z "$idx" ]]; then
+        err "The rules changed while you were choosing (rule ${id} is no longer the same). Nothing was changed; list the rules again."
+        return 1
+    fi
+    fw_backup_rules || return 1
+    if ! fw_do_remove "$idx"; then
+        err "${FW_BACKEND} could not remove the rule: ${FW_OUT}"
+        info "Nothing else was changed."
+        return 1
+    fi
+    if ((FW_PARTIAL)); then
+        warn "$FW_OUT"
+    elif [[ -n "$FW_OUT" ]]; then
+        info "$FW_OUT"
+    fi
+    info ""
+    info "Rules now (re-read from ${FW_BACKEND}):"
+    fw_load || return 1
+    fw_print_rules
+    after="$(fw_count_raw "$want_raw")"
+    if ((after >= before)); then
+        warn "${FW_BACKEND} still lists the rule you removed. Check the list above."
+        return 1
+    fi
+    info ""
+    info "Removed: ${want_raw}"
+    info "Only that rule was removed; the firewall was not disabled."
+    fw_persistence_note
+    return 0
+}
+
+# --- submenu ------------------------------------------------------------------------------------------
+
+FW_MENU_LABELS=("Show firewall status" "List rules" "Allow port" "Remove rule")
+
+module_firewall() {
+    local choice i
+    # Detect first: with no backend there is nothing to show or change, so say so and go back.
+    if ! fw_detect; then
+        info ""
+        warn "No firewall backend found (looked for, in this order: ufw, firewalld, nftables, iptables)."
+        info "ezvps does not install a firewall tool. Nothing was changed."
+        return 0
+    fi
+    while true; do
+        info ""
+        info "${C_BOLD}Firewall${C_RESET}"
+        info "Backend: ${FW_BACKEND}"
+        info ""
+        for i in "${!FW_MENU_LABELS[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${FW_MENU_LABELS[$i]}"
+        done
+        printf '%2d) %s\n' 0 "Back"
+        info ""
+        if ! read -r -p "Select: " choice; then
+            info ""
+            return 0
+        fi
+        choice="${choice//[[:space:]]/}"
+        case "$choice" in
+            0) return 0 ;;
+            1) fw_show_status || true ;;
+            2) fw_list_rules || true ;;
+            3) fw_allow_port || true ;;
+            4) fw_remove_rule || true ;;
+            *)
+                warn "Invalid choice: $(fw_clean "${choice:-<empty>}")"
+                ;;
+        esac
+        pause "Press Enter to continue... " || true
+    done
+}
+
 # Dispatch a module by key. Always returns 0 so a module can never take the
 # menu down; real failures are reported by the module itself.
 run_module() {
@@ -5152,7 +6281,8 @@ run_module() {
         ctunnel) module_ctunnel ;;
         lazyports) module_lazyports ;;
         ssh) module_ssh ;;
-        firewall | backup | update | uninstall)
+        firewall) module_firewall ;;
+        backup | update | uninstall)
             module_not_implemented "$1"
             ;;
         *)
@@ -5216,7 +6346,7 @@ Modules:
   l2tp 3x-ui backpack ctunnel nginx certs lazyports ssh firewall
   backup update uninstall
 
-Only l2tp, 3x-ui, backpack, ctunnel, nginx, certs, lazyports and ssh are implemented
+Only l2tp, 3x-ui, backpack, ctunnel, nginx, certs, lazyports, ssh and firewall are implemented
 in this release; the others report that they are not implemented yet."
 }
 

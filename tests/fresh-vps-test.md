@@ -83,13 +83,13 @@ script it from ezvps)
 - [ ] menu lines match exactly (no description text):
       `L2TP, 3x-ui, Backpack, ctunnel, Nginx, Certificates, Lazyports,
       SSH and Users, Firewall, Backup, Check For Updates, Uninstall`, then `0) Exit`
-- [ ] each of `9` to `12` prints `<Label> is not implemented yet.` and returns to
+- [ ] each of `10` to `12` prints `<Label> is not implemented yet.` and returns to
       the menu after Enter (`2` opens the 3x-ui submenu, section 5; `3`, `4` and `7`
       open the Backpack, ctunnel and Lazyports submenus, section 8; `5` opens the
       Nginx submenu, section 6; `6` opens the Certificates submenu, section 7; `8`
-      opens the SSH and Users submenu, section 9)
+      opens the SSH and Users submenu, section 9; `9` opens the Firewall submenu, section 10)
 - [ ] `abc`, `13`, empty input -> `Invalid choice`, menu continues
-- [ ] `ezvps firewall` (and the other pending keys) print the same message, exit 0
+- [ ] `ezvps backup` (and `update`, `uninstall`) print the same message, exit 0
 - [ ] `ezvps bogus` prints usage, exit 2
 - [ ] Ctrl-D at the prompt exits cleanly
 
@@ -625,12 +625,74 @@ never paste a real private key anywhere. Run it **once per supported release**.
 - [ ] an account whose home is outside `/home` (for example `useradd -d /srv/x -m shared1`): the home
       question is not asked and the directory is kept
 
-## 10. Non-root
+## 10. Firewall
+
+Do this on a throwaway VPS **with console access** (the provider's web console), because a wrong firewall
+change can lock you out of SSH. Keep a second SSH session open throughout. Which backend runs depends on
+what is installed; repeat the checklist for each backend you can set up (ufw, firewalld, nftables, iptables),
+and never install one just to test unless you mean to.
+
+**10a. Detection and the menu**
+- [ ] `ezvps` -> `9` shows exactly `1) Show firewall status`, `2) List rules`, `3) Allow port`,
+      `4) Remove rule`, `0) Back`, and the line `Backend: <name>`
+- [ ] the backend named is the first present of `ufw`, `firewalld`, `nftables`, `iptables`
+      (`command -v ufw firewall-cmd nft iptables`); e.g. with ufw installed it is ufw even if `nft` exists
+- [ ] on an image with none of the four commands: `No firewall backend found (looked for, in this order: ...)`
+      and `Nothing was changed.`, back at the main menu, no submenu; `ezvps firewall` does the same, exit 0
+- [ ] an unsupported system file (`EZVPS_OS_RELEASE` is test-only; on a real server just confirm Allow port /
+      Remove rule print the supported-systems message on an unlisted release) changes nothing, while
+      Show firewall status and List rules still work
+
+**10b. Show firewall status and List rules (read-only)**
+- [ ] status matches the backend: `ufw status verbose` (Status line and `Default:` line), `firewall-cmd
+      --state` and the default zone, `nft list ruleset` (input chain `policy`), `iptables -S INPUT` (`-P INPUT`)
+- [ ] a disabled ufw (`ufw disable`, then re-enable it afterwards with your own command) is reported as
+      `disabled`; a stopped firewalld is `disabled` with `not running`
+- [ ] List rules shows the same rules, in the same order, as the backend's own listing
+      (`ufw status numbered`, `firewall-cmd --list-all`, `nft -a list ruleset`, `iptables -S INPUT`), with the
+      right ID (ufw/iptables number, nftables handle), action, protocol, port or service and source
+- [ ] running List rules several times changes nothing (`ufw status numbered` / `nft list ruleset` /
+      `iptables-save` before and after are identical)
+
+**10c. Allow port**
+- [ ] invalid ports `0`, `65536`, `080`, `8x`, `-1`, `80:90`, `80,443`, empty; invalid protocols `icmp`,
+      `both`, empty: each refused, nothing changes
+- [ ] `8080` / `tcp` on a free port: the exact command is shown, one confirmation, the rule appears in the
+      backend's own listing (and the re-read list shown by ezvps), a copy of the previous listing exists in
+      `/var/backups/ezvps/firewall-<backend>.*` (mode 600); `n` at the confirmation changes nothing
+- [ ] from a second machine, the port is reachable once a service listens on it (`nc -l 8080` on the server,
+      `nc -vz <server> 8080` from outside)
+- [ ] the same port again: refused as already allowed, no second rule
+- [ ] a port already allowed through a range or a service/profile (for example `443` when `Nginx Full` or the
+      firewalld `https` service is on) is refused
+- [ ] a port something already listens on (for example `ss -ltn` shows 80 with nginx running): the warning names
+      the process and address, and one yes still adds the rule
+- [ ] ufw: both the IPv4 and IPv6 rows appear; firewalld: the rule is in the default zone, both in
+      `firewall-cmd --list-ports` and `firewall-cmd --permanent --list-ports`
+- [ ] nftables / iptables: the rule is first in the input chain, and the note says it is lost at reboot
+      unless you save the ruleset yourself
+
+**10d. Remove rule**
+- [ ] the list is shown first; an unknown ID, `abc`, `all`, empty: nothing is removed
+- [ ] removing the `8080/tcp` rule from 10c: asked once, only that rule disappears (compare the listing before
+      and after), the firewall stays enabled, the other rules are untouched, the re-read list is shown
+- [ ] `n` at the confirmation removes nothing
+- [ ] removing the rule that allows **SSH** (port 22, or your `Port`): the `WARNING: rule N allows SSH ...`
+      with the lock-out text, then a **second** question; `n` there removes nothing; only test `y` from a
+      session you can recover with the provider's console
+- [ ] over SSH on a non-default port: the rule for the port you are connected on is protected even if
+      `sshd -T` is not readable (`SSH_CONNECTION` is used)
+- [ ] a source-only allow (for example from one address with no port) or an established-connections rule
+      (nftables/iptables) gets the "no port or protocol restriction" SSH warning
+- [ ] there is no way to remove several rules in one run and no `disable`/`reset`/`flush` anywhere in the
+      backend's own history (`journalctl`, `ufw status` still `active`)
+
+## 11. Non-root
 
 - [ ] as a normal user: `ezvps` prints `ezvps must be run as root.`, exit 1
 - [ ] as a normal user: `ezvps --version` still works
 
-## 11. Cleanup (no uninstall module yet)
+## 12. Cleanup (no uninstall module yet)
 
 ```bash
 x-ui uninstall            # 3x-ui's own uninstaller, if you installed it
@@ -640,6 +702,7 @@ rm -f /usr/local/bin/ezvps
 rm -rf /var/backups/ezvps /var/lib/ezvps
 rm -rf /root/.acme.sh /etc/ssl/ezvps   # if you installed acme.sh / issued certificates
 userdel testuser; userdel testadmin    # the throwaway accounts from section 9 (add -r to drop their homes)
+# Firewall (section 10): remove the test rules you added (ezvps Remove rule, or the backend's own command)
 rm -f /tmp/ezvps-test-key /tmp/ezvps-test-key.pub
 ```
 

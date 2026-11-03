@@ -63,7 +63,10 @@ SPEC.md  README.md  AGENTS.md
   never installed by ezvps), `apt-get` (offered packages) and optionally `systemctl`
   (Backpack's `backpack-*.service` units); SSH and Users: `useradd`, `usermod`,
   `userdel`, `passwd`, `chown`, `sshd` (`-t`/`-T`), `systemctl`, optionally `ss` and `apt-get`;
-  no `sed`/`awk`/`grep`/`ssh-keygen`: passwd, group and sshd_config are parsed in bash). Shared
+  no `sed`/`awk`/`grep`/`ssh-keygen`: passwd, group and sshd_config are parsed in bash; Firewall:
+  only the one detected backend's own command (`ufw`, `firewall-cmd`, `nft` or `iptables`), plus
+  `ss` and `sshd` when present, `date`/`mkdir`/`chmod` for the rule listing copy, and no
+  `sed`/`awk`/`grep`: backend output is parsed in bash). Shared
   helpers (`have_cmd`, `require_cmds`, `ask_yes_no`, `require_supported_os`,
   `port_in_use`, `backup_file`) are module-neutral; reuse them. Adding another
   one is a decision: check it exists (`command -v`) and degrade with a clear
@@ -122,6 +125,17 @@ SPEC.md  README.md  AGENTS.md
   `$OS_ID` with a comment saying why; where they behave the same keep one code
   path. L2TP (ezl2tp) is gated by `L2TP_SUPPORTED` (Debian 13 only) until the
   owner says otherwise; never claim L2TP works where ezl2tp does not.
+* Firewall (SPEC 6.9): the backend is the first present of `ufw`, `firewalld`, `nftables`,
+  `iptables` (fixed order, `FW_BACKENDS`); use only that backend's documented commands, always
+  through `fw_run` (C locale, output captured), and never install a firewall tool. Never enable,
+  disable, reset or flush a firewall, reload firewalld, change a default policy, zone, table or
+  chain, or remove more than the one rule the user picked by ID (lint enforces the command list).
+  Every change starts with `fw_change_preflight` (root, supported system, backend, and for
+  `ufw`/`firewalld` an enabled firewall), validates port (1-65535, digits only) and protocol
+  (`tcp`/`udp`), refuses a duplicate, asks once, saves a text copy of the listing, and re-reads the
+  rules from the backend afterwards; removing a rule that allows SSH needs its own warning and
+  second confirmation, and the rules are re-read to make sure the chosen rule is still the same.
+  nftables/iptables changes are runtime only and say so; do not rewrite their saved configuration.
 * Output goes through `info` / `warn` / `err`. Colour only on a TTY and
   honour `NO_COLOR`.
 * Test-only switches are environment variables documented in `SPEC.md`

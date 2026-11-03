@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10).
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10), Firewall (PR 11).
 
 ## 1. What ezvps is
 
@@ -15,7 +15,8 @@ user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` p
 Certificates: `curl` and the pinned acme.sh script; Backpack and Lazyports: `curl`;
 ctunnel: `git`, `make`, `gcc` and the OpenSSL and zlib development packages. Lazyports needs
 Go, which ezvps never installs; SSH and Users: `sudo`, only when you ask for sudo access on a
-system without it. It never installs the OpenSSH server).
+system without it. It never installs the OpenSSH server; Firewall: nothing, it uses the firewall
+backend that is already present and never installs one).
 
 ### 1.1 Supported systems
 
@@ -40,6 +41,7 @@ Per module:
 | Certificates (acme.sh) | yes | yes | yes | yes | yes |
 | Backpack, ctunnel, Lazyports (`x86_64` and `aarch64` only) | yes | yes | yes | yes | yes |
 | SSH and Users | yes | yes | yes | yes | yes |
+| Firewall (whichever of ufw, firewalld, nftables, iptables is present) | yes | yes | yes | yes | yes |
 | L2TP (ezl2tp) | **no** (gate below) | yes | **no** (gate below) | **no** (gate below) | **no** (gate below) |
 
 * **L2TP has its own gate.** ezvps running on a system does not mean ezl2tp
@@ -93,6 +95,7 @@ Per module:
   | certificate store `/etc/ssl/ezvps` (PR 8) | no package owns it | no package owns it (Ubuntu's `ssl-cert` group is not used) | one path |
   | Backpack, ctunnel, Lazyports (PR 9) | upstream installers branch on nothing distro-specific (Backpack's `install.sh` keys on `uname -m` only; ctunnel is `make`; Lazyports is `go install`); apt package names `git make gcc libssl-dev zlib1g-dev curl` are identical | identical | one path (Go is not installed by ezvps, so the distro's Go version only matters to Lazyports, see 6.7) |
   | SSH and Users (PR 10) | `useradd`/`usermod`/`userdel`/`passwd` (shadow-utils), group `sudo` (only when the `sudo` package is installed, which a minimal Debian image may lack), `ssh.service` | same commands; group `sudo`; sudo is preinstalled; **Ubuntu 22.10+ starts sshd through `ssh.socket`**, whose port is not always taken from `sshd_config` | one code path. The group name (`sudo`, not `wheel`) and the documented command (`usermod -aG sudo <user>`) are the same on both. The socket difference is handled by *verifying* that sshd listens on the new port after a port change and rolling back if it does not (6.8); ezvps does not branch on the distro for it |
+  | Firewall (PR 11) | which backend exists differs by image (Ubuntu usually ships `ufw`; Debian usually has `nftables`/`iptables`), not by release: `ufw`, `firewall-cmd`, `nft` and `iptables` take the same arguments on all five systems | same | one code path. The backend is chosen by which command is present, in the fixed order of 6.9, never by `ID`; ezvps does not branch on the distro |
 
 ## 2. Principles (same as easyl2tp)
 
@@ -183,7 +186,7 @@ redraws. EOF on stdin exits 0.
 | 6 | Certificates      | **implemented**     | PR 8       |
 | 7 | Lazyports         | **implemented**     | PR 9       |
 | 8 | SSH and Users     | **implemented**     | PR 10      |
-| 9 | Firewall          | not implemented yet | later      |
+| 9 | Firewall          | **implemented**     | PR 11      |
 | 10| Backup            | not implemented yet | later      |
 | 11| Check For Updates | not implemented yet | later      |
 | 12| Uninstall         | not implemented yet | later      |
@@ -1366,10 +1369,174 @@ connections, and to keep the session until a new one works.
 6. A key that is already present (same type and data) is a no-op: no write, no backup.
 7. Reminds you to test a key login in a second terminal before disabling passwords.
 
-### 6.9 Firewall (later PR; v0.0.1 = show only)
+### 6.9 Firewall (PR 11, done)
 
-Read-only view of the active firewall (nftables/ufw/iptables, whichever is
-present) and listening ports. No rule changes in v0.0.1.
+Menu item 9 opens a submenu. Clean labels only:
+
+```
+ 1) Show firewall status
+ 2) List rules
+ 3) Allow port
+ 4) Remove rule
+ 0) Back
+```
+
+`0` or EOF returns to the main menu; after each action "Press Enter to continue..."; invalid input
+prints `Invalid choice: <input>`. Module key `firewall` maps to `module_firewall`; its helpers are
+prefixed `fw_`. **Scope:** show the status, list the rules, allow one port, remove one rule, through the
+one backend that is present. ezvps never installs a firewall tool, never enables, disables, resets or
+flushes a firewall, and never changes a default policy, a zone, a table or a chain.
+
+#### The backend: detected, in this order
+
+The backend is the **first** one of these whose command exists (`command -v`), in this fixed order
+(`FW_BACKENDS` in `ezvps`; lint checks it):
+
+| Order | Backend | Detected by the command | Why it comes here |
+|-------|---------|-------------------------|-------------------|
+| 1 | `ufw` | `ufw` | a front end that owns the rules it manages, so it goes first |
+| 2 | `firewalld` | `firewall-cmd` | likewise a manager over nftables/iptables |
+| 3 | `nftables` | `nft` | the kernel framework that the two above and modern iptables sit on |
+| 4 | `iptables` | `iptables` | the legacy interface (also the `iptables-nft` compatibility command) |
+
+Only that backend's documented commands are used; the others are never called (the tests assert it).
+The chosen backend is named in every action (`Firewall backend: ufw (command: ufw)`) and under the
+submenu title. **No backend found** (none of the four commands exists): the module prints `No firewall
+backend found (looked for, in this order: ufw, firewalld, nftables, iptables).` and `ezvps does not
+install a firewall tool. Nothing was changed.`, does not open the submenu, and returns to the main
+menu. The commands are checked each time an action runs, so a backend that disappears is reported
+again. Detection is by command, not by service state: a backend that is installed but switched off is
+still the backend, and is reported as `disabled`.
+
+| Backend | Commands ezvps runs (all with `LC_ALL=C`) |
+|---------|--------------------------------------------|
+| ufw | `ufw status verbose`, `ufw status numbered`, `ufw app list`, `ufw app info <profile>`, `ufw allow <port>/<proto>`, `ufw --force delete <number>` |
+| firewalld | `firewall-cmd --state`, `--get-default-zone`, `--get-active-zones`, `--zone=<z> --list-all`, `--list-ports`, `--list-services`, `--list-rich-rules`, `--list-sources`, `--info-service=<s>`, `--zone=<z> --add-port=<port>/<proto>`, `--remove-port=`, `--remove-service=`, `--remove-rich-rule=` (each change twice: once for the running firewall and once with `--permanent`; never `--reload`) |
+| nftables | `nft -a list ruleset`, `nft insert rule <family> <table> <chain> <proto> dport <port> accept`, `nft delete rule <family> <table> <chain> handle <handle>` |
+| iptables | `iptables -w -S INPUT`, `iptables -w -I INPUT 1 -p <proto> --dport <port> -j ACCEPT`, `iptables -w -D INPUT <number>` |
+
+#### Checks
+
+* **Read-only actions** (status, list): a detected backend. Nothing else; they run no write command.
+* **Every change** (Allow port, Remove rule), before anything is asked: root (`require_root`), a
+  supported system (`require_supported_os "Firewall"`, section 1.1; the shared refusal text), a
+  detected backend, and, for `ufw` and `firewalld`, a firewall that is **enabled**. A disabled ufw
+  (`Status: inactive`) or a firewalld that is not running does not report its rules back, and ezvps
+  never enables or disables a firewall, so it refuses with `<backend> is disabled. ...` and `Nothing was
+  changed.` nftables and iptables have no switch, so they are never refused for that reason.
+* Then a valid port and protocol (below). A refusal says why and changes nothing.
+
+#### 1) Show firewall status
+
+Read-only. `Status` is `enabled` or `disabled` as the backend reports it, and `Default policy` is what
+the backend reports, or says it does not:
+
+| Backend | enabled / disabled | Default policy shown |
+|---------|--------------------|----------------------|
+| ufw | `Status: active` / `inactive` | the `Default:` line of `ufw status verbose` (`not reported while ufw is inactive`) |
+| firewalld | `--state` is `running` / not running | the default zone and its `target` (`not reported while firewalld is not running`) |
+| nftables | at least one input chain (`type filter hook input`) has a policy other than `accept` or has rules / otherwise | each input chain's `policy` (`not reported: no input filter chain is loaded`) |
+| iptables | the `INPUT` policy is not `ACCEPT` or the chain has rules / otherwise | `INPUT policy <policy>` |
+
+nftables and iptables have no on/off switch, so for them `enabled` means filtering is loaded; the output
+says so.
+
+#### 2) List rules
+
+Read-only: it never changes a rule and runs no write command. One rule per row, in the backend's own
+order, with the columns `ID  ACTION  PROTO  PORT/SERVICE  SOURCE` and, last, the rule exactly as the
+backend reports it:
+
+| Backend | What is listed | ID | ACTION | PORT/SERVICE, SOURCE |
+|---------|----------------|----|--------|-----------------------|
+| ufw | every row of `ufw status numbered` (IPv4 and IPv6 rows have their own numbers) | ufw's rule number | ufw's word (`allow in`, `deny in`, `limit in`, ...) | the `To` column (port, range, or application profile followed by its ports from `ufw app info`) and the `From` column |
+| firewalld | ports, services and rich rules of the **default zone and every other active zone**; the zone is part of the rule text; zones bound to sources get a note | the row number in this list (firewalld has no numbers); the rule is removed by what it is, not by the number | `allow` for ports and services, `accept`/`reject`/`drop` for rich rules | the port, or the service name followed by the ports `--info-service` reports; a rich rule's source |
+| nftables | the rules of every **input chain** (`type filter hook input`); a set definition, a forward/output chain, other tables' chains are not shown; a note says so | the nftables rule **handle** | the verdict (`accept`, `drop`, `reject`, ...) | `dport` (a `{ 80, 443 }` set is shown as `80,443`) and `saddr` |
+| iptables | the `INPUT` chain of the filter table, IPv4 (no `ip6tables`); a note says so | the rule number in that chain | `-j` target (`accept`, `drop`, `reject`, or a chain name) | `--dport`/`--dports` and `-s` |
+
+A cell the backend does not report for a rule is `-`. A disabled ufw or a firewalld that is not running
+says it reports no rules. Nothing is guessed from files on disk.
+
+#### 3) Allow port
+
+1. The checks above, then the port and the protocol, **strictly validated**: the port is one number of
+   digits only, `1`-`65535`, no leading zero, no sign, range, list, or `/proto` (surrounding spaces are
+   ignored); the protocol is exactly `tcp` or `udp` (any case). Anything else is refused with the reason
+   and nothing is changed. An empty port cancels. (To open both protocols, run it twice.)
+2. The rules are read. **A port that is already allowed is refused** (`Port <port>/<proto> is already
+   allowed by:` and the rules): an allow rule with no source restriction whose port, range, list, service
+   or application profile covers that port and protocol (for ufw, the rules of an application profile
+   such as `Nginx Full` count; for firewalld, the ports of an enabled service such as `http` count, in the
+   default zone). A rule limited to one source address does not count, and neither does the other
+   protocol. Re-running it is therefore a no-op.
+3. **A blocking rule** (`deny`, `reject`, `drop`) that covers the same port is warned about, since the
+   backend may evaluate it first; it does not stop the user.
+4. **A port in use** (`ss -ltnp` or `-lunp`, filtered on the port; without `ss`, tcp falls back to a
+   connection test and udp says it cannot be checked): the process and listening address are shown with
+   a warning, and the confirmation question changes to `Port <port>/<proto> is already in use. Allow it
+   anyway?`. It is a warning, not a block: after one yes the rule is added.
+5. The exact command(s) are shown and one confirmation is asked (default no). Declined, or EOF: nothing
+   changes.
+6. A text copy of the listing the backend just reported is saved to
+   `/var/backups/ezvps/firewall-<backend>.<timestamp>.<pid>` (dir 700, file 600; a reference copy, not a
+   restore file). A failed copy aborts before the change.
+7. The rule is added **only through the detected backend**: ufw `allow <port>/<proto>` (ufw places it);
+   firewalld in the **default zone**, running and permanent; nftables `insert` at the **top** of the input
+   chain; iptables `-I INPUT 1`. At the top, because a rule appended after a final `drop`/`reject` would
+   never match. nftables chooses the chain from those loaded: with one input chain it is used, with
+   several the user is asked, with none ezvps stops (`ezvps does not create tables or chains`). The
+   backend's refusal is shown and nothing else is changed.
+8. **The rules are read again from the backend and shown**, followed by `The rule as <backend> reports
+   it:` with the matching rule(s). If the backend does not list an allow rule for the port after the
+   change, that is reported as a problem and not as success.
+9. For nftables and iptables a note says the change applies to the running firewall only (see the limits).
+   A firewalld change that reached the running firewall but not the permanent configuration says so.
+
+#### 4) Remove rule
+
+1. The checks above, then the rules are listed with their IDs. No rules: nothing to do.
+2. The ID is asked (an empty ID cancels). Only an ID in the list is accepted; `all`, ranges, lists and
+   anything else are refused, so **exactly one rule can be removed per run**, and there is no
+   remove-all. The rule and the exact command(s) are shown.
+3. `Remove rule <id>? The firewall stays enabled and every other rule stays as it is.` (default no).
+4. **SSH protection, a separate warning and a separate confirmation.** The SSH ports are the ports
+   `sshd -T` reports (else the `Port` lines of `sshd_config`, else 22) plus the server port of the SSH
+   session ezvps is running in (`SSH_CONNECTION`). A removal is treated as an SSH removal when the rule
+   **allows** traffic and it (a) covers an SSH port (a port, a range, a list, an application profile or
+   a service such as `OpenSSH`/`ssh`), (b) is the SSH service or profile by name when its ports cannot
+   be read, or (c) has **no port and no protocol restriction at all** (for example a source-only allow,
+   an established-connections rule, or a loopback rule), which may be what keeps SSH or the current
+   session working. Then ezvps prints `WARNING: rule <id> <why>.`, that removing it can lock the user out
+   of the server including the current session and cannot be undone remotely, and (when connected over
+   SSH) that the session appears to be an SSH one, and asks `Remove this SSH-related rule anyway?`
+   (default no). One yes to the first question is not enough. Removing a block rule is not an SSH
+   removal.
+5. The numbers can move between listing and removing (ufw, iptables, firewalld), so the rules are read
+   again and the chosen rule must still be the same rule; otherwise `The rules changed while you were
+   choosing` and nothing is changed.
+6. The listing is saved as in Allow port (step 6), then the rule is removed through the backend: ufw
+   `--force delete <number>` (the `--force` only skips ufw's own prompt, ezvps has asked already),
+   firewalld `--remove-port/-service/-rich-rule` for the running and the permanent configuration,
+   nftables `delete rule ... handle <handle>`, iptables `-D INPUT <number>`.
+7. **The rules are read again and shown;** the rule must be gone (one fewer rule with that text), else
+   it is reported. The summary says `Only that rule was removed; the firewall was not disabled.`
+
+ezvps never blocks a port, so it cannot block SSH; the only way it can cut SSH is by removing an allow
+rule, which is why that is the case guarded above.
+
+#### Known limits
+
+* **nftables and iptables changes are runtime only.** ezvps does not rewrite `/etc/nftables.conf`, the
+  iptables save files or `netfilter-persistent`, whose format and ownership differ per setup; it says so
+  after every such change. ufw and firewalld (permanent) persist by themselves.
+* iptables is the IPv4 `INPUT` chain only (`ip6tables` is not managed); nftables only the input chains
+  that exist (an `ip` chain is IPv4 only, `inet` covers both).
+* A rule that also matches an interface or a connection state counts as the port being allowed (the
+  duplicate check looks at port, protocol, action and source only).
+* firewalld rich rules are listed and removable, not created. Rules in zones that are neither the default
+  nor active are not shown. `docker`'s chains and forward/NAT rules are not shown.
+* `ufw` adds IPv4 and IPv6 rules; removing a rule removes only that one row (its IPv6 twin has its own ID).
+* Disabled ufw / not-running firewalld: read-only. Enabling is left to the administrator.
 
 ### 6.10 Backup (later PR)
 
@@ -1413,12 +1580,12 @@ Defaults are the real paths; none of these relax a check on a real server.
 | Variable | Used by | Meaning |
 |----------|---------|---------|
 | `EZVPS_ALLOW_NONROOT=1` | ezvps, install.sh | skip the root check |
-| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
-| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
+| `EZVPS_SKIP_OS_CHECK=1` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, L2TP), install.sh | skip the "supported system" check only. Detection still runs: L2TP is still gated by the ezl2tp list, and Nginx still picks the repository from the detected distro and codename and still refuses an unknown distro, an unlisted release or a codename mismatch (none gets a repository) |
+| `EZVPS_OS_RELEASE` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall, L2TP), install.sh | os-release file to read (default `/etc/os-release`) |
 | `EZVPS_XUI_DIR` | ezvps (3x-ui) | panel install dir (default `/usr/local/x-ui`) |
 | `EZVPS_XUI_DB_DIR` | ezvps (3x-ui) | panel database dir (default `/etc/x-ui`) |
 | `EZVPS_STATE_DIR` | ezvps (3x-ui) | state dir (default `/var/lib/ezvps`) |
-| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users), install.sh | backup dir (default `/var/backups/ezvps`) |
+| `EZVPS_BACKUP_DIR` | ezvps (3x-ui, Nginx, Certificates, Backpack, ctunnel, Lazyports, SSH and Users, Firewall), install.sh | backup dir (default `/var/backups/ezvps`) |
 | `EZVPS_NGINX_DIR` | ezvps (Nginx) | nginx config dir (default `/etc/nginx`) |
 | `EZVPS_APT_DIR` | ezvps (Nginx) | apt config dir for the nginx.org source and pin (default `/etc/apt`) |
 | `EZVPS_KEYRING_DIR` | ezvps (Nginx) | where `nginx-archive-keyring.gpg` is stored (default `/usr/share/keyrings`) |
@@ -1431,7 +1598,7 @@ Defaults are the real paths; none of these relax a check on a real server.
 | `EZVPS_PASSWD_FILE` / `EZVPS_GROUP_FILE` / `EZVPS_SHELLS_FILE` | ezvps (SSH and Users) | passwd, group and shells files that are read (defaults `/etc/passwd`, `/etc/group`, `/etc/shells`); the `useradd`/`usermod`/`userdel` stubs of the tests edit fake copies |
 | `EZVPS_PROC_DIR` | ezvps (SSH and Users) | where `<pid>/status` and `self/loginuid` are read (default `/proc`) |
 | `EZVPS_HOME_BASE` | ezvps (SSH and Users) | the only directory under which a home directory may be offered for removal (default `/home`) |
-| `EZVPS_SSHD_CONFIG` | ezvps (SSH and Users) | sshd configuration file that is read, backed up and rewritten (default `/etc/ssh/sshd_config`) |
+| `EZVPS_SSHD_CONFIG` | ezvps (SSH and Users, Firewall) | sshd configuration file that is read, backed up and rewritten (default `/etc/ssh/sshd_config`); the Firewall module only reads its `Port` lines, as a fallback, to find the SSH port |
 | `EZVPS_SSH_WAIT_SECONDS` | ezvps (SSH and Users) | how long to wait for sshd to listen on a new port (default 10) |
 | `EZVPS_TOOL_PREFIX` | ezvps (Backpack, ctunnel, Lazyports) | install prefix of the tools (default `/usr/local`: binaries in `<prefix>/bin`, ctunnel's man page in `<prefix>/share/man/man1`; also passed to `make` as `PREFIX`) |
 | `EZVPS_BACKPACK_CONF_DIR` | ezvps (Backpack) | Backpack's config directory, backed up before changes (default `/etc/backpack`) |
@@ -1629,9 +1796,47 @@ Defaults are the real paths; none of these relax a check on a real server.
   Each assertion was checked to fail when the behaviour it covers is broken (a scripted mutation run
   removed, one at a time, each refusal, confirmation, backup, `sshd -t`, verification, rollback, `chown`,
   `chmod` and private-key check).
+  **Firewall** (`== Firewall module`) runs against **fake backend commands** with file-backed state, so every
+  change can be read back: a fake `ufw` (`status verbose`/`numbered` in ufw's column layout, IPv4 and IPv6 rows,
+  `app list`/`app info` with its `Port:`/`Ports:` forms, `allow`, `--force delete`), `firewall-cmd` (runtime and
+  permanent config per zone, services with `--info-service`, rich rules), `nft` (`-a list ruleset` with a set
+  block, an input and a forward chain, handles, `insert rule`, `delete rule ... handle`), `iptables` (`-S INPUT`
+  with a policy line, `-I`, `-D`, the real tool's `-m tcp` normalisation), `ss` (tcp and udp listeners with a
+  process name) and `sshd` (`-T` ports). Switches make a backend fail, ignore an add, fail a permanent write,
+  or change the rules between the listing and the removal. Sandbox `PATH`s hold bash, three coreutils and the
+  chosen stubs only. Covered: **detection order** (all four present = ufw, no ufw = firewalld, then nftables,
+  then iptables; the other backends' commands are never called; none = the clear message, no submenu, no
+  command run, exit 0, also through the main menu); the exact submenu; **status** enabled and disabled for
+  each backend with the default policy as reported; **list parsing** for each backend (ids, action, protocol,
+  port, range, set, source, application profile and service ports, IPv6 rows, rich rules, other zones, forward
+  chains and set definitions not mistaken for rules, ufw's order kept, nothing written); **allow** (port and
+  protocol validation with 15 bad ports and 7 bad protocols, boundary ports, case and spaces, the exact
+  command, the re-read after the change, the rule as the backend reports it, the saved listing and its modes,
+  declined and EOF, **duplicate refusal** by port, range, set, multiport, application profile and service, not
+  by another protocol, another source or another zone, idempotent second run, a deny rule warned about, a
+  **port in use** warned with the process and address for tcp and udp and allowed after one yes, no `ss`, a
+  backend failure, a rule the backend does not report afterwards, a disabled ufw/firewalld refused, firewalld's
+  permanent write failing, several nftables input chains, none, `nft` failing); **remove** (the list first,
+  exactly one delete call, invalid ids and `all` refused, declined and EOF, re-read afterwards, other rules
+  untouched, a changed rule list refused, the backend failing); **SSH protection** (an allow on the SSH port,
+  its IPv6 twin, the port from `sshd -T` and from `sshd_config` when there is no `sshd`, the port of the
+  current session, a range covering it, the `OpenSSH` profile by ports and by name, the firewalld `ssh`
+  service, a rule without port or protocol, a block rule not protected, the second question needed, one yes
+  not enough, nothing deleted when declined); unsupported systems refused for changes but not for status/list,
+  the five supported systems accepted. Source rules: the fixed backend order, no enable/disable/reset/flush/
+  reload/policy/table/chain command, no `sed`/`awk`/`grep`/`curl`, every backend call through `fw_run` in the C
+  locale, only the documented ufw subcommands, list and status never reach a changing function, and every
+  change starts with the preflight. Each assertion was checked to fail when the behaviour it covers is broken
+  (a scripted mutation run removed, one at a time, the SSH protection and its second confirmation, the duplicate
+  check, the OS check, each confirmation, the backend order, the port and protocol validation, the re-read
+  checks, the changed-rules check, the backup, the in-use warning, the disabled-firewall refusal, `--force`,
+  the permanent firewalld write, the nftables/iptables insert position and the port-range, service and
+  application-profile coverage).
   It touches nothing outside its temp dir and uses no network.
   `tests/lint.sh` additionally checks that the SSH and Users code never touches `/etc/shadow`, stores no key
-  material and downloads nothing.
+  material and downloads nothing, and that the Firewall code never enables, disables, resets or flushes a
+  firewall, reloads firewalld, changes a policy, zone, table or chain, uses `sed`/`awk`/`grep`/`curl`, or calls a
+  backend outside `fw_run`, and that the detection order is ufw, firewalld, nftables, iptables.
   `tests/lint.sh` additionally checks that the OS allowlist block is identical
   in `ezvps` and `install.sh` and lists exactly the five supported systems, that
   the nginx.org suite is not hardcoded, that the repository URL is the stable
