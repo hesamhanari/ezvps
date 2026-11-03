@@ -39,8 +39,8 @@ system in the table the L2TP item prints a clear message, installs and
 launches nothing, and returns to the menu.
 
 > **Status: v0.0.1 in development.** **L2TP**, **3x-ui**, **Backpack**,
-> **ctunnel**, **Nginx**, **Certificates** and **Lazyports** work so far. The other
-> menu items (SSH and Users, Firewall, Backup, Check For Updates, Uninstall) are still pending:
+> **ctunnel**, **Nginx**, **Certificates**, **Lazyports** and **SSH and Users** work so far. The other
+> menu items (Firewall, Backup, Check For Updates, Uninstall) are still pending:
 > they print "not implemented yet" and return to the menu. They arrive in
 > later releases, one module per PR. See [SPEC.md](SPEC.md).
 
@@ -295,6 +295,43 @@ never asks for or stores DNS provider credentials.
 
 The pin, the HTTPS site layout and the details are in [SPEC.md](SPEC.md) section 6.4.
 
+### SSH and Users
+
+`ezvps` -> `8` opens a submenu:
+
+```
+ 1) List users
+ 2) Add user
+ 3) Delete user
+ 4) SSH settings
+ 5) Add SSH key
+ 0) Back
+```
+
+* **List users** shows accounts that have a login shell and a home directory, one per row, with
+  username, UID and whether the account has sudo access (member of the `sudo` group). Service
+  accounts with a `nologin` or `false` shell are hidden unless you ask for the full list. Password
+  hashes are never read or shown.
+* **Add user** asks for a username (strictly validated; an existing user or group is refused),
+  asks whether to grant sudo (adds the user to the `sudo` group only, and checks it worked), creates the
+  account with a home directory, and only if you say yes runs the system's own `passwd` prompt. ezvps
+  never sees, stores or prints a password.
+* **Delete user** refuses `root`, any UID 0 account, the account you are logged in with, system
+  accounts and any user that has running processes. It asks for confirmation, and removes the home
+  directory only after a separate second confirmation (never by default).
+* **SSH settings** changes only the **SSH port**, **PermitRootLogin** and **PasswordAuthentication**,
+  one at a time. `sshd_config` is backed up to `/var/backups/ezvps/` first, `sshd -t` must pass
+  before sshd is restarted, and the change is rolled back if the test fails, if the setting would not
+  take effect (for example a `sshd_config.d` drop-in overrides it), or if sshd does not listen on the
+  new port. It warns clearly before anything that can lock you out. The firewall is not changed: open a
+  new port yourself before closing the old one, and test from a second terminal.
+* **Add SSH key** asks for a user and a public key (typed without echo), refuses anything that is
+  not a one-line OpenSSH public key (a private key is refused and never printed), and appends it to
+  that user's `~/.ssh/authorized_keys` with mode 700/600 and the right owner. An existing file is
+  backed up first and a key that is already there is not added twice.
+
+Details, the exact refusals and the limits are in [SPEC.md](SPEC.md) section 6.8.
+
 ## Principles
 
 Check before installing. Back up before overwriting. Idempotent re-runs. No
@@ -305,7 +342,7 @@ fake data only).
 
 ```bash
 bash tests/lint.sh          # bash -n + shellcheck + hygiene scan
-bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports against fakes, pending modules, installer
+bash tests/smoke-test.sh    # menu, L2TP stub, 3x-ui, Nginx, Certificates, Backpack/ctunnel/Lazyports, SSH and Users against fakes, pending modules, installer
 ```
 
 `tests/fresh-vps-test.md` is the manual checklist for a throwaway VPS on each

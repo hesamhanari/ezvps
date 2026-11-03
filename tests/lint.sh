@@ -132,6 +132,18 @@ fi
 if ! grep -qF 'bash "${tmp}/install.sh" </dev/null' ezvps; then
     bad "ezvps: the upstream installer must run with </dev/null so it can not open the tool"
 fi
+# SSH and Users: password hashes live in /etc/shadow, which ezvps never reads; a password is only
+# ever asked for by the system's own passwd prompt; downloads are not part of this module.
+ssh_users_code="$(awk '/^(usr_|ssh_|module_ssh)[a-z_]*\(\) \{/ {on=1} on {print} /^}/ {on=0}' ezvps | grep -vE '^[[:space:]]*#')"
+if grep -q 'shadow' <<<"$ssh_users_code"; then
+    bad "ezvps: the SSH and Users module must never touch /etc/shadow (password hashes)"
+fi
+if grep -qE '(curl|wget)' <<<"$ssh_users_code"; then
+    bad "ezvps: the SSH and Users module must not download anything"
+fi
+if grep -qE 'read[^|]*-s[^|]*(pass|pw)' <<<"$ssh_users_code"; then
+    bad "ezvps: the SSH and Users module must not read a password itself (use the system's passwd prompt)"
+fi
 # Nginx must come from the nginx.org STABLE repository: the repo URL has no
 # "mainline", the key URL is https, the pin is priority 900, and the key
 # fingerprints are pinned (40 hex digits each).

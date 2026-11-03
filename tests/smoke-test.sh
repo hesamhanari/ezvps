@@ -166,7 +166,7 @@ check "'ezvps l2tp' without ezl2tp exits 0" equals "$RC" 0
 
 echo "== not-yet-implemented modules"
 for i in "${!KEYS[@]}"; do
-    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" || "${KEYS[$i]}" == "backpack" || "${KEYS[$i]}" == "ctunnel" || "${KEYS[$i]}" == "lazyports" ]] && continue
+    [[ "${KEYS[$i]}" == "l2tp" || "${KEYS[$i]}" == "3x-ui" || "${KEYS[$i]}" == "nginx" || "${KEYS[$i]}" == "certs" || "${KEYS[$i]}" == "backpack" || "${KEYS[$i]}" == "ctunnel" || "${KEYS[$i]}" == "lazyports" || "${KEYS[$i]}" == "ssh" ]] && continue
     n=$((i + 1))
     label="${LABELS[$i]}"
     run_ezvps "$STUB_BIN" "${n}\n\n0\n"
@@ -3863,6 +3863,892 @@ check "Backpack: update/uninstall/status on a machine without it all return to t
 export HOME="$LC_SAVED_HOME"
 if [[ -n "$LC_SAVED_BACKUP" ]]; then export EZVPS_BACKUP_DIR="$LC_SAVED_BACKUP"; else unset EZVPS_BACKUP_DIR; fi
 unset EZVPS_TOOL_PREFIX EZVPS_BACKPACK_CONF_DIR FAKE_LOG FAKE_ARCH FAKE_SHA FAKE_INSTALLER FAKE_GO_VERSION
+
+echo "== SSH and Users module (fake passwd/group/sshd_config, stub useradd/usermod/userdel/passwd/chown/sshd/systemctl/ss, no real accounts)"
+
+SSHW="$WORK/ssh"
+SSH_STUBS="$SSHW/stubs"
+mkdir -p "$SSH_STUBS"
+SSH_SAVED_PAUSE="${EZVPS_NO_PAUSE-}"
+export EZVPS_NO_PAUSE=1
+
+# --- stubs: they edit the FAKE passwd/group/sshd_config files, never the system's ---------------
+mkstub "$SSH_STUBS/useradd" <<'EOF'
+echo "useradd $*" >>"$FAKE_LOG"
+[[ "${FAKE_USERADD_FAIL:-0}" == 1 ]] && { echo "useradd: failure" >&2; exit 1; }
+name="${!#}"
+max=2000
+while IFS=: read -r _ _ u _; do
+    [[ "$u" =~ ^[0-9]+$ ]] && ((u < 60000 && u > max)) && max=$u
+done <"$EZVPS_PASSWD_FILE"
+uid=$((max + 1))
+printf '%s:x:%s:%s::%s/%s:/bin/bash\n' "$name" "$uid" "$uid" "$EZVPS_HOME_BASE" "$name" >>"$EZVPS_PASSWD_FILE"
+printf '%s:x:%s:\n' "$name" "$uid" >>"$EZVPS_GROUP_FILE"
+mkdir -p "$EZVPS_HOME_BASE/$name"
+exit 0
+EOF
+mkstub "$SSH_STUBS/usermod" <<'EOF'
+echo "usermod $*" >>"$FAKE_LOG"
+[[ "${FAKE_USERMOD_FAIL:-0}" == 1 ]] && { echo "usermod: failure" >&2; exit 1; }
+[[ "${FAKE_USERMOD_NOOP:-0}" == 1 ]] && exit 0
+args=("$@")
+grp="${args[1]}" user="${args[3]}" out=""
+while IFS= read -r l; do
+    IFS=: read -r gn gp gg gm <<<"$l"
+    if [[ "$gn" == "$grp" ]]; then
+        if [[ -z "$gm" ]]; then gm="$user"; else gm="$gm,$user"; fi
+        l="$gn:$gp:$gg:$gm"
+    fi
+    out+="$l"$'\n'
+done <"$EZVPS_GROUP_FILE"
+printf '%s' "$out" >"$EZVPS_GROUP_FILE"
+exit 0
+EOF
+mkstub "$SSH_STUBS/userdel" <<'EOF'
+echo "userdel $*" >>"$FAKE_LOG"
+[[ "${FAKE_USERDEL_FAIL:-0}" == 1 ]] && { echo "userdel: failure" >&2; exit 1; }
+rmhome=0 name=""
+for a in "$@"; do
+    case "$a" in -r) rmhome=1 ;; --) ;; *) name="$a" ;; esac
+done
+home="" out=""
+while IFS= read -r l; do
+    IFS=: read -r n _ _ _ _ h _ <<<"$l"
+    if [[ "$n" == "$name" ]]; then home="$h"; continue; fi
+    out+="$l"$'\n'
+done <"$EZVPS_PASSWD_FILE"
+printf '%s' "$out" >"$EZVPS_PASSWD_FILE"
+out=""
+while IFS= read -r l; do
+    IFS=: read -r n _ <<<"$l"
+    [[ "$n" == "$name" ]] && continue
+    out+="$l"$'\n'
+done <"$EZVPS_GROUP_FILE"
+printf '%s' "$out" >"$EZVPS_GROUP_FILE"
+((rmhome)) && rm -rf "$home"
+exit 0
+EOF
+# fake passwd: records the call and prints a marker; it must not read stdin (ezvps never types a password)
+mkstub "$SSH_STUBS/passwd" <<'EOF'
+echo "passwd $*" >>"$FAKE_LOG"
+echo "FAKE-PASSWD-PROMPT"
+exit "${FAKE_PASSWD_RC:-0}"
+EOF
+mkstub "$SSH_STUBS/chown" <<'EOF'
+echo "chown $*" >>"$FAKE_LOG"
+exit "${FAKE_CHOWN_RC:-0}"
+EOF
+mkstub "$SSH_STUBS/apt-get" <<'EOF'
+echo "apt-get $*" >>"$FAKE_LOG"
+for a in "$@"; do
+    [[ "$a" == sudo ]] && printf 'sudo:x:27:\n' >>"$EZVPS_GROUP_FILE"
+done
+exit 0
+EOF
+# fake sshd: -t fails on BROKEN_DIRECTIVE (or, with FAKE_SSHD_FAIL_AFTER_MANAGED, once ezvps has written its
+# line); -T prints a small effective config (Include, first value wins, Port cumulative, Match skipped).
+mkstub "$SSH_STUBS/sshd" <<'EOF'
+mode="" cfg=""
+while (($#)); do
+    case "$1" in -t) mode=t ;; -T) mode=T ;; -f) cfg="$2"; shift ;; esac
+    shift
+done
+echo "sshd -$mode" >>"$FAKE_LOG"
+if [[ "$mode" == t ]]; then
+    body="$(<"$cfg")"
+    if [[ "$body" == *BROKEN_DIRECTIVE* ]] || { [[ "${FAKE_SSHD_FAIL_AFTER_MANAGED:-0}" == 1 ]] && [[ "$body" == *"# ezvps:managed"* ]]; }; then
+        echo "$cfg line 3: Bad configuration option: BROKEN_DIRECTIVE" >&2
+        exit 255
+    fi
+    exit 0
+fi
+declare -A seen
+ports=()
+parse() {
+    local f="$1" line t kw val g inc inmatch=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        t="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$t" || "$t" == \#* ]] && continue
+        kw="${t%%[[:space:]=]*}"
+        kw="${kw,,}"
+        val="${t:${#kw}}"
+        val="${val#"${val%%[![:space:]=]*}"}"
+        case "$kw" in
+            match) inmatch=1 ;;
+            include) for g in $val; do for inc in $g; do [[ -f "$inc" ]] && parse "$inc"; done; done ;;
+            port) ((inmatch)) || ports+=("$val") ;;
+            permitrootlogin | passwordauthentication | kbdinteractiveauthentication)
+                ((inmatch)) || [[ -n "${seen[$kw]:-}" ]] || seen[$kw]="$val" ;;
+        esac
+    done <"$f"
+}
+parse "$cfg"
+((${#ports[@]})) || ports=(22)
+for p in "${ports[@]}"; do echo "port $p"; done
+echo "permitrootlogin ${seen[permitrootlogin]:-without-password}"
+echo "passwordauthentication ${seen[passwordauthentication]:-yes}"
+echo "kbdinteractiveauthentication ${seen[kbdinteractiveauthentication]:-no}"
+exit 0
+EOF
+# fake systemctl: restart re-binds the ports the config now names (the "listening" state is a file)
+mkstub "$SSH_STUBS/systemctl" <<'EOF'
+echo "systemctl $*" >>"$FAKE_LOG"
+rebind() {
+    [[ "${FAKE_NO_REBIND:-0}" == 1 ]] && return 0
+    : >"$FAKE_LISTEN"
+    while IFS= read -r l; do
+        [[ "$l" == port\ * ]] && echo "${l#port }" >>"$FAKE_LISTEN"
+    done < <("$FAKE_SSHD" -T -f "$EZVPS_SSHD_CONFIG")
+}
+case "${1:-}" in
+    is-active)
+        for a in "$@"; do
+            [[ "$a" == ssh.socket ]] && { [[ "${FAKE_SOCKET:-0}" == 1 ]]; exit $?; }
+            [[ "$a" == ssh ]] && { [[ "${FAKE_SSH_DOWN:-0}" != 1 ]]; exit $?; }
+        done
+        exit 0 ;;
+    restart)
+        if [[ "${FAKE_RESTART_FAIL:-0}" == 1 ]]; then echo "Job for ssh failed" >&2; exit 1; fi
+        if [[ "${FAKE_RESTART_FAIL_ONCE:-0}" == 1 && ! -e "$FAKE_LOG.once" ]]; then : >"$FAKE_LOG.once"; echo "Job for ssh failed" >&2; exit 1; fi
+        if [[ "${FAKE_SOCKET:-0}" == 1 ]]; then
+            [[ "${2:-}" == ssh.socket ]] && rebind
+        else
+            rebind
+        fi
+        exit 0 ;;
+esac
+exit 0
+EOF
+# fake ss: a port is "in use" when it is in the listening file or the other-services file
+mkstub "$SSH_STUBS/ss" <<'EOF'
+port="${!#}"
+port="${port##*:}"
+port="${port%% *}"
+port="${port%)}"
+for f in "$FAKE_LISTEN" "$FAKE_BUSY"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r p; do
+        [[ "$p" == "$port" ]] && { echo "LISTEN 0 128 0.0.0.0:$port 0.0.0.0:*"; exit 0; }
+    done <"$f"
+done
+exit 0
+EOF
+
+# sandbox PATH: coreutils + stubs; some variants lack one command
+mk_ssh_bin() { # mk_ssh_bin <dir> [missing...]
+    local dir="$1" c s skip
+    shift
+    mkdir -p "$dir"
+    for c in bash cp mkdir mv rm rmdir mktemp date chmod ln readlink; do ln -sf "$(command -v "$c")" "$dir/$c"; done
+    for s in useradd usermod userdel passwd chown sshd systemctl ss apt-get; do
+        for skip in "$@"; do [[ "$skip" == "$s" ]] && continue 2; done
+        ln -sf "$SSH_STUBS/$s" "$dir/$s"
+    done
+}
+SSHBIN="$SSHW/bin"
+SSHBIN_NOSSHD="$SSHW/bin-nosshd"
+SSHBIN_NOUSERADD="$SSHW/bin-nouseradd"
+SSHBIN_NOAPT="$SSHW/bin-noapt"
+mk_ssh_bin "$SSHBIN"
+mk_ssh_bin "$SSHBIN_NOSSHD" sshd
+mk_ssh_bin "$SSHBIN_NOUSERADD" useradd
+mk_ssh_bin "$SSHBIN_NOAPT" apt-get
+
+# --- fixtures ------------------------------------------------------------------------------------
+SSH_N=0
+ssh_new() { # fresh fake system; exports the paths the module and the stubs use
+    SSH_N=$((SSH_N + 1))
+    FIX="$SSHW/s$SSH_N"
+    rm -rf "$FIX"
+    mkdir -p "$FIX/home" "$FIX/proc/1" "$FIX/proc/self" "$FIX/backup" "$FIX/root" "$FIX/sshd_config.d" "$FIX/svc"
+    local u
+    for u in testadmin testuser primsudo legacy sysbash; do mkdir -p "$FIX/home/$u"; done
+    cat >"$FIX/passwd" <<PASSWD
+root:x:0:0:root:$FIX/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+www-data:x:33:33:www-data:$FIX/svc:/usr/sbin/nologin
+svcfalse:x:998:998::$FIX/svc:/bin/false
+sysbash:x:110:110::$FIX/home/sysbash:/bin/bash
+testadmin:x:2001:2001:Test Admin:$FIX/home/testadmin:/bin/bash
+testuser:x:2002:2002::$FIX/home/testuser:/bin/bash
+testnohome:x:2003:2003::$FIX/home/testnohome:/bin/bash
+primsudo:x:2004:27::$FIX/home/primsudo:/bin/bash
+legacy:\$6\$fakesalt\$FAKEHASHFAKEHASHFAKEHASH:2005:2005::$FIX/home/legacy:/bin/zsh
+PASSWD
+    cat >"$FIX/group" <<'GROUP'
+root:x:0:
+sudo:x:27:testadmin
+testadmin:x:2001:
+testuser:x:2002:
+GROUP
+    printf '%s\n' '# /etc/shells: valid login shells' /bin/sh /bin/bash /usr/bin/bash /bin/zsh >"$FIX/shells"
+    printf 'Name:\tinit\nUid:\t0\t0\t0\t0\n' >"$FIX/proc/1/status"
+    printf '4294967295' >"$FIX/proc/self/loginuid"
+    printf '22\n' >"$FIX/listen"
+    : >"$FIX/busy"
+    ssh_write_config
+    export FAKE_LOG="$FIX/log" FAKE_LISTEN="$FIX/listen" FAKE_BUSY="$FIX/busy" FAKE_SSHD="$SSH_STUBS/sshd"
+    export EZVPS_PASSWD_FILE="$FIX/passwd" EZVPS_GROUP_FILE="$FIX/group" EZVPS_SHELLS_FILE="$FIX/shells"
+    export EZVPS_PROC_DIR="$FIX/proc" EZVPS_HOME_BASE="$FIX/home" EZVPS_SSHD_CONFIG="$FIX/sshd_config"
+    export EZVPS_BACKUP_DIR="$FIX/backup" EZVPS_SSH_WAIT_SECONDS=0
+    : >"$FAKE_LOG"
+    unset SUDO_USER SUDO_UID SSH_CONNECTION FAKE_USERADD_FAIL FAKE_USERMOD_FAIL FAKE_USERMOD_NOOP FAKE_USERDEL_FAIL \
+        FAKE_PASSWD_RC FAKE_CHOWN_RC FAKE_SSHD_FAIL_AFTER_MANAGED FAKE_RESTART_FAIL FAKE_RESTART_FAIL_ONCE FAKE_NO_REBIND \
+        FAKE_SOCKET FAKE_SSH_DOWN
+}
+ssh_write_config() { # a Debian-style sshd_config with a cloud-init style drop-in that sets PasswordAuthentication
+    cat >"$FIX/sshd_config" <<CONF
+# This is the sshd server system-wide configuration file.
+Include $FIX/sshd_config.d/*.conf
+
+#Port 22
+#PermitRootLogin prohibit-password
+#PasswordAuthentication yes
+KbdInteractiveAuthentication no
+UsePAM yes
+X11Forwarding yes
+CONF
+    printf 'PasswordAuthentication yes\n' >"$FIX/sshd_config.d/50-cloud-init.conf"
+    chmod 644 "$FIX/sshd_config"
+}
+ssh_proc_for_uid() { # a fake running process owned by <uid>
+    mkdir -p "$FIX/proc/$2"
+    printf 'Name:\tbash\nUid:\t%s\t%s\t%s\t%s\n' "$1" "$1" "$1" "$1" >"$FIX/proc/$2/status"
+}
+run_ssh() { # run_ssh <stdin> [ezvps args]; environment comes from the caller
+    local input="$1"
+    shift
+    OUT="$(printf '%b' "$input" | PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" "${@:-ssh}" 2>&1)"
+    RC=$?
+}
+log_has() { grep -qF -- "$1" "$FAKE_LOG"; }
+log_lacks() { ! grep -qF -- "$1" "$FAKE_LOG"; }
+log_line() { grep -nF -- "$1" "$FAKE_LOG" | head -1 | cut -d: -f1; }
+log_after() { # log_after <first> <second>: both logged, first before second
+    local a b
+    a="$(log_line "$1")" b="$(log_line "$2")"
+    [[ -n "$a" && -n "$b" ]] && ((a < b))
+}
+nfiles() { # nfiles <dir> <glob>
+    local n=0 f
+    for f in "$1"/$2; do [[ -e "$f" ]] && n=$((n + 1)); done
+    printf '%s' "$n"
+}
+file_has() { grep -qF -- "$2" "$1"; }
+file_lacks() { ! grep -qF -- "$2" "$1"; }
+same_file() { cmp -s "$1" "$2"; }
+count_in_file() { grep -cF -- "$2" "$1"; }
+
+# fake keys: the right base64 prefix for the type, then filler. Not keys of anyone.
+SSH_BLOB_ED="AAAAC3NzaC1lZDI1NTE5$(printf 'FAKE%.0s' {1..12})"
+SSH_BLOB_ED2="AAAAC3NzaC1lZDI1NTE5$(printf 'WXYZ%.0s' {1..12})"
+SSH_BLOB_RSA="AAAAB3NzaC1y$(printf 'FAKE%.0s' {1..22})"
+SSH_KEY_LINE="ssh-ed25519 ${SSH_BLOB_ED} testuser@example.com"
+SSH_KEY_LINE2="ssh-ed25519 ${SSH_BLOB_ED2} second@example.com"
+# a private key header, assembled at run time so this file holds no key marker
+SSH_PRIV_HDR="-----BEGIN OPENSSH PRIVATE"" KEY-----"
+
+# --- submenu and dispatch --------------------------------------------------------------------------
+ssh_new
+run_ssh "0\n"
+for l in " 1) List users" " 2) Add user" " 3) Delete user" " 4) SSH settings" " 5) Add SSH key" " 0) Back"; do
+    check "SSH submenu line '${l}' is exact (clean label)" has_line "$OUT" "$l"
+done
+check "SSH submenu has exactly 5 numbered entries" equals "$(printf '%s\n' "$OUT" | grep -cE '^ *[1-9]\) ')" 5
+check "SSH module is no longer 'not implemented'" not_contains "$OUT" "is not implemented yet"
+check "SSH submenu exits 0 on 0" equals "$RC" 0
+run_ssh "" ssh
+check "SSH submenu exits 0 on EOF" equals "$RC" 0
+run_ssh "9\nabc\n0\n"
+check "SSH submenu reports an invalid choice" contains "$OUT" "Invalid choice: 9"
+check "SSH submenu reports a non-numeric choice" contains "$OUT" "Invalid choice: abc"
+OUT="$(printf '8\n0\n0\n' | PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" 2>&1)"
+check "main menu item 8 (SSH and Users) opens the submenu" contains "$OUT" " 4) SSH settings"
+
+# --- List users ----------------------------------------------------------------------------------
+echo "-- SSH and Users: list users"
+ssh_new
+run_ssh "1\nn\n0\n"
+check "list: root is shown with its UID" contains "$OUT" "root"
+for u in testadmin testuser primsudo legacy; do
+    check "list shows ${u} (login shell and home directory)" contains "$OUT" "$u"
+done
+check "list: sysbash (login shell and home, system UID) is shown with its UID" contains "$OUT" "sysbash                  110"
+check "list: header has USER, UID and SUDO" contains "$OUT" "USER                     UID      SUDO"
+check "list: testadmin UID and sudo=yes in one row" contains "$OUT" "testadmin                2001     yes"
+check "list: testuser UID and sudo=no in one row" contains "$OUT" "testuser                 2002     no"
+check "list: a user whose primary group is sudo has sudo=yes" contains "$OUT" "primsudo                 2004     yes"
+check "list: root is n/a for sudo" contains "$OUT" "root                     0        n/a"
+for u in daemon www-data svcfalse sync testnohome; do
+    check "list hides ${u} (nologin/false shell, pseudo shell or no home directory)" not_contains "$OUT" "$u  "
+done
+check "list never prints a password hash" not_contains "$OUT" "FAKEHASH"
+check "list never prints the hash prefix either" not_contains "$OUT" '$6$'
+check "list does not show the full list when declined" not_contains "$OUT" "All accounts:"
+run_ssh "1\ny\n0\n"
+check "full list on request" contains "$OUT" "All accounts:"
+check "full list shows a nologin service account" contains "$OUT" "www-data"
+check "full list shows a /bin/false account" contains "$OUT" "svcfalse"
+check "full list shows shells" contains "$OUT" "/usr/sbin/nologin"
+check "full list still never prints a password hash" not_contains "$OUT" "FAKEHASH"
+rm -f "$FIX/shells"
+run_ssh "1\nn\n0\n"
+check "without a shells file only nologin/false are filtered (testuser listed)" contains "$OUT" "testuser"
+check "without a shells file www-data is still hidden" not_contains "$OUT" "www-data"
+check "list needs no root/OS check (works on an unsupported system)" contains "$(EZVPS_SKIP_OS_CHECK=0 EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$SSHBIN" bash -c 'printf "1\nn\n0\n" | "$0" "$1" ssh 2>&1' "$BASH_BIN" "$EZVPS")" "testuser"
+
+# --- Add user ------------------------------------------------------------------------------------
+echo "-- SSH and Users: add user"
+ssh_new
+run_ssh "2\nnewuser\nn\ny\nn\n0\n"
+check "add (no sudo): exits 0" equals "$RC" 0
+check "add (no sudo): useradd creates a home and a bash shell" log_has "useradd --create-home --shell /bin/bash -- newuser"
+check "add (no sudo): the user is in passwd" file_has "$FIX/passwd" "newuser:x:2006:"
+check "add (no sudo): home directory exists" test -d "$FIX/home/newuser"
+check "add (no sudo): usermod is not called" log_lacks "usermod"
+check "add (no sudo): not in the sudo group" file_lacks "$FIX/group" "sudo:x:27:testadmin,newuser"
+check "add (no sudo): reports the created username" contains "$OUT" "Created user: newuser (UID 2006)"
+check "add (no sudo): reports sudo: no" contains "$OUT" "sudo     : no"
+check "add (no sudo): password is not set and passwd is not run" log_lacks "passwd"
+check "add (no sudo): says password login is locked" contains "$OUT" "not set (password login is locked)"
+check "add (no sudo): makes no backup for a new user" equals "$(nfiles "$FIX/backup" '*')" 0
+ssh_new
+run_ssh "2\nsudoer\ny\ny\nn\n0\n"
+check "add (sudo): usermod -aG sudo is the group method used" log_has "usermod -aG sudo -- sudoer"
+check "add (sudo): the group file lists the user in sudo" file_has "$FIX/group" "sudo:x:27:testadmin,sudoer"
+check "add (sudo): sudo is added to the sudo group only (one usermod call)" equals "$(grep -c '^usermod' "$FAKE_LOG")" 1
+check "add (sudo): reports sudo: yes" contains "$OUT" "sudo     : yes"
+check "add (sudo): reports the username" contains "$OUT" "Created user: sudoer"
+check "add (sudo): useradd ran before usermod" log_after "useradd" "usermod"
+ssh_new
+run_ssh "2\npwuser\nn\ny\ny\n0\n"
+check "add + password: passwd runs through the system prompt for that user" log_has "passwd -- pwuser"
+check "add + password: the (fake) system prompt was shown" contains "$OUT" "FAKE-PASSWD-PROMPT"
+check "add + password: reports it as set" contains "$OUT" "password : set with passwd"
+check "add + password: ezvps handles no password text (nothing but the prompt marker)" not_contains "$OUT" "Password:"
+FAKE_PASSWD_RC=10 run_ssh "2\npwfail\nn\ny\ny\n0\n"
+check "add: a failing passwd is reported with the manual command" contains "$OUT" "Set the password later with: passwd pwfail"
+check "add: a failing passwd still leaves the user created" file_has "$FIX/passwd" "pwfail:x:"
+ssh_new
+run_ssh "2\nnewuser\nn\nn\n0\n"
+check "add: declining the plan creates nothing" log_lacks "useradd"
+check "add: declining says nothing was changed" contains "$OUT" "Nothing was changed"
+for bad in "Bad Name" "1abc" "UPPER" "a;b" "../x" "-rf" "a.b" "user\$" "abcdefghijklmnopqrstuvwxyzabcdefg"; do
+    ssh_new
+    run_ssh "2\n${bad}\ny\ny\nn\n0\n"
+    check "add refuses invalid username '${bad}'" contains "$OUT" "Invalid username"
+    check "add: invalid username '${bad}' runs no useradd" log_lacks "useradd"
+done
+ssh_new
+run_ssh "2\ntestuser\n0\n"
+check "add refuses an existing username" contains "$OUT" "User 'testuser' already exists"
+check "add: existing username runs no useradd" log_lacks "useradd"
+run_ssh "2\nroot\n0\n"
+check "add refuses root as an existing username" contains "$OUT" "User 'root' already exists"
+printf 'groupy:x:3001:\n' >>"$FIX/group"
+run_ssh "2\ngroupy\n0\n"
+check "add refuses a name that is already a group" contains "$OUT" "A group named 'groupy' already exists"
+run_ssh "2\n\n0\n"
+check "add: empty username cancels" contains "$OUT" "Cancelled. Nothing was changed."
+FAKE_USERADD_FAIL=1 run_ssh "2\nnewuser\nn\ny\nn\n0\n"
+check "add: a failing useradd is reported and nothing else is done" contains "$OUT" "useradd did not create 'newuser'"
+check "add: a failing useradd runs no usermod" log_lacks "usermod"
+ssh_new
+FAKE_USERMOD_NOOP=1 run_ssh "2\nnoopuser\ny\ny\nn\n0\n"
+check "add: sudo membership is verified (usermod that did nothing is caught)" contains "$OUT" "Sudo access was NOT granted"
+check "add: unverified sudo is reported as sudo: no" contains "$OUT" "sudo     : no"
+ssh_new
+FAKE_USERMOD_FAIL=1 run_ssh "2\nfailuser\ny\ny\nn\n0\n"
+check "add: a failing usermod means sudo: no" contains "$OUT" "sudo     : no"
+# no sudo group: offer apt-get; decline, then create without sudo / cancel
+ssh_new
+printf 'root:x:0:\ntestuser:x:2002:\n' >"$FIX/group"
+run_ssh "2\nnosudo1\ny\nn\ny\ny\nn\n0\n"
+check "add: missing sudo group is explained" contains "$OUT" "the sudo package is not installed"
+check "add: apt-get is not run without a yes" log_lacks "apt-get install"
+check "add: user is created without sudo after the second question" file_has "$FIX/passwd" "nosudo1:x:"
+check "add: no usermod when sudo is unavailable" log_lacks "usermod"
+run_ssh "2\nnosudo2\ny\nn\nn\n0\n"
+check "add: declining 'create without sudo' cancels" file_lacks "$FIX/passwd" "nosudo2:x:"
+run_ssh "2\nnosudo3\ny\ny\ny\ny\nn\n0\n"
+check "add: apt-get installs sudo only after a yes" log_has "apt-get install -y -q sudo"
+check "add: after installing sudo the group method is used" log_has "usermod -aG sudo -- nosudo3"
+check "add: sudo granted after installing the package" file_has "$FIX/group" "nosudo3"
+OUT="$(printf '2\nnoapt\ny\ny\nn\n0\n' | PATH="$SSHBIN_NOAPT" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "add: without apt-get the sudo package is not offered (user can still be created without sudo)" not_contains "$OUT" "Install the sudo package"
+# system / tool checks
+ssh_new
+OUT="$(printf '2\nnewuser\n0\n' | PATH="$SSHBIN_NOUSERADD" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "add: missing useradd gives a clear message, nothing changed" contains "$OUT" "Required command(s) not found: useradd"
+OUT="$(printf '2\nnewuser\ny\ny\nn\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "add: unsupported system is refused with the shared message" contains "$OUT" "SSH and Users needs a supported system: ${OS_LIST_TEXT}; found 'ubuntu 25.10 questing'"
+check "add: unsupported system runs no useradd" log_lacks "useradd"
+for f in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    ssh_new
+    OUT="$(printf '2\nosuser\nn\ny\nn\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/$f" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+    check "add works on ${f} (same code path)" log_has "useradd --create-home --shell /bin/bash -- osuser"
+done
+OUT="$(printf '2\nnewuser\n0\n' | env EZVPS_ALLOW_NONROOT=0 PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+if ((EUID != 0)); then
+    check "add: a non-root run is refused by ezvps itself" contains "$OUT" "ezvps must be run as root."
+fi
+
+# --- Delete user ---------------------------------------------------------------------------------
+echo "-- SSH and Users: delete user"
+ssh_new
+run_ssh "3\nroot\n0\n"
+check "delete refuses root" contains "$OUT" "Refusing to delete root"
+check "delete root: userdel is never called" log_lacks "userdel"
+check "delete root: passwd file unchanged" file_has "$FIX/passwd" "root:x:0:0:"
+printf 'toor:x:0:0:toor:%s/root:/bin/bash\n' "$FIX" >>"$FIX/passwd"
+run_ssh "3\ntoor\n0\n"
+check "delete refuses any UID 0 account" contains "$OUT" "UID 0 is a root account"
+check "delete UID 0: userdel not called" log_lacks "userdel"
+SUDO_USER=testuser run_ssh "3\ntestuser\ny\n0\n"
+check "delete refuses the current user (sudo caller)" contains "$OUT" "that is the account you are logged in with"
+check "delete current user: userdel not called" log_lacks "userdel"
+printf '2002' >"$FIX/proc/self/loginuid"
+run_ssh "3\ntestuser\ny\n0\n"
+check "delete refuses the account that logged in (audit login uid)" contains "$OUT" "that is the account you are logged in with"
+check "delete login uid: userdel not called" log_lacks "userdel"
+printf '4294967295' >"$FIX/proc/self/loginuid"
+run_ssh "3\ndaemon\ny\n0\n"
+check "delete refuses a system account (UID below 1000)" contains "$OUT" "it is a system account"
+run_ssh "3\nsysbash\ny\n0\n"
+check "delete refuses a system UID even with a login shell" contains "$OUT" "it is a system account"
+check "delete system account: userdel not called" log_lacks "userdel"
+run_ssh "3\nnosuchuser\n0\n"
+check "delete reports an unknown user" contains "$OUT" "User 'nosuchuser' does not exist"
+run_ssh "3\nBad Name\n0\n"
+check "delete refuses an invalid username" contains "$OUT" "Invalid username"
+run_ssh "3\n\n0\n"
+check "delete: empty username cancels" contains "$OUT" "Cancelled. Nothing was changed."
+ssh_proc_for_uid 2002 4242
+run_ssh "3\ntestuser\ny\ny\n0\n"
+check "delete refuses a user with running processes" contains "$OUT" "1 process(es) are running as this user (PIDs: 4242)"
+check "delete with processes: does not offer an override or ask again" not_contains "$OUT" "Delete the user"
+check "delete with processes: userdel never called" log_lacks "userdel"
+check "delete with processes: user still in passwd" file_has "$FIX/passwd" "testuser:x:2002:"
+check "delete with processes: nothing was backed up or changed" equals "$(nfiles "$FIX/backup" '*')" 0
+ssh_new
+printf 'Name:\tbash\nUid:\t0\t2002\t2002\t2002\n' >"$FIX/proc/1/status"
+run_ssh "3\ntestuser\ny\n0\n"
+check "delete also sees a process whose effective UID matches" contains "$OUT" "process(es) are running as this user"
+ssh_new
+rm -rf "$FIX/proc"
+run_ssh "3\ntestuser\ny\n0\n"
+check "delete refuses when running processes cannot be checked" contains "$OUT" "Cannot check running processes"
+check "delete (no proc): userdel not called" log_lacks "userdel"
+# confirmations
+ssh_new
+run_ssh "3\ntestuser\nn\n0\n"
+check "delete: declining the confirmation changes nothing" log_lacks "userdel"
+check "delete: declining keeps the user" file_has "$FIX/passwd" "testuser:x:2002:"
+check "delete: declining makes no backup" equals "$(nfiles "$FIX/backup" '*')" 0
+run_ssh "3\ntestuser\ny\nn\n0\n"
+check "delete without the second confirmation: userdel has no -r" log_has "userdel -- testuser"
+check "delete without the second confirmation: no -r anywhere" log_lacks "userdel -r"
+check "delete: the account is gone from passwd" file_lacks "$FIX/passwd" "testuser:x:2002:"
+check "delete: the home directory is kept by default" test -d "$FIX/home/testuser"
+check "delete: reports the kept home directory" contains "$OUT" "home directory: kept"
+check "delete: reports the deletion" contains "$OUT" "Deleted user: testuser"
+check "delete: passwd and group are backed up first" equals "$(nfiles "$FIX/backup" 'users-*')" 2
+check "delete: the passwd backup is a byte-for-byte copy of the original" file_has "$(printf '%s' "$FIX"/backup/users-passwd.*)" "testuser:x:2002:"
+ssh_new
+run_ssh "3\ntestuser\ny\ny\n0\n"
+check "delete + home confirmed separately: userdel -r" log_has "userdel -r -- testuser"
+check "delete + home: the home directory is removed" test ! -e "$FIX/home/testuser"
+check "delete + home: the second warning names the path" contains "$OUT" "The home directory $FIX/home/testuser and everything in it can be deleted too"
+check "delete + home: reports it" contains "$OUT" "home directory: removed"
+ssh_new
+run_ssh "3\ntestuser\ny\nn\n0\n"
+check "the home directory prompt is a separate question (answering n keeps files)" test -d "$FIX/home/testuser"
+# home safety
+ssh_new
+printf 'outside:x:2010:2010::/srv/ezvps-fake-outside:/bin/bash\n' >>"$FIX/passwd"
+run_ssh "3\noutside\ny\ny\n0\n"
+check "delete: a home outside the home base is not offered for removal" contains "$OUT" "The home directory will be kept"
+check "delete: outside home -> userdel without -r" log_has "userdel -- outside"
+printf 'twin:x:2011:2011::%s/home/testadmin:/bin/bash\n' "$FIX" >>"$FIX/passwd"
+run_ssh "3\ntestadmin\ny\ny\n0\n"
+check "delete: a home shared with another account is not removed" contains "$OUT" "is shared with the account 'twin'"
+check "delete: shared home stays on disk" test -d "$FIX/home/testadmin"
+ssh_new
+mkdir -p "$FIX/elsewhere"
+rm -rf "$FIX/home/testuser"
+ln -s "$FIX/elsewhere" "$FIX/home/testuser"
+run_ssh "3\ntestuser\ny\ny\n0\n"
+check "delete: a symlinked home is never removed" contains "$OUT" "is a symbolic link"
+check "delete: symlink target untouched" test -d "$FIX/elsewhere"
+ssh_new
+FAKE_USERDEL_FAIL=1 run_ssh "3\ntestuser\ny\nn\n0\n"
+check "delete: a failing userdel is reported, user still listed" contains "$OUT" "userdel did not remove 'testuser'"
+ssh_new
+OUT="$(printf '3\ntestuser\ny\nn\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/debian11" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "delete: unsupported system is refused" contains "$OUT" "SSH and Users needs a supported system"
+check "delete: unsupported system runs no userdel" log_lacks "userdel"
+
+# --- SSH settings --------------------------------------------------------------------------------
+echo "-- SSH and Users: SSH settings"
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n0\n0\n"
+check "settings: submenu labels are clean" has_line "$OUT" " 1) SSH port"
+check "settings: PermitRootLogin item" has_line "$OUT" " 2) PermitRootLogin"
+check "settings: PasswordAuthentication item" has_line "$OUT" " 3) PasswordAuthentication"
+check "settings: offers only the three settings (no 4th item)" not_contains "$OUT" " 4) PermitEmptyPasswords"
+check "settings: shows the effective port" contains "$OUT" "Port                   : 22"
+check "settings: shows the effective PermitRootLogin" contains "$OUT" "PermitRootLogin        : prohibit-password"
+check "settings: shows the effective PasswordAuthentication from the drop-in" contains "$OUT" "PasswordAuthentication : yes"
+check "settings: just looking changes nothing (config identical)" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "settings: just looking makes no backup" equals "$(nfiles "$FIX/backup" '*')" 0
+# port change
+run_ssh "4\n1\n2222\ny\n0\n"
+check "port: the change is reported as verified" contains "$OUT" "Verified: sshd listens on port 2222."
+check "port: a backup of sshd_config was made first" equals "$(nfiles "$FIX/backup" 'sshd_config.*')" 1
+check "port: the backup is a byte-for-byte copy of the original" same_file "$(printf '%s' "$FIX"/backup/sshd_config.*)" "$FIX/sshd_config.orig"
+check "port: the new Port line is written" file_has "$FIX/sshd_config" "Port 2222"
+check "port: it sits above the Include so a drop-in cannot override it" test "$(grep -n '^Port 2222' "$FIX/sshd_config" | cut -d: -f1)" -lt "$(grep -n '^Include' "$FIX/sshd_config" | cut -d: -f1)"
+check "port: other lines are kept (Include, UsePAM, X11Forwarding)" contains "$(<"$FIX/sshd_config")" "UsePAM yes"
+check "port: file mode is preserved" equals "$(stat -c %a "$FIX/sshd_config")" 644
+check "port: sshd -t ran" log_has "sshd -t"
+check "port: sshd was restarted" log_has "systemctl restart ssh"
+check "port: sshd -t ran before the restart" log_after "sshd -t" "systemctl restart ssh"
+check "port: only sshd was restarted (not reloaded, not the socket)" log_lacks "restart ssh.socket"
+check "port: warns about the firewall" contains "$OUT" "allow port 2222 BEFORE you close the old one"
+check "port: tells you to test from a second terminal" contains "$OUT" "second terminal"
+check "port: no temp file left behind" equals "$(nfiles "$FIX" 'sshd_config.ezvps.*')" 0
+ssh_new
+printf 'Port 22\nPort 2200\n' >"$FIX/sshd_config.tmp"
+cat "$FIX/sshd_config" >>"$FIX/sshd_config.tmp"
+mv "$FIX/sshd_config.tmp" "$FIX/sshd_config"
+run_ssh "4\n1\n2222\ny\n0\n"
+check "port: existing active Port lines are commented out (Port is cumulative)" contains "$(<"$FIX/sshd_config")" "# ezvps disabled: Port 22"
+check "port: both old Port lines disabled" contains "$(<"$FIX/sshd_config")" "# ezvps disabled: Port 2200"
+check "port: exactly one active Port line remains" equals "$(grep -c '^Port ' "$FIX/sshd_config")" 1
+# re-run is idempotent
+n_before="$(nfiles "$FIX/backup" '*')"
+: >"$FAKE_LOG"
+run_ssh "4\n1\n2222\n0\n"
+check "port: choosing the current port again is a no-op" contains "$OUT" "already listens only on port 2222"
+check "port: the no-op makes no backup" equals "$(nfiles "$FIX/backup" '*')" "$n_before"
+check "port: the no-op does not restart sshd" log_lacks "systemctl restart"
+run_ssh "4\n1\n3333\ny\n0\n"
+check "port: a second change keeps one managed Port block" equals "$(count_in_file "$FIX/sshd_config" '# ezvps:managed Port')" 1
+check "port: a second change has one active Port line" equals "$(grep -c '^Port ' "$FIX/sshd_config")" 1
+check "port: the second change is the active one" file_has "$FIX/sshd_config" "Port 3333"
+# invalid / busy / declined
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+for bad in abc 0 80 1023 65536 99999 -5 "22 22" ""; do
+    run_ssh "4\n1\n${bad}\n0\n"
+    if [[ -z "$bad" ]]; then
+        check "port: an empty answer cancels" contains "$OUT" "Cancelled. Nothing was changed."
+    else
+        check "port: '${bad}' is refused" contains "$OUT" "Invalid port"
+    fi
+done
+check "port: refused input changes nothing" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "port: refused input makes no backup and restarts nothing" equals "$(nfiles "$FIX/backup" '*')-$(grep -c restart "$FAKE_LOG")" "0-0"
+printf '8080\n' >"$FIX/busy"
+run_ssh "4\n1\n8080\ny\n0\n"
+check "port: a port that another service uses is refused" contains "$OUT" "Something already listens on port 8080"
+check "port: busy port changes nothing" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n1\n2222\nn\n0\n"
+check "port: declining the confirmation changes nothing" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "port: declining makes no backup" equals "$(nfiles "$FIX/backup" '*')" 0
+SSH_CONNECTION="198.51.100.7 51234 192.0.2.10 22" run_ssh "4\n1\n2222\nn\n0\n"
+check "port: warns about the current SSH session" contains "$OUT" "connected over SSH right now"
+run_ssh "4\n1\n2222\nn\n0\n"
+check "port: no session warning when not on SSH" not_contains "$OUT" "connected over SSH right now"
+# failing sshd -t -> rollback, no restart
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+FAKE_SSHD_FAIL_AFTER_MANAGED=1 run_ssh "4\n1\n2222\ny\n0\n"
+check "sshd -t failure: the error is shown" contains "$OUT" "sshd -t rejected the new configuration"
+check "sshd -t failure: config rolled back byte for byte" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "sshd -t failure: says it rolled back" contains "$OUT" "Rolled back"
+check "sshd -t failure: sshd is NOT restarted" log_lacks "systemctl restart"
+check "sshd -t failure: says sshd was not restarted" contains "$OUT" "sshd was NOT restarted"
+check "sshd -t failure: the backup exists" equals "$(nfiles "$FIX/backup" 'sshd_config.*')" 1
+FAKE_SSHD_FAIL_AFTER_MANAGED=1 run_ssh "4\n3\n1\ny\ny\n0\n"
+check "sshd -t failure (auth setting): rolled back too" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "sshd -t failure (auth setting): never restarted" log_lacks "systemctl restart"
+# already broken config
+ssh_new
+printf 'BROKEN_DIRECTIVE yes\n' >>"$FIX/sshd_config"
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n1\n2222\ny\n0\n"
+check "broken config: ezvps refuses before changing anything" contains "$OUT" "sshd -t already fails on the current configuration"
+check "broken config: file untouched, no backup, no restart" equals "$(cksum <"$FIX/sshd_config")-$(nfiles "$FIX/backup" '*')-$(grep -c restart "$FAKE_LOG")" "$(cksum <"$FIX/sshd_config.orig")-0-0"
+# restart failure / not listening -> rollback
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+FAKE_RESTART_FAIL_ONCE=1 run_ssh "4\n1\n2222\ny\n0\n"
+check "restart failure: reported" contains "$OUT" "Restarting sshd failed"
+check "restart failure: config restored byte for byte" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "restart failure: sshd restarted again with the old config" contains "$OUT" "sshd was restarted with the previous configuration"
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+FAKE_NO_REBIND=1 run_ssh "4\n1\n2222\ny\n0\n"
+check "port not listening after restart: reported" contains "$OUT" "sshd is not listening on port 2222"
+check "port not listening after restart: config rolled back" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+FAKE_RESTART_FAIL=1 run_ssh "4\n1\n2222\ny\n0\n"
+check "restart that always fails: rolled back and the problem is reported" contains "$OUT" "could not be restarted after the rollback"
+check "restart that always fails: config restored" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+ssh_new
+FAKE_SOCKET=1 run_ssh "4\n1\n2222\ny\n0\n"
+check "socket activation: a port change reloads systemd and restarts ssh.socket" log_after "systemctl daemon-reload" "systemctl restart ssh.socket"
+check "socket activation: the port change is verified" contains "$OUT" "Verified: sshd listens on port 2222."
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+FAKE_SOCKET=1 FAKE_NO_REBIND=1 run_ssh "4\n1\n2222\ny\n0\n"
+check "socket activation that keeps the old port: rolled back and ssh.socket is named" contains "$OUT" "ssh.socket"
+check "socket activation that keeps the old port: config restored" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+ssh_new
+FAKE_SOCKET=1 run_ssh "4\n2\n1\ny\n0\n"
+check "socket activation: a non-port change leaves the socket alone" log_lacks "restart ssh.socket"
+# a drop-in that still adds a port -> the change would not take effect -> rolled back
+ssh_new
+printf 'Port 2200\n' >"$FIX/sshd_config.d/60-extra.conf"
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n1\n2222\ny\n0\n"
+check "effective check: a drop-in that adds another port is caught" contains "$OUT" "The change would not take effect"
+check "effective check: config rolled back" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "effective check: sshd not restarted" log_lacks "systemctl restart"
+# PermitRootLogin
+echo "-- SSH and Users: PermitRootLogin and PasswordAuthentication"
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n2\n1\ny\n0\n"
+check "root login no: a clear lock-out warning comes first" contains "$OUT" "Disabling root login over SSH can lock you out"
+check "root login no: notes that another sudo account exists" contains "$OUT" "Another account with sudo access exists"
+check "root login no: written" file_has "$FIX/sshd_config" "PermitRootLogin no"
+check "root login no: backed up byte for byte" same_file "$(printf '%s' "$FIX"/backup/sshd_config.*)" "$FIX/sshd_config.orig"
+check "root login no: tested before restart" log_after "sshd -t" "systemctl restart ssh"
+check "root login no: verified running" contains "$OUT" "Verified: sshd is running with PermitRootLogin no."
+run_ssh "4\n0\n0\n"
+check "root login no: the effective value changed" contains "$OUT" "PermitRootLogin        : no"
+ssh_new
+printf 'root:x:0:\nsudo:x:27:\ntestuser:x:2002:\n' >"$FIX/group"
+grep -v '^primsudo:' "$FIX/passwd" >"$FIX/passwd.new" && mv "$FIX/passwd.new" "$FIX/passwd"
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n2\n1\nn\n0\n"
+check "root login no without any sudo account: a stronger warning" contains "$OUT" "No other account with sudo access was found"
+check "root login no without a sudo account: declining the extra question changes nothing" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "root login no without a sudo account: no backup either" equals "$(nfiles "$FIX/backup" '*')" 0
+run_ssh "4\n2\n1\ny\ny\n0\n"
+check "root login no without a sudo account: can still be done after both yes" file_has "$FIX/sshd_config" "PermitRootLogin no"
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n2\n1\nn\n0\n"
+check "root login: declining the confirmation changes nothing" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n2\n2\n0\n"
+check "root login: choosing the current value is a no-op" contains "$OUT" "PermitRootLogin is already prohibit-password"
+run_ssh "4\n2\n3\ny\n0\n"
+check "root login yes: warns it is not recommended" contains "$OUT" "not recommended"
+check "root login yes: written" file_has "$FIX/sshd_config" "PermitRootLogin yes"
+run_ssh "4\n2\n9\n0\n"
+check "root login: an out-of-range choice cancels" contains "$OUT" "Cancelled. Nothing was changed."
+# PasswordAuthentication
+ssh_new
+mkdir -p "$FIX/home/testadmin/.ssh"
+printf '%s\n' "$SSH_KEY_LINE" >"$FIX/home/testadmin/.ssh/authorized_keys"
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n3\n1\ny\n0\n"
+check "password auth no: warns that only keys will work" contains "$OUT" "ONLY SSH keys work"
+check "password auth no: tells you to test a key login first" contains "$OUT" "Test a key login in a second terminal"
+check "password auth no: written above the Include" test "$(grep -n '^PasswordAuthentication no' "$FIX/sshd_config" | cut -d: -f1)" -lt "$(grep -n '^Include' "$FIX/sshd_config" | cut -d: -f1)"
+check "password auth no: the cloud-init style drop-in no longer wins (verified effective)" contains "$OUT" "Verified: sshd is running with PasswordAuthentication no."
+check "password auth no: the drop-in itself is untouched" equals "$(<"$FIX/sshd_config.d/50-cloud-init.conf")" "PasswordAuthentication yes"
+check "password auth no: backed up before the change" equals "$(nfiles "$FIX/backup" 'sshd_config.*')" 1
+check "password auth no: sshd -t before restart" log_after "sshd -t" "systemctl restart ssh"
+run_ssh "4\n3\n2\ny\n0\n"
+check "password auth yes: warns" contains "$OUT" "exposes the server to password guessing"
+check "password auth yes then no then yes: one managed block only" equals "$(count_in_file "$FIX/sshd_config" '# ezvps:managed PasswordAuthentication')" 1
+check "password auth yes: only one active PasswordAuthentication line" equals "$(grep -c '^PasswordAuthentication' "$FIX/sshd_config")" 1
+check "password auth: the commented default lines are kept as comments" file_has "$FIX/sshd_config" "#PasswordAuthentication yes"
+ssh_new
+cp -p "$FIX/sshd_config" "$FIX/sshd_config.orig"
+run_ssh "4\n3\n1\nn\n0\n"
+check "password auth no with no keys anywhere: a stronger warning" contains "$OUT" "No account has an authorized_keys file yet"
+check "password auth no with no keys: declining the extra question changes nothing" same_file "$FIX/sshd_config" "$FIX/sshd_config.orig"
+check "password auth no with no keys: no restart" log_lacks "systemctl restart"
+ssh_new
+run_ssh "4\n3\n1\ny\nn\n0\n"
+check "password auth no with no keys: the final question can still decline" file_lacks "$FIX/sshd_config" "PasswordAuthentication no"
+ssh_new
+printf 'KbdInteractiveAuthentication yes\n' >"$FIX/sshd_config.d/10-kbd.conf"
+mkdir -p "$FIX/home/testadmin/.ssh"
+printf '%s\n' "$SSH_KEY_LINE" >"$FIX/home/testadmin/.ssh/authorized_keys"
+run_ssh "4\n3\n1\ny\n0\n"
+check "password auth no: warns when keyboard-interactive can still ask for a password" contains "$OUT" "KbdInteractiveAuthentication is enabled"
+# Match block
+ssh_new
+printf 'Match User testuser\n    PasswordAuthentication yes\n' >>"$FIX/sshd_config"
+mkdir -p "$FIX/home/testadmin/.ssh"
+printf '%s\n' "$SSH_KEY_LINE" >"$FIX/home/testadmin/.ssh/authorized_keys"
+run_ssh "4\n3\n1\ny\n0\n"
+check "Match block that also sets the keyword: warned about" contains "$OUT" "A Match block in"
+check "Match block lines are left exactly as they were" file_has "$FIX/sshd_config" "    PasswordAuthentication yes"
+check "Match block line is not commented out" file_lacks "$FIX/sshd_config" "ezvps disabled:     PasswordAuthentication yes"
+# prerequisites
+ssh_new
+OUT="$(printf '4\n1\n2222\ny\n0\n' | PATH="$SSHBIN_NOSSHD" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "no sshd: a clear message, nothing changed" contains "$OUT" "sshd is not installed"
+check "no sshd: ezvps does not install it" log_lacks "apt-get"
+check "no sshd: no backup" equals "$(nfiles "$FIX/backup" '*')" 0
+ssh_new
+rm -f "$FIX/sshd_config"
+run_ssh "4\n1\n2222\ny\n0\n"
+check "missing sshd_config: a clear message" contains "$OUT" "Cannot read"
+ssh_new
+OUT="$(printf '4\n1\n2222\ny\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "settings change: unsupported system is refused before any prompt" contains "$OUT" "SSH and Users needs a supported system"
+check "settings change: unsupported system changes nothing" equals "$(nfiles "$FIX/backup" '*')-$(grep -c restart "$FAKE_LOG")" "0-0"
+for f in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    ssh_new
+    OUT="$(printf '4\n2\n1\ny\n0\n' | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/$f" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+    check "settings change works on ${f}" file_has "$FIX/sshd_config" "PermitRootLogin no"
+done
+
+# --- Add SSH key ---------------------------------------------------------------------------------
+echo "-- SSH and Users: add SSH key"
+ssh_new
+run_ssh "5\ntestuser\n${SSH_KEY_LINE}\ny\n0\n"
+AK="$FIX/home/testuser/.ssh/authorized_keys"
+check "key: a new authorized_keys is created" test -f "$AK"
+check "key: the key line is in it exactly once" equals "$(count_in_file "$AK" "$SSH_BLOB_ED")" 1
+check "key: authorized_keys is mode 600" equals "$(stat -c %a "$AK")" 600
+check "key: .ssh is mode 700" equals "$(stat -c %a "$FIX/home/testuser/.ssh")" 700
+check "key: ownership is set to the user's uid:gid on .ssh and authorized_keys" log_has "chown 2002:2002 $FIX/home/testuser/.ssh $AK"
+check "key: reports the user and file" contains "$OUT" "Key added for testuser: ${AK}"
+check "key: the key data is never printed" not_contains "$OUT" "$SSH_BLOB_ED"
+check "key: shows only the type and comment" contains "$OUT" "type    : ssh-ed25519"
+check "key: shows the comment" contains "$OUT" "comment : testuser@example.com"
+check "key: a new file needs no backup" equals "$(nfiles "$FIX/backup" '*')" 0
+check "key: no temp file left in .ssh" equals "$(nfiles "$FIX/home/testuser/.ssh" '.ezvps-ak.*')" 0
+check "key: advises testing before disabling passwords" contains "$OUT" "Test a key login in a second terminal"
+# append, no trailing newline in the old file, dir with loose modes
+ssh_new
+mkdir -p "$FIX/home/testuser/.ssh"
+chmod 755 "$FIX/home/testuser/.ssh"
+printf '%s' "$SSH_KEY_LINE2" >"$FIX/home/testuser/.ssh/authorized_keys"
+chmod 644 "$FIX/home/testuser/.ssh/authorized_keys"
+cp -p "$FIX/home/testuser/.ssh/authorized_keys" "$FIX/ak.orig"
+run_ssh "5\ntestuser\n${SSH_KEY_LINE}\ny\n0\n"
+AK="$FIX/home/testuser/.ssh/authorized_keys"
+check "append: the old key is still there" file_has "$AK" "$SSH_BLOB_ED2"
+check "append: the new key was appended" file_has "$AK" "$SSH_BLOB_ED"
+check "append: two lines (a missing final newline did not glue them)" equals "$(grep -c '' "$AK")" 2
+check "append: first line is the old key unchanged" equals "$(head -1 "$AK")" "$SSH_KEY_LINE2"
+check "append: modes are corrected to 600 / 700" equals "$(stat -c %a "$AK")-$(stat -c %a "$FIX/home/testuser/.ssh")" "600-700"
+check "append: the old file was backed up" equals "$(nfiles "$FIX/backup" 'authorized_keys-testuser.*')" 1
+check "append: the backup is a byte-for-byte copy" same_file "$(printf '%s' "$FIX"/backup/authorized_keys-testuser.*)" "$FIX/ak.orig"
+n_before="$(nfiles "$FIX/backup" '*')"
+run_ssh "5\ntestuser\n${SSH_KEY_LINE}\ny\n0\n"
+check "duplicate: the same key is not added twice" contains "$OUT" "already in"
+check "duplicate: still two lines" equals "$(grep -c '' "$AK")" 2
+check "duplicate: no new backup" equals "$(nfiles "$FIX/backup" '*')" "$n_before"
+# declined
+ssh_new
+run_ssh "5\ntestuser\n${SSH_KEY_LINE}\nn\n0\n"
+check "key: declining creates nothing" test ! -e "$FIX/home/testuser/.ssh"
+# private key refused (the header is assembled at run time; the "body" lines of a paste arrive as later prompts)
+ssh_new
+run_ssh "5\ntestuser\n${SSH_PRIV_HDR}\n0\n"
+check "private key: refused" contains "$OUT" "looks like a PRIVATE key"
+check "private key: nothing is written" test ! -e "$FIX/home/testuser/.ssh"
+check "private key: the header is never echoed back" not_contains "$OUT" "BEGIN OPENSSH"
+check "private key: no chown, no backup" equals "$(grep -c chown "$FAKE_LOG")-$(nfiles "$FIX/backup" '*')" "0-0"
+run_ssh "5\ntestuser\nssh-rsa ${SSH_BLOB_RSA} PRIVATE KEY\n0\n"
+check "private key: the words PRIVATE KEY in a pasted line are refused too" contains "$OUT" "looks like a PRIVATE key"
+run_ssh "5\ntestuser\nPuTTY-User-Key-File-3: ssh-ed25519\n0\n"
+check "private key: a PuTTY private key file is refused" contains "$OUT" "looks like a PRIVATE key"
+check "private key: nothing created for PuTTY keys either" test ! -e "$FIX/home/testuser/.ssh"
+# invalid public keys
+for bad in "hello world" "ssh-ed25519" "ssh-ed25519 notbase64!!!! c" "ssh-foo ${SSH_BLOB_ED} c" "ssh-rsa ${SSH_BLOB_ED} c" "ssh-ed25519 ${SSH_BLOB_RSA} c" "command=\"/bin/true\" ssh-ed25519 ${SSH_BLOB_ED} c" "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAA c" "-----BEGIN PUBLIC KEY-----" "ssh-ed25519 ${SSH_BLOB_ED}x c"; do
+    run_ssh "5\ntestuser\n${bad}\n0\n"
+    check "invalid key refused: '${bad:0:40}'" test -n "$(printf '%s\n' "$OUT" | grep -E 'does not look like an OpenSSH public key|not valid for type|PRIVATE key')"
+    check "invalid key '${bad:0:40}': authorized_keys not created" test ! -e "$FIX/home/testuser/.ssh"
+done
+for t in ecdsa-sha2-nistp256 ecdsa-sha2-nistp384 ecdsa-sha2-nistp521; do
+    case "$t" in
+        ecdsa-sha2-nistp256) pre="AAAAE2VjZHNhLXNoYTItbmlzdHAy" ;;
+        ecdsa-sha2-nistp384) pre="AAAAE2VjZHNhLXNoYTItbmlzdHAz" ;;
+        *) pre="AAAAE2VjZHNhLXNoYTItbmlzdHA1" ;;
+    esac
+    ssh_new
+    run_ssh "5\ntestuser\n${t} ${pre}$(printf 'FAKE%.0s' {1..10}) c\ny\n0\n"
+    check "key type ${t} is accepted" test -s "$FIX/home/testuser/.ssh/authorized_keys"
+done
+ssh_new
+run_ssh "5\ntestuser\nssh-rsa ${SSH_BLOB_RSA}\ny\n0\n"
+check "key type ssh-rsa (no comment) is accepted" test -s "$FIX/home/testuser/.ssh/authorized_keys"
+run_ssh "5\ntestuser\n-----BEGIN PUBLIC"" KEY-----\n0\n"
+check "key: a PEM public key is refused as not an OpenSSH key, not mislabelled as a private key" equals "$(contains "$OUT" "does not look like an OpenSSH public key" && ! contains "$OUT" "PRIVATE key" && echo ok)" ok
+run_ssh "5\ntestuser\n\n0\n"
+check "key: an empty key cancels" contains "$OUT" "Cancelled. Nothing was changed."
+# bad users / paths
+ssh_new
+run_ssh "5\nnosuchuser\n${SSH_KEY_LINE}\ny\n0\n"
+check "key: unknown user is refused" contains "$OUT" "User 'nosuchuser' does not exist"
+run_ssh "5\nBad Name\n0\n"
+check "key: invalid username is refused" contains "$OUT" "Invalid username"
+run_ssh "5\ntestnohome\n${SSH_KEY_LINE}\ny\n0\n"
+check "key: a user whose home directory is missing is refused (it is not created)" contains "$OUT" "is not an existing absolute directory"
+check "key: missing home is not created" test ! -e "$FIX/home/testnohome"
+rm -rf "$FIX/home/testuser/.ssh"
+mkdir -p "$FIX/elsewhere"
+ln -s "$FIX/elsewhere" "$FIX/home/testuser/.ssh"
+run_ssh "5\ntestuser\n${SSH_KEY_LINE}\ny\n0\n"
+check "key: a symlinked .ssh is refused" contains "$OUT" "symbolic link"
+check "key: nothing written through the symlink" equals "$(nfiles "$FIX/elsewhere" '*')" 0
+rm -f "$FIX/home/testuser/.ssh"
+mkdir -p "$FIX/home/testuser/.ssh"
+ln -s "$FIX/elsewhere/target" "$FIX/home/testuser/.ssh/authorized_keys"
+run_ssh "5\ntestuser\n${SSH_KEY_LINE}\ny\n0\n"
+check "key: a symlinked authorized_keys is refused" contains "$OUT" "symbolic link"
+check "key: nothing written through the authorized_keys symlink" test ! -e "$FIX/elsewhere/target"
+ssh_new
+FAKE_CHOWN_RC=1 run_ssh "5\ntestuser\n${SSH_KEY_LINE}\ny\n0\n"
+check "key: a failing chown is reported, not hidden" contains "$OUT" "Could not set up"
+check "key: a failing chown does not claim success" not_contains "$OUT" "Key added for"
+ssh_new
+run_ssh "5\nroot\n${SSH_KEY_LINE}\ny\n0\n"
+check "key: root can receive a key (its own home directory)" test -s "$FIX/root/.ssh/authorized_keys"
+check "key: root's authorized_keys is owned by uid 0" log_has "chown 0:0 $FIX/root/.ssh $FIX/root/.ssh/authorized_keys"
+ssh_new
+OUT="$(printf '5\ntestuser\n%s\ny\n0\n' "$SSH_KEY_LINE" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/ubuntu2510" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+check "key: unsupported system is refused before any prompt" contains "$OUT" "SSH and Users needs a supported system"
+check "key: unsupported system writes nothing" test ! -e "$FIX/home/testuser/.ssh"
+for f in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
+    ssh_new
+    OUT="$(printf '5\ntestuser\n%s\ny\n0\n' "$SSH_KEY_LINE" | env -u EZVPS_SKIP_OS_CHECK EZVPS_OS_RELEASE="$OSD/$f" PATH="$SSHBIN" "$BASH_BIN" "$EZVPS" ssh 2>&1)"
+    check "key works on ${f}" test -s "$FIX/home/testuser/.ssh/authorized_keys"
+done
+
+# --- source rules for the module -------------------------------------------------------------------
+ssh_body() { awk '/^(usr_|ssh_|module_ssh)[a-z_]*\(\) \{/ {on=1} on {print} /^}/ {on=0}' "$EZVPS"; }
+ssh_code() { ssh_body | grep -vE '^[[:space:]]*#'; }
+check "the module never reads /etc/shadow" not_contains "$(ssh_code)" "shadow"
+check "the module has no curl/wget" not_contains "$(ssh_code)" "curl"
+check "the module has no wget" not_contains "$(ssh_code)" "wget"
+check "the module never removes a home directory itself (only userdel -r does)" not_contains "$(ssh_code | grep -E 'rm[[:space:]]+-[a-z]*r')" "rm"
+check "the only password handling is the system's own passwd prompt" equals "$(ssh_code | grep -cE '^[[:space:]]*(if |! )?passwd[[:space:]]')" 1
+check "no password is read by the module (no read -s except the public key prompt)" equals "$(ssh_code | grep -cE 'read[^|]* -s')" 2
+check "passwd is only ever run as 'passwd -- <name>'" contains "$(ssh_code | grep -E '^[[:space:]]*(if |! )?passwd[[:space:]]')" 'passwd -- "$name"'
+check "the module uses no tool outside coreutils, bash and its listed commands" equals "$(ssh_code | grep -cE '(^|[[:space:]|(])(sed|awk|grep|perl|python3?|tee|ssh-keygen)[[:space:]]')" 0
+check "the module's functions are prefixed usr_ / ssh_" equals "$(grep -cE '^(usr|ssh)_[a-z_]+\(\) \{' "$EZVPS")" "$(ssh_body | grep -cE '^(usr|ssh)_[a-z_]+\(\) \{')"
+
+export EZVPS_NO_PAUSE="${SSH_SAVED_PAUSE:-0}"
+[[ -z "$SSH_SAVED_PAUSE" ]] && unset EZVPS_NO_PAUSE
+unset EZVPS_PASSWD_FILE EZVPS_GROUP_FILE EZVPS_SHELLS_FILE EZVPS_PROC_DIR EZVPS_HOME_BASE EZVPS_SSHD_CONFIG EZVPS_SSH_WAIT_SECONDS \
+    FAKE_LOG FAKE_LISTEN FAKE_BUSY FAKE_SSHD SUDO_USER SSH_CONNECTION
+if [[ -n "${LC_SAVED_BACKUP-}" ]]; then export EZVPS_BACKUP_DIR="$LC_SAVED_BACKUP"; else unset EZVPS_BACKUP_DIR; fi
 
 echo "== source rules"
 # curl may appear only in the 3x-ui functions that need it; never in the L2TP
