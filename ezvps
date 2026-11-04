@@ -3546,28 +3546,29 @@ LC_BACKPACK_CONF="${EZVPS_BACKPACK_CONF_DIR:-/etc/backpack}"
 LC_HOME="${HOME:-/root}"
 
 # Filled by lc_load (the per-tool table), lc_find and lc_version.
-LC_KEY="" LC_LABEL="" LC_CMD="" LC_PROJECT="" LC_KIND="" LC_URL="" LC_SHA="" LC_PIN_TEXT=""
+LC_KEY="" LC_LABEL="" LC_CMD="" LC_KIND="" LC_URL="" LC_SHA="" LC_PIN_TEXT=""
 LC_GIT_URL="" LC_GIT_COMMIT="" LC_ARCHES="" LC_VERSION_ARG="" LC_UNITS_GLOB="" LC_ASSET=""
-LC_NO_SERVICE_TEXT="" LC_UPDATE="" LC_UNINSTALL="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT=""
-LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=() LC_BINS_FOUND=()
+LC_UPDATE="" LC_UNINSTALL="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT="" LC_WHAT=""
+LC_RUN_INPUT=""
+LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_RUN_ARGS=() LC_BINS_FOUND=()
 LC_BIN_FOUND="" LC_VERSION=""
 
 # lc_load <key>: the per-tool table. Everything that differs between the tools
 # is here; the flow below is shared.
 lc_load() {
     LC_KEY="$1"
-    LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=()
+    LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_RUN_ARGS=()
     LC_URL="" LC_SHA="" LC_GIT_URL="" LC_GIT_COMMIT="" LC_UNITS_GLOB="" LC_VERSION_ARG=""
-    LC_NO_SERVICE_TEXT="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT=""
+    LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT="" LC_WHAT="" LC_RUN_INPUT=""
     case "$1" in
         backpack)
             LC_LABEL="Backpack" LC_CMD="backpack"
-            LC_PROJECT="https://github.com/${LC_BACKPACK_REPO}"
             # Upstream's one documented install: its own install.sh (docs/install.md).
             LC_KIND="script"
             LC_URL="https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh"
             LC_SHA="$LC_BACKPACK_SHA256"
-            LC_PIN_TEXT="release tag ${LC_BACKPACK_TAG}"
+            LC_PIN_TEXT="installer at tag ${LC_BACKPACK_TAG}"
+            LC_WHAT="Backpack (official installer script)"
             # README: "Supported release architectures currently include x86_64 -> amd64, aarch64 -> arm64".
             LC_ARCHES="x86_64 aarch64"
             LC_BINS=("${LC_PREFIX}/bin/backpack")
@@ -3578,63 +3579,51 @@ lc_load() {
             LC_UNINSTALL="menu"
             LC_UPDATE_HINT="In Backpack's menu choose 8 (Update), follow its prompts, then leave the menu (10, Exit)."
             LC_UNINSTALL_HINT="In Backpack's menu choose 9 (Uninstall) and answer its own confirmation."
-            LC_OPEN_HINT="run: backpack   (Backpack's own menu: Setup, Manage, Update, ...)"
-            LC_NOTES=(
-                "The installer downloads the latest release archive for this architecture from GitHub and"
-                "verifies it against the SHA256SUMS published with the release (it refuses an archive it cannot verify)."
-                "It installs ${LC_PREFIX}/bin/backpack and creates /etc/backpack and /root/BackPack."
-                "ezvps runs it with no terminal input, so it only installs: it does not open Backpack's menu."
-            )
+            LC_OPEN_HINT="backpack (its own menu)"
+            # Run: Backpack's documented open command is `backpack` (README: `sudo backpack`;
+            # ezvps already runs as root, so no sudo). Its menu needs the terminal.
+            LC_RUN_ARGS=() LC_RUN_INPUT="tty"
             ;;
         ctunnel)
             LC_LABEL="ctunnel" LC_CMD="ctunnel"
-            LC_PROJECT="https://github.com/${LC_CTUNNEL_REPO}"
             # Upstream has no installer script, no release and no tag: INSTALL/README say
             # `make; make install` from source. ezvps builds one pinned commit.
             LC_KIND="source"
             LC_GIT_URL="https://github.com/${LC_CTUNNEL_REPO}.git"
             LC_GIT_COMMIT="$LC_CTUNNEL_COMMIT"
-            LC_PIN_TEXT="commit ${LC_CTUNNEL_COMMIT} (upstream publishes no tags or releases)"
+            LC_PIN_TEXT="commit ${LC_CTUNNEL_COMMIT:0:12}"
+            LC_WHAT="ctunnel (built from source: make; make install)"
             # Upstream states no architecture list (a C source build); ezvps accepts the two
             # architectures of its supported systems.
             LC_ARCHES="x86_64 aarch64"
             LC_BINS=("${LC_PREFIX}/bin/ctunnel")
             LC_CONFIGS=("${LC_HOME}/.passkey") # README "Keys": ctunnel keeps its pre-shared key in ~/.passkey
             LC_VERSION_ARG="-v" # `ctunnel -v` (usage text); prints "ctunnel <major>.<minor> ..."
-            LC_NO_SERVICE_TEXT="none documented upstream (ctunnel is a command-line program started by hand)"
             LC_UPDATE="none"
             LC_UNINSTALL="remove"
             LC_REMOVE_PATHS=("${LC_PREFIX}/bin/ctunnel" "${LC_PREFIX}/share/man/man1/ctunnel.1") # what `make uninstall` removes
-            LC_OPEN_HINT="run: ctunnel -h   (a command-line tunnel program; see also: man ctunnel)"
-            LC_NOTES=(
-                "ctunnel has no installer script or release; upstream's documented install is 'make; make install'"
-                "from source (OpenSSL build, upstream default). ezvps fetches that one commit with git, builds it in a"
-                "temporary directory and installs ${LC_PREFIX}/bin/ctunnel and its man page."
-                "Build tools are needed: git, make, gcc, libssl-dev, zlib1g-dev (offered via apt-get if missing)."
-            )
+            LC_OPEN_HINT="ctunnel -h (command-line program; see man ctunnel)"
+            # Run: ctunnel has no interactive interface, and with no arguments it is not meant
+            # to be started from a menu. Run only shows its usage (`-h`) and never starts a tunnel.
+            LC_RUN_ARGS=("-h") LC_RUN_INPUT="null"
             ;;
         lazyports)
             LC_LABEL="Lazyports" LC_CMD="lazyports"
-            LC_PROJECT="https://github.com/${LC_LAZYPORTS_REPO}"
             # A prebuilt binary from the fork's GitHub release: no installer script, no Go, no build.
             # LC_URL is the release download directory; the asset names and the pinned SHA-256
             # per architecture are chosen by lc_select_asset.
             LC_KIND="binary"
             LC_URL="https://github.com/${LC_LAZYPORTS_REPO}/releases/download/${LC_LAZYPORTS_TAG}"
-            LC_PIN_TEXT="fork ${LC_LAZYPORTS_REPO} release ${LC_LAZYPORTS_TAG}, per-architecture SHA256 pinned, verified against the release SHA256SUMS"
+            LC_PIN_TEXT="release ${LC_LAZYPORTS_TAG}"
+            LC_WHAT="Lazyports (prebuilt release binary)"
             LC_ARCHES="x86_64 aarch64"
             LC_BINS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # new installs: /usr/local/bin; ~/go/bin is where a Go-built copy lives
-            LC_NO_SERVICE_TEXT="none documented upstream (Lazyports is an interactive terminal program)"
             LC_UPDATE="none"
             LC_UNINSTALL="remove"
             LC_REMOVE_PATHS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # both places Lazyports has ever been installed to
-            LC_OPEN_HINT="run: lazyports   (its own terminal interface)"
-            LC_NOTES=(
-                "Lazyports is a prebuilt binary from the fork's release: no Go is needed and nothing is built."
-                "The binary must match BOTH the release SHA256SUMS and the SHA-256 pinned in ezvps, or nothing is installed."
-                "It is installed to ${LC_PREFIX}/bin/lazyports (mode 755). No shell startup file is changed."
-                "A copy installed the old way (Go build) in ${LC_HOME}/go/bin is left alone; Uninstall removes both places."
-            )
+            LC_OPEN_HINT="lazyports (its own terminal interface; q quits)"
+            # Run: the TUI in the foreground, with the real terminal.
+            LC_RUN_ARGS=() LC_RUN_INPUT="tty"
             ;;
         *) return 1 ;;
     esac
@@ -3748,36 +3737,14 @@ lc_backup_all() {
     return 0
 }
 
+# lc_show_plan: three lines (what, version, destination). The project and download URLs,
+# the pinned hashes and the per-tool notes are in README.md and SPEC.md 6.5 to 6.7; the
+# hashes are still checked, and a mismatch is reported with both values.
 lc_show_plan() {
-    local n
     info ""
-    info "ezvps will install ${LC_LABEL} (this system and architecture are supported):"
-    info "  project:   ${LC_PROJECT}"
-    if [[ "$LC_KIND" == "script" ]]; then
-        info "  installer: ${LC_URL}"
-        info "  pinned to: ${LC_PIN_TEXT}"
-        info "  sha256:    ${LC_SHA} (expected)"
-        info "The installer is saved to a temporary directory and checked against that hash first;"
-        info "it is never piped into a shell."
-    elif [[ "$LC_KIND" == "binary" ]]; then
-        info "  binary:    ${LC_URL}/${LC_ASSET}"
-        info "  checksums: ${LC_URL}/SHA256SUMS"
-        info "  pinned to: ${LC_PIN_TEXT}"
-        info "  sha256:    ${LC_SHA} (expected for ${LC_ASSET})"
-        info "Both files are saved to a temporary directory and the binary is checked against the"
-        info "pinned hash and the downloaded SHA256SUMS first; it is installed only if both match."
-    else
-        info "  source:    ${LC_GIT_URL}"
-        info "  pinned to: ${LC_PIN_TEXT}"
-        info "The commit is fetched with git into a temporary directory and checked before it is built."
-    fi
-    for n in "${LC_NOTES[@]}"; do
-        info "  ${n}"
-    done
-    info "Existing config and binaries are backed up to ${NGX_BACKUP_BASE}/ first."
-    info "ezvps does not start ${LC_LABEL} and asks for no tunnel settings, tokens or ports:"
-    info "all setup stays in ${LC_LABEL}'s own interface."
-    info ""
+    info "Install:     ${LC_WHAT}"
+    info "Version:     ${LC_PIN_TEXT}"
+    info "Destination: ${LC_BINS[0]}"
 }
 
 # Downloads the pinned installer or release file and nothing else (the only curl for these tools).
@@ -3813,7 +3780,7 @@ lc_run_script() {
         err "Cannot create a temporary directory."
         return 1
     }
-    info "Downloading ${LC_URL}"
+    info "Downloading the ${LC_LABEL} installer..."
     if ! lc_fetch_installer "${tmp}/install.sh"; then
         err "Download failed: ${LC_URL}"
         rm -rf "$tmp"
@@ -3832,8 +3799,7 @@ lc_run_script() {
         rm -rf "$tmp"
         return 1
     fi
-    info "Downloaded installer matches the pinned sha256."
-    info "Running the ${LC_LABEL} installer (no terminal input, so it will not open ${LC_LABEL})..."
+    info "Running the ${LC_LABEL} installer (sha256 verified)..."
     bash "${tmp}/install.sh" </dev/null
     rc=$?
     rm -rf "$tmp"
@@ -3900,14 +3866,14 @@ lc_run_binary() {
         err "Cannot create a temporary directory."
         return 1
     }
-    info "Downloading ${LC_URL}/${LC_ASSET}"
+    info "Downloading ${LC_ASSET}..."
     if ! lc_fetch_installer "${tmp}/${LC_ASSET}" "${LC_URL}/${LC_ASSET}"; then
         err "Download failed: ${LC_URL}/${LC_ASSET}"
         err "(A 404 means that release asset does not exist.) Nothing was installed; there is no fallback to another install method."
         rm -rf "$tmp"
         return 1
     fi
-    info "Downloading ${LC_URL}/SHA256SUMS"
+    info "Downloading SHA256SUMS..."
     if ! lc_fetch_installer "${tmp}/SHA256SUMS" "${LC_URL}/SHA256SUMS"; then
         err "Download failed: ${LC_URL}/SHA256SUMS"
         err "(A 404 means the release has no SHA256SUMS file.) Nothing was installed; there is no fallback to another install method."
@@ -3940,7 +3906,6 @@ lc_run_binary() {
         rm -rf "$tmp"
         return 1
     fi
-    info "Downloaded ${LC_ASSET} matches the pinned sha256 and the release SHA256SUMS."
     lc_backup_all || {
         rm -rf "$tmp"
         return 1
@@ -3958,7 +3923,7 @@ lc_run_binary() {
         err "The installed ${dest} does not match the verified download; ${LC_LABEL} is NOT installed correctly."
         return 1
     fi
-    info "Installed ${dest} (mode 755, release ${LC_LAZYPORTS_TAG}, sha256 verified)."
+    info "Installed ${dest} (mode 755, sha256 verified)."
     if [[ -e "${LC_HOME}/go/bin/lazyports" ]]; then
         info "Note: an older copy from a Go build is still at ${LC_HOME}/go/bin/lazyports; Uninstall removes both."
     fi
@@ -3972,7 +3937,7 @@ lc_run_source() {
         err "Cannot create a temporary directory."
         return 1
     }
-    info "Fetching ${LC_GIT_URL} at commit ${LC_GIT_COMMIT}..."
+    info "Fetching ${LC_LABEL} source (${LC_PIN_TEXT})..."
     if ! lc_fetch_source "${tmp}/src"; then
         err "Could not fetch commit ${LC_GIT_COMMIT} from ${LC_GIT_URL}."
         rm -rf "$tmp"
@@ -3998,28 +3963,20 @@ lc_run_source() {
     return 0
 }
 
-# lc_report_installed <old version>: verify the binary exists after an install.
+# lc_report_installed <old version>: verify the binary exists after an install and say
+# so in one line. The binary install already printed its own line (mode, hash).
 lc_report_installed() {
-    local old="$1"
+    local old="$1" v
     lc_find
     if [[ -z "$LC_BIN_FOUND" ]]; then
         err "The installer finished, but no ${LC_CMD} binary was found in ${LC_BINS[*]}. ${LC_LABEL} is NOT installed."
         return 1
     fi
+    [[ "$LC_KIND" == "binary" ]] && return 0
     lc_version "$LC_BIN_FOUND"
-    info ""
-    info "Installed: ${LC_BIN_FOUND}"
-    if [[ -n "$LC_VERSION_ARG" ]]; then
-        if [[ -n "$old" && -n "$LC_VERSION" ]]; then
-            info "Version:   ${old}  ->  ${LC_VERSION}"
-        else
-            info "Version:   ${LC_VERSION:-unknown (the version command printed nothing)}"
-        fi
-    else
-        info "Version:   not reported (${LC_LABEL} documents no version command)"
-    fi
-    info "To open ${LC_LABEL}: ${LC_OPEN_HINT}"
-    info "ezvps does not open it for you; tunnels, ports and tokens are set up there."
+    v="${LC_VERSION:-unknown}"
+    [[ -n "$old" && -n "$LC_VERSION" ]] && v="${old} -> ${LC_VERSION}"
+    info "Installed ${LC_BIN_FOUND} (version ${v})."
     return 0
 }
 
@@ -4082,11 +4039,8 @@ lc_install() { lc_install_flow install; }
 # lc_print_services: documented systemd units, if upstream documents any.
 lc_print_services() {
     local line unit load active sub n=0
-    if [[ -z "$LC_UNITS_GLOB" ]]; then
-        info "  Service:    ${LC_NO_SERVICE_TEXT}"
-        info "              so ezvps reports installed + binary present, not running or stopped."
-        return 0
-    fi
+    # No documented service (ctunnel, Lazyports): nothing to report, nothing invented.
+    [[ -n "$LC_UNITS_GLOB" ]] || return 0
     if ! have_cmd systemctl; then
         info "  Services:   systemctl not found; ${LC_UNITS_GLOB} not checked"
         return 0
@@ -4116,14 +4070,12 @@ lc_status() {
     for b in "${LC_BINS_FOUND[@]}"; do
         info "  Binary:     ${b}"
     done
-    lc_version "$LC_BIN_FOUND"
     if [[ -n "$LC_VERSION_ARG" ]]; then
-        info "  Version:    ${LC_VERSION:-unknown (the version command printed nothing)}"
-    else
-        info "  Version:    not reported (${LC_LABEL} documents no version command)"
+        lc_version "$LC_BIN_FOUND"
+        info "  Version:    ${LC_VERSION:-unknown}"
     fi
     lc_print_services
-    info "  Open it:    ${LC_OPEN_HINT}"
+    info "  Open:       Run, or type: ${LC_OPEN_HINT}"
     return 0
 }
 
@@ -4139,6 +4091,28 @@ lc_launch_menu() {
     info ""
     ((rc != 0)) && warn "${LC_LABEL} exited with status ${rc}."
     info "Returned to ezvps."
+    return 0
+}
+
+# lc_run_tool: Run in the submenu. Starts the installed binary in the foreground with the
+# per-tool arguments from lc_load (LC_RUN_ARGS) and returns to the submenu when it exits.
+# Interactive tools (LC_RUN_INPUT=tty) inherit the real terminal: no pipe, no redirect, no
+# background job. ctunnel only gets `-h` with /dev/null as input, so it never starts a tunnel.
+# A missing tool is never run.
+lc_run_tool() {
+    local rc
+    lc_find
+    if [[ -z "$LC_BIN_FOUND" ]]; then
+        info "${LC_LABEL} is not installed. Install it first."
+        return 0
+    fi
+    if [[ "$LC_RUN_INPUT" == "tty" ]]; then
+        "$LC_BIN_FOUND" "${LC_RUN_ARGS[@]}"
+    else
+        "$LC_BIN_FOUND" "${LC_RUN_ARGS[@]}" </dev/null
+    fi
+    rc=$?
+    ((rc != 0)) && info "${LC_LABEL} exited with status ${rc}."
     return 0
 }
 
@@ -4239,7 +4213,7 @@ lc_uninstall() {
 
 lc_module() { # lc_module <key>: the shared submenu
     local choice i
-    local labels=("Install" "Status" "Update" "Uninstall")
+    local labels=("Install" "Status" "Update" "Uninstall" "Run")
     lc_load "$1" || return 0
     while true; do
         info ""
@@ -4261,6 +4235,7 @@ lc_module() { # lc_module <key>: the shared submenu
             2) lc_status || true ;;
             3) lc_update || true ;;
             4) lc_uninstall || true ;;
+            5) lc_run_tool || true ;;
             *)
                 warn "Invalid choice: ${choice:-<empty>}"
                 ;;
