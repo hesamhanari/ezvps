@@ -13,8 +13,8 @@ a supported install already has (bash, coreutils, systemd); anything else a
 module needs is checked with `command -v` first and installed only with the
 user's say-so (3x-ui: `curl`; Nginx: `curl`, `gnupg` and the nginx.org `nginx` package itself;
 Certificates: `curl` and the pinned acme.sh script; Backpack and Lazyports: `curl`;
-ctunnel: `git`, `make`, `gcc` and the OpenSSL and zlib development packages. Lazyports needs
-Go, which ezvps never installs; SSH and Users: `sudo`, only when you ask for sudo access on a
+ctunnel: `git`, `make`, `gcc` and the OpenSSL and zlib development packages. Lazyports is a
+prebuilt binary and needs no Go; SSH and Users: `sudo`, only when you ask for sudo access on a
 system without it. It never installs the OpenSSH server; Firewall: nothing, it uses the firewall
 backend that is already present and never installs one; Check For Updates and Update ezvps: `git`, only to fetch
 the private repository with the user's own authentication, never installed by ezvps; Backup, Restore and Uninstall:
@@ -101,7 +101,7 @@ Per module:
   | acme.sh (PR 8) | the same pinned script, `bash ./acme.sh --install`; needs `openssl` (always present), `curl`, optionally `crontab` | identical | one path |
   | `http2 on;` in the HTTPS site (PR 8) | needs nginx 1.25.1+; the module only ever installs nginx.org stable 1.30+ | identical | one path |
   | certificate store `/etc/ssl/ezvps` (PR 8) | no package owns it | no package owns it (Ubuntu's `ssl-cert` group is not used) | one path |
-  | Backpack, ctunnel, Lazyports (PR 9) | upstream installers branch on nothing distro-specific (Backpack's `install.sh` keys on `uname -m` only; ctunnel is `make`; Lazyports is `go install`); apt package names `git make gcc libssl-dev zlib1g-dev curl` are identical | identical | one path (Go is not installed by ezvps, so the distro's Go version only matters to Lazyports, see 6.7) |
+  | Backpack, ctunnel, Lazyports (PR 9) | upstream installers branch on nothing distro-specific (Backpack's `install.sh` keys on `uname -m` only; ctunnel is `make`; Lazyports is a prebuilt release binary chosen by `uname -m`); apt package names `git make gcc libssl-dev zlib1g-dev curl` are identical | identical | one path (no Go is involved, see 6.7) |
   | SSH and Users (PR 10) | `useradd`/`usermod`/`userdel`/`passwd` (shadow-utils), group `sudo` (only when the `sudo` package is installed, which a minimal Debian image may lack), `ssh.service` | same commands; group `sudo`; sudo is preinstalled; **Ubuntu 22.10+ starts sshd through `ssh.socket`**, whose port is not always taken from `sshd_config` | one code path. The group name (`sudo`, not `wheel`) and the documented command (`usermod -aG sudo <user>`) are the same on both. The socket difference is handled by *verifying* that sshd listens on the new port after a port change and rolling back if it does not (6.8); ezvps does not branch on the distro for it |
   | Backup, Check For Updates, Uninstall (PR 12) | coreutils (`cp`, `mv`, `rm`, `mkdir`, `mktemp`, `date`, `chmod`, `stat`, `du`, `cmp`, `sha256sum`) and `git` have the same arguments and the same package names (`git`) | same | one code path. Restoring nginx sites uses the same `nginx -t` and `systemctl` as the Nginx module on all five systems; `/etc/nginx/conf.d` is the nginx.org layout everywhere |
   | Firewall (PR 11) | which backend exists differs by image (Ubuntu usually ships `ufw`; Debian usually has `nftables`/`iptables`), not by release: `ufw`, `firewall-cmd`, `nft` and `iptables` take the same arguments on all five systems | same | one code path. The backend is chosen by which command is present, in the fixed order of 6.9, never by `ID`; ezvps does not branch on the distro |
@@ -1033,7 +1033,7 @@ says so and does not guess (no invented service, version flag or update command)
    `<Label> is already installed (<path>[, version <v>]).` and ask before reinstalling;
    `n` changes nothing, makes no download and no backup.
 3. Prerequisites: installer tools need `sha256sum` and `curl` (`curl` is offered via
-   `apt-get` after a yes, as elsewhere); Lazyports needs `go` (6.7); ctunnel needs `git`,
+   `apt-get` after a yes, as elsewhere); Lazyports needs only `sha256sum` and `curl`, no Go (6.7); ctunnel needs `git`,
    `make`, `gcc` (offered via one `apt-get install git make gcc libssl-dev zlib1g-dev`
    after a yes).
 4. The plan is printed before anything is fetched: project, installer URL or git URL, the
@@ -1059,7 +1059,11 @@ modules), hashed, compared with the pinned SHA-256 and **refused on a mismatch**
 with `bash <file> </dev/null` (the script's terminal input is `/dev/null`: Backpack's
 installer would otherwise open Backpack's menu on a terminal, and ezvps must not launch the
 tool). It is never piped or process-substituted into a shell. Nothing from the network is
-run without the URL and pin having been shown and a yes. The pins live in `ezvps` as
+run without the URL and pin having been shown and a yes. Lazyports is the exception to
+"installer script": it downloads a prebuilt release binary and its `SHA256SUMS` through the
+same `lc_fetch_installer`, runs nothing it downloaded, and installs the binary only when it
+matches both the pinned hash and the `SHA256SUMS` entry (6.7); for it the existing binary is
+backed up after that verification, not before, so a refused download changes nothing at all. The pins live in `ezvps` as
 `LC_BACKPACK_*`, `LC_CTUNNEL_*`, `LC_LAZYPORTS_*`; to bump one, read the upstream file at
 the new tag or commit, change the tag/commit and the hash together, update 6.5 to 6.7 and
 run the tests (`tests/lint.sh` checks that the pins exist and are well formed).
@@ -1178,41 +1182,49 @@ printed.
   reported and not touched.
 * Tunnels, ciphers, keys, VPN mode: the `ctunnel` command line only.
 
-### 6.7 Lazyports (PR 9, done)
+### 6.7 Lazyports (PR 9, done; install switched to a prebuilt binary)
 
-* Project: <https://github.com/v9mirza/lazyports> (public). Read at commit
-  `84647db0ea0e0c7b90b247e35a6c47d44d4bba95` (`README.md`, `install.sh`, `go.mod`,
-  `main.go`). A Go terminal UI; no releases, tags, services, config files or version flag.
-* **Install:** upstream's documented install is its `install.sh`
-  (`curl -sL https://raw.githubusercontent.com/v9mirza/lazyports/main/install.sh | bash`).
-  ezvps downloads the same script **at that commit, never `main`**, **exact URL**
-  `https://raw.githubusercontent.com/v9mirza/lazyports/84647db0ea0e0c7b90b247e35a6c47d44d4bba95/install.sh`,
-  expected SHA-256 `6324d8c6e4fe736f994e41de5a985040b0d4d6b734968f0ad554833ca0940a60`,
-  and runs it with `</dev/null`. The script requires Go (it exits with "Go is not installed"
-  otherwise), runs `GOPROXY=direct go install github.com/v9mirza/lazyports@main`, copies the
-  binary from `$(go env GOPATH)/bin` to `/usr/local/bin/lazyports`, and, when that Go bin
-  directory is not on `PATH`, **appends an `export PATH=...` line to `~/.bashrc` or
-  `~/.zshrc`**. Honest limit, shown in the plan: the script is pinned and hash-checked but
-  `go install ...@main` builds upstream's **current main branch**, which cannot be pinned
-  without changing upstream's script.
-* **Go:** required, never installed by ezvps (upstream: "Please install Go"). Missing =
-  refuse with the Go install URL, nothing changed. `go.mod` needs Go 1.24 (toolchain
-  go1.24.12): below 1.21 (cannot fetch a newer toolchain) is refused, 1.21 to 1.23 is
-  warned about (Go will try to download the toolchain; the installer reports failure
-  otherwise), 1.24 and newer pass.
-* **Architectures:** upstream states none (a Go source build). ezvps accepts `x86_64` and
-  `aarch64`.
-* **Config backed up:** Lazyports has no config. The files its installer may change are
-  backed up first: the existing `~/.bashrc` and `~/.zshrc`, plus any installed binary.
-* **Binary:** `/usr/local/bin/lazyports` or `~/go/bin/lazyports` (README).
+* Project: the fork <https://github.com/hesamhanari/LazyPorts> (a terminal UI for listening
+  ports; no services, config files or version flag). The earlier install built upstream
+  `v9mirza/lazyports` with `go install`; that path is **gone**: no Go is needed, called,
+  checked, downloaded or installed, and no shell startup file (`~/.bashrc`, `~/.zshrc`) is
+  touched.
+* **Install:** ezvps downloads the prebuilt binary of **release `v0.1.0`** of the fork, never
+  a branch and never a "latest" lookup. Architecture (`uname -m`): `x86_64` ->
+  `lazyports-linux-amd64`, `aarch64` -> `lazyports-linux-arm64`; any other architecture is
+  refused with the usual "does not support architecture" message and nothing is changed.
+  **Exact URLs** (a release download directory, `<asset>` is the name above):
+  `https://github.com/hesamhanari/LazyPorts/releases/download/v0.1.0/<asset>` and
+  `https://github.com/hesamhanari/LazyPorts/releases/download/v0.1.0/SHA256SUMS`.
+  Pinned SHA-256 per architecture:
+  * amd64: `edf030c28163605f360097ece2a2207619f88bab0446b22a52a3863971eb8f87`
+  * arm64: `9d4eb016a4df7ae3ff0a5b7f67ec830c36e9978c0fd72d28ab0f4d3150538b8a`
+
+  Pin text shown in the plan: *fork hesamhanari/LazyPorts release v0.1.0, per-architecture
+  SHA256 pinned, verified against the release SHA256SUMS*. Both files are downloaded to a
+  temporary directory (`curl --proto =https --tlsv1.2`); the binary is installed **only if**
+  its `sha256sum` equals the pinned value **and** the entry for that asset in the downloaded
+  `SHA256SUMS`. A mismatch against either, a `SHA256SUMS` without an entry for the asset, or
+  any failed download (a 404 included) aborts with a clear message, installs nothing and has
+  **no fallback** to a Go build or any other source. Only then is any existing binary backed
+  up (`/var/backups/ezvps/lazyports-<n>-lazyports.<timestamp>`) and the new one installed to
+  `/usr/local/bin/lazyports` with mode 755 (copied beside it, then moved into place, then the
+  hash of the installed file is checked again). Never installed to `~/go/bin`.
+* **Go:** not required. `lc_check_go` does not exist any more.
+* **Architectures:** `x86_64` and `aarch64` only.
+* **Config backed up:** Lazyports has no config and ezvps no longer touches shell startup
+  files; only the existing binaries (see Binary) are backed up.
+* **Binary:** `/usr/local/bin/lazyports` (new installs) or `~/go/bin/lazyports` (a copy
+  installed the old Go way). Status finds both, and so does Uninstall, so an old Go-built
+  install is still detected and removed. A reinstall while an old `~/go/bin` copy exists
+  installs to `/usr/local/bin` and says the old copy is left alone.
 * **Version:** none documented; Status prints `not reported`. No `--version` is guessed.
 * **Services:** none (an interactive TUI): Status says so.
-* **Update:** upstream documents **no update command**; Update says so and offers the
-  documented reinstall (the same installer, which rebuilds the current upstream `main`).
-* **Uninstall:** documented as removing the binary (README "Uninstallation": `sudo rm
-  /usr/local/bin/lazyports` and `rm ~/go/bin/lazyports`). ezvps lists the paths that exist,
-  asks, backs up, removes exactly those and verifies. The PATH line the installer added to a
-  shell startup file is **not** removed (upstream does not document it); the message says
+* **Update:** unchanged: no update command is documented for Lazyports, so Update says so
+  and offers the same reinstall (the pinned release above). There is **no latest-release
+  check**; a later PR can add Update against the fork's releases.
+* **Uninstall:** removes exactly `/usr/local/bin/lazyports` and `~/go/bin/lazyports` (the
+  paths that exist), after a yes and a backup, and verifies. Nothing else is deleted;
   shell startup files stay as they are.
 * Everything the TUI does (filter, sort, kill): Lazyports itself.
 
@@ -1950,9 +1962,12 @@ Defaults are the real paths; none of these relax a check on a real server.
   **Backpack, ctunnel and Lazyports** (`== Backpack, ctunnel and Lazyports lifecycle
   modules`) share one section, run against **fake binaries and fake installers**: a fake
   `backpack` (its `version` command, and a tiny menu that reads `8` Update / `9` Uninstall /
-  `10` Exit from stdin and records that it was opened), fake official installers for Backpack
-  and Lazyports (they record their arguments, whether they received terminal input and the
-  environment, and write the fake binary; Lazyports' also appends a PATH line to `~/.bashrc`),
+  `10` Exit from stdin and records that it was opened), fake official installer for Backpack
+  (it records its arguments, whether it received terminal input and the environment, and writes
+  the fake binary), a fake Lazyports release directory (`lc_lz_release`: the two fake binaries
+  and a `SHA256SUMS`, with variants for a tampered binary, a `SHA256SUMS` that disagrees, a
+  missing entry and a 404; the fake `sha256sum` derives the hash from the fake binary's content,
+  because the pinned hashes belong to the real release binaries),
   a fake `git` (records the calls and answers `rev-parse` from a switch) and a fake `make` for
   ctunnel, stub `curl`, `sha256sum`, `uname`, `go`, `gcc`, `systemctl` and `apt-get`, and
   sandbox `PATH`s that each lack one command. Everything lives in per-scenario temp dirs
@@ -1967,8 +1982,8 @@ Defaults are the real paths; none of these relax a check on a real server.
   second reinstall converges); failure paths (SHA-256 mismatch, download failure, installer
   failure, installer that installs nothing, missing `curl` offered and only installed after a
   yes, ctunnel: commit that does not verify, git failure, build failure with the log tail,
-  missing build tools offered once and only after a yes, Lazyports: no Go, Go 1.19 refused,
-  Go 1.22 warned); status (not installed; installed with version; Backpack's
+  missing build tools offered once and only after a yes, Lazyports: hash mismatch against the pin, against `SHA256SUMS`, no `SHA256SUMS` entry and
+  404 each install nothing, change nothing and fall back to nothing); status (not installed; installed with version; Backpack's
   `backpack-*.service` units running and stopped, none, and no `systemctl`; ctunnel and
   Lazyports say no service is documented and never claim running/stopped; Lazyports says no
   version is reported; a ctunnel on `PATH` outside the prefix counts as installed); update
@@ -1977,13 +1992,17 @@ Defaults are the real paths; none of these relax a check on a real server.
   offered, declined changes nothing, accepted backs up and reinstalls, old and new version
   reported); uninstall (not installed, declined changes nothing, Backpack through its own menu
   with the verify step, leaving the menu without uninstalling is reported, ctunnel removes
-  exactly the binary and man page and keeps `~/.passkey`, Lazyports removes both documented
-  locations and keeps the shell startup file, a copy outside the documented paths is left
+  exactly the binary and man page and keeps `~/.passkey`, Lazyports removes both locations
+  (`/usr/local/bin` and an old `~/go/bin` copy) and nothing else, a copy outside the documented paths is left
   alone, backups kept, secrets never printed); unsupported systems (all twelve rejected
   `os-release` fixtures, a missing file, and the five accepted ones, for Backpack; Ubuntu
   25.10 and Debian 11 for the others) and unsupported architectures (`armv7l`, `armv6l`,
   `i686`, `i386`, `s390x`, `ppc64le`, `riscv64`, `mips` rejected, `aarch64` accepted) change
-  nothing and download nothing. Source rules: `curl` only in `lc_fetch_installer`, git network
+  nothing and download nothing. Lazyports additionally: amd64 and arm64 each install their own
+  asset to `/usr/local/bin/lazyports` with mode 755 and nothing in `~/go/bin`, **a sandbox
+  without `go` (and one with an old `go`) installs normally and `go` is never called**, the
+  shell startup files are untouched, an old `~/go/bin` copy is still found by Status and
+  removed by Uninstall. Source rules: `curl` only in `lc_fetch_installer`, git network
   access only in `lc_fetch_source` with https only, the installer runs with `</dev/null`, no
   `read` in the lifecycle code outside the submenu, the yes/no helper and the parsers of the
   tools' own output, one shared submenu and three one-line wrappers, no unpinned installer URL.
@@ -2116,7 +2135,7 @@ Defaults are the real paths; none of these relax a check on a real server.
   the nginx.org suite is not hardcoded, that the repository URL is the stable
   one (never mainline), the key URL, the fingerprint pins and the priority-900
   pin are present, that `curl` is used only in the 3x-ui download/probe
-  functions, `ngx_fetch_key`, `acme_fetch_script` and `lc_fetch_installer`, that the Backpack, ctunnel and Lazyports pins (repository, tag or full commit, SHA-256) are present and well formed and their installer URLs are built from the pin, that the installer runs with `</dev/null`, that git touches the network only in `lc_fetch_source` and `upd_fetch_latest` (https and ssh only), that the Backup, Check For Updates and Uninstall code downloads nothing, uses `rm -rf` only for this run's own discarded backup and the update temp directory, lets Uninstall remove nothing but the script and the state files, and never prints a private key, that the acme.sh pin (tag,
+  functions, `ngx_fetch_key`, `acme_fetch_script` and `lc_fetch_installer`, that the Backpack, ctunnel and Lazyports pins (repository, tag or full commit, SHA-256; for Lazyports the release tag and one SHA-256 per architecture) are present and well formed and their installer or release URLs are built from the pin, that the installer runs with `</dev/null`, that git touches the network only in `lc_fetch_source` and `upd_fetch_latest` (https and ssh only), that the Backup, Check For Updates and Uninstall code downloads nothing, uses `rm -rf` only for this run's own discarded backup and the update temp directory, lets Uninstall remove nothing but the script and the state files, and never prints a private key, that the acme.sh pin (tag,
   exact tag-based URL, SHA-256) is present and well formed, and that the script has
   no `get.acme.sh`, DNS-validation, DNS-credential or certbot code.
 * **Operating systems** (`== operating systems` in the smoke test, always with

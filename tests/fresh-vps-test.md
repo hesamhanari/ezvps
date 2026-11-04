@@ -535,19 +535,23 @@ tunnel setup in this section happens inside each tool's own interface.
       backups remain
 
 **8e. Lazyports**
-- [ ] `Install` without Go prints that Go 1.24+ is needed and changes nothing; with Go
-      1.24+ the plan shows the installer URL at the pinned commit, its SHA-256, the
-      `go install ...@main` note (the built code is **not** pinned) and the shell-file
-      note
-- [ ] after `y`: `lazyports` exists in `/usr/local/bin` (and `~/go/bin`), `~/.bashrc`
-      was backed up to `/var/backups/ezvps/lazyports-1-bashrc.*` before the installer
-      appended its PATH line; ezvps prints only `To open Lazyports: run: lazyports`
-      and `Version: not reported`; Lazyports itself did not start
-- [ ] `Status`: installed, binary path(s), no version, no service
+- [ ] `Install` works **without Go installed** (`command -v go` prints nothing); the plan
+      shows the fork `hesamhanari/LazyPorts`, the release `v0.1.0` binary URL for this
+      architecture (`lazyports-linux-amd64` or `-arm64`), the `SHA256SUMS` URL and the
+      pinned SHA-256; no Go requirement and no `go install` text
+- [ ] after `y`: `/usr/local/bin/lazyports` exists with mode 755 and `sha256sum` of it
+      equals the pinned value; nothing is created in `~/go`; `~/.bashrc` and `~/.zshrc`
+      are unchanged; ezvps prints only `To open Lazyports: run: lazyports` and
+      `Version: not reported`; Lazyports itself did not start
+- [ ] a second `Install` asks before reinstalling; after `y` the old binary is in
+      `/var/backups/ezvps/lazyports-1-lazyports.*`
+- [ ] on an unsupported architecture, `Install` is refused with nothing changed
+- [ ] `Status`: installed, binary path(s) (an old `~/go/bin/lazyports` is listed too), no
+      version, no service
 - [ ] `Update`: says there is no documented update command and offers a reinstall;
       `n` changes nothing; `y` backs up and reinstalls
-- [ ] `Uninstall`: `y` removes `/usr/local/bin/lazyports` and `~/go/bin/lazyports`,
-      verifies they are gone, leaves `~/.bashrc` (and its PATH line) alone
+- [ ] `Uninstall`: `y` removes `/usr/local/bin/lazyports` and `~/go/bin/lazyports` (only
+      those), backs them up first, verifies they are gone, leaves `~/.bashrc` alone
 
 ## 9. SSH and Users
 

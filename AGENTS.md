@@ -60,8 +60,7 @@ SPEC.md  README.md  AGENTS.md
   `curl` and `sha256sum` (acme.sh download only), the installed `acme.sh`
   itself, optionally `openssl` (expiry dates), `crontab` (presence check and
   backup) and `ss`; Backpack, ctunnel and Lazyports: `uname`, `bash`, `sha256sum`,
-  `curl` (installer download), `git`/`make`/`gcc` (ctunnel build), `go` (Lazyports,
-  never installed by ezvps), `apt-get` (offered packages) and optionally `systemctl`
+  `curl` (installer and Lazyports binary download), `git`/`make`/`gcc` (ctunnel build), `apt-get` (offered packages) and optionally `systemctl`
   (Backpack's `backpack-*.service` units); SSH and Users: `useradd`, `usermod`,
   `userdel`, `passwd`, `chown`, `sshd` (`-t`/`-T`), `systemctl`, optionally `ss` and `apt-get`;
   no `sed`/`awk`/`grep`/`ssh-keygen`: passwd, group and sshd_config are parsed in bash; Firewall:
@@ -77,8 +76,8 @@ SPEC.md  README.md  AGENTS.md
   message; do not assume it.
 * Downloads: `curl` is allowed only in `xui_fetch_installer` / `xui_probe`,
   in `ngx_fetch_key` (the nginx.org signing key), in `acme_fetch_script`
-  (the pinned acme.sh script) and in `lc_fetch_installer` (the pinned Backpack and
-  Lazyports installers); git may touch the network only in `lc_fetch_source` (the
+  (the pinned acme.sh script) and in `lc_fetch_installer` (the pinned Backpack installer and
+  the pinned Lazyports release binary and `SHA256SUMS`); git may touch the network only in `lc_fetch_source` (the
   pinned ctunnel commit, https only) and in `upd_fetch_latest` (a shallow clone of `main` of the user's own
   private ezvps repository, https/ssh only, with the user's own authentication). Lint enforces both.
   Download to a temp file, show URL and hash, verify, ask, then run. Never
@@ -94,8 +93,11 @@ SPEC.md  README.md  AGENTS.md
   ezvps does not read). Use only what upstream documents: no invented service name,
   version flag or update command; where upstream has none, say so and offer the
   documented reinstall (backup first). Upstream installer scripts are pinned (tag or full
-  commit plus SHA-256), shown, confirmed and run with `</dev/null`. Adding a tool means a
-  new `lc_load` entry, not a new submenu.
+  commit plus SHA-256), shown, confirmed and run with `</dev/null`. Lazyports is a prebuilt
+  binary from the fork's release (tag plus one SHA-256 per architecture, also checked against
+  the release `SHA256SUMS`; both must match, nothing is installed otherwise, no Go and no
+  fallback to another source; existing binaries are backed up after the verification).
+  Adding a tool means a new `lc_load` entry, not a new submenu.
 * SSH and Users (SPEC 6.8): never read `/etc/shadow`, never print, store or log a password,
   a password hash or a private key (a pasted private key is refused and discarded). A
   password is only ever asked for by the system's own `passwd` prompt. Delete user refuses

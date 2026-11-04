@@ -57,7 +57,7 @@ done
 #    - ezvps may call curl only from the 3x-ui download/probe functions
 #      (xui_fetch_installer, xui_probe), the Nginx signing-key download
 #      (ngx_fetch_key), the pinned acme.sh download (acme_fetch_script) and the
-#      pinned Backpack/Lazyports installer download (lc_fetch_installer); never
+#      pinned Backpack installer and Lazyports release download (lc_fetch_installer); never
 #      from L2TP or anywhere else.
 #    - git may touch the network only in lc_fetch_source (the pinned ctunnel commit) and
 #      upd_fetch_latest (main of the user's private ezvps repository, with the user's own
@@ -111,23 +111,24 @@ if grep -vE '^[[:space:]]*#' ezvps | grep -qiE -- '--dns|dns_[a-z]+|CF_Token|api
     bad "ezvps: DNS validation, DNS provider credentials and certbot are out of scope for the Certificates module"
 fi
 # Backpack, ctunnel and Lazyports: every upstream is pinned (a release tag or a full
-# commit, plus a SHA-256 for the installer scripts), and the installer URLs are built
-# from the pin, never a branch.
+# commit, plus a SHA-256 for the installer script or, for Lazyports, the release binary
+# of each architecture), and the URLs are built from the pin, never a branch.
 if ! grep -qE '^LC_BACKPACK_REPO="AminMGMT/BackPack"$' ezvps ||
     ! grep -qE '^LC_BACKPACK_TAG="v[0-9]+\.[0-9]+\.[0-9]+"$' ezvps ||
     ! grep -qE '^LC_BACKPACK_SHA256="[0-9a-f]{64}"$' ezvps ||
     ! grep -qE '^LC_CTUNNEL_REPO="alienrobotarmy/ctunnel"$' ezvps ||
     ! grep -qE '^LC_CTUNNEL_COMMIT="[0-9a-f]{40}"$' ezvps ||
-    ! grep -qE '^LC_LAZYPORTS_REPO="v9mirza/lazyports"$' ezvps ||
-    ! grep -qE '^LC_LAZYPORTS_COMMIT="[0-9a-f]{40}"$' ezvps ||
-    ! grep -qE '^LC_LAZYPORTS_SHA256="[0-9a-f]{64}"$' ezvps; then
-    bad "ezvps: the Backpack/ctunnel/Lazyports pins (repo, tag or commit, sha256) are missing or malformed"
+    ! grep -qE '^LC_LAZYPORTS_REPO="hesamhanari/LazyPorts"$' ezvps ||
+    ! grep -qE '^LC_LAZYPORTS_TAG="v[0-9]+\.[0-9]+\.[0-9]+"$' ezvps ||
+    ! grep -qE '^LC_LAZYPORTS_SHA256_AMD64="[0-9a-f]{64}"$' ezvps ||
+    ! grep -qE '^LC_LAZYPORTS_SHA256_ARM64="[0-9a-f]{64}"$' ezvps; then
+    bad "ezvps: the Backpack/ctunnel/Lazyports pins (repo, tag or commit, sha256 per architecture for Lazyports) are missing or malformed"
 fi
 # shellcheck disable=SC2016 # the literal ${...} text of the URL lines in ezvps
 if ! grep -qF 'LC_URL="https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh"' ezvps ||
-    ! grep -qF 'LC_URL="https://raw.githubusercontent.com/${LC_LAZYPORTS_REPO}/${LC_LAZYPORTS_COMMIT}/install.sh"' ezvps ||
+    ! grep -qF 'LC_URL="https://github.com/${LC_LAZYPORTS_REPO}/releases/download/${LC_LAZYPORTS_TAG}"' ezvps ||
     ! grep -qF 'LC_GIT_COMMIT="$LC_CTUNNEL_COMMIT"' ezvps; then
-    bad "ezvps: the Backpack/Lazyports installer URLs must be built from the pinned tag/commit, and ctunnel from its pinned commit"
+    bad "ezvps: the Backpack installer URL and the Lazyports release URL must be built from the pinned tag, and ctunnel from its pinned commit"
 fi
 # The upstream installers run with no terminal input (Backpack's would open its menu).
 # shellcheck disable=SC2016 # the literal ${tmp} text in ezvps
