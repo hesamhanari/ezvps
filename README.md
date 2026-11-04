@@ -162,7 +162,9 @@ The same rules apply to all three:
   asks, backs up any existing config and binary under `/var/backups/ezvps/`, and only
   then runs upstream's documented install. Installer scripts are downloaded to a
   temporary file, checked against a pinned SHA-256 and run with no terminal input
-  (never piped into a shell).
+  (never piped into a shell). Lazyports has no installer script: its prebuilt
+  release binary is downloaded, verified (pinned hash and `SHA256SUMS`) and only
+  then backed up over and installed; a failed download or hash installs nothing.
 * **Status** shows installed or not, the binary path, the version when the tool has a
   documented version command, and whether its services run when upstream documents
   any. Where there is no service it says so instead of inventing one.
@@ -176,7 +178,7 @@ The same rules apply to all three:
 |------|--------|------------------|------------------|---------|----------|--------|-----------|
 | [Backpack](https://github.com/AminMGMT/BackPack) | `/usr/local/bin/backpack` | `/etc/backpack` | official `install.sh` at tag `v1.9.0` (SHA-256 checked); it downloads the latest release and verifies it against the release's `SHA256SUMS` | `backpack version` | `backpack-*.service` units (one per tunnel, plus monitor) | Backpack's own **Update** menu item (8): ezvps opens its menu for you to pick it | Backpack's own **Uninstall** menu item (9), same way |
 | [ctunnel](https://github.com/alienrobotarmy/ctunnel) | `/usr/local/bin/ctunnel` (+ man page) | `~/.passkey` | upstream has no installer or releases: its documented `make; make install` on one pinned commit (fetched with git) | `ctunnel -v` | none documented | none documented: ezvps says so and offers a reinstall | what `make uninstall` removes: the binary and the man page |
-| [Lazyports](https://github.com/v9mirza/lazyports) | `/usr/local/bin/lazyports` or `~/go/bin/lazyports` | none (`~/.bashrc` / `~/.zshrc`, which the installer may extend, are backed up) | official `install.sh` at one pinned commit (SHA-256 checked); needs Go 1.24+ and builds upstream's `main` with `go install` | none documented | none documented | none documented: ezvps says so and offers a reinstall | remove the binary, as upstream documents |
+| [Lazyports](https://github.com/hesamhanari/LazyPorts) | `/usr/local/bin/lazyports` (a copy installed the old Go way in `~/go/bin/lazyports` is still found and removed) | none (only an existing binary is backed up) | prebuilt binary from the fork, release `v0.1.0`: `lazyports-linux-amd64` or `-arm64`, per-architecture SHA-256 pinned and verified against the release `SHA256SUMS` (both must match, else nothing is installed); no Go needed | none documented | none documented | none documented: ezvps says so and offers a reinstall | remove the binary, as upstream documents |
 
 Config backups are byte-for-byte copies that ezvps never reads or prints; they can
 contain a tunnel token or key, which is why `/var/backups/ezvps` is root-only. Details,

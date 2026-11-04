@@ -3178,13 +3178,16 @@ echo "== Backpack, ctunnel and Lazyports lifecycle modules (fake binaries/instal
 LC_BP_TAG="$(grep -oE '^LC_BACKPACK_TAG="[^"]+"' "$EZVPS" | cut -d'"' -f2)"
 LC_BP_SHA="$(grep -oE '^LC_BACKPACK_SHA256="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
 LC_CT_COMMIT="$(grep -oE '^LC_CTUNNEL_COMMIT="[0-9a-f]{40}"' "$EZVPS" | cut -d'"' -f2)"
-LC_LZ_COMMIT="$(grep -oE '^LC_LAZYPORTS_COMMIT="[0-9a-f]{40}"' "$EZVPS" | cut -d'"' -f2)"
-LC_LZ_SHA="$(grep -oE '^LC_LAZYPORTS_SHA256="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
+LC_LZ_TAG="$(grep -oE '^LC_LAZYPORTS_TAG="[^"]+"' "$EZVPS" | cut -d'"' -f2)"
+LC_LZ_SHA_AMD64="$(grep -oE '^LC_LAZYPORTS_SHA256_AMD64="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
+LC_LZ_SHA_ARM64="$(grep -oE '^LC_LAZYPORTS_SHA256_ARM64="[0-9a-f]{64}"' "$EZVPS" | cut -d'"' -f2)"
 check "Backpack pin is declared (tag vX.Y.Z, sha256)" matches "$LC_BP_TAG-${#LC_BP_SHA}" '^v[0-9]+\.[0-9]+\.[0-9]+-64$'
 check "ctunnel pin is a full 40-hex commit" test "${#LC_CT_COMMIT}" -eq 40
-check "Lazyports pin is a full 40-hex commit and a sha256" test "${#LC_LZ_COMMIT}-${#LC_LZ_SHA}" = "40-64"
+check "Lazyports pin is the fork's release v0.1.0" equals "$(grep -E '^LC_LAZYPORTS_REPO=' "$EZVPS")-${LC_LZ_TAG}" 'LC_LAZYPORTS_REPO="hesamhanari/LazyPorts"-v0.1.0'
+check "Lazyports amd64 sha256 is the pinned value" equals "$LC_LZ_SHA_AMD64" edf030c28163605f360097ece2a2207619f88bab0446b22a52a3863971eb8f87
+check "Lazyports arm64 sha256 is the pinned value" equals "$LC_LZ_SHA_ARM64" 9d4eb016a4df7ae3ff0a5b7f67ec830c36e9978c0fd72d28ab0f4d3150538b8a
 LC_BP_URL="https://raw.githubusercontent.com/AminMGMT/BackPack/${LC_BP_TAG}/install.sh"
-LC_LZ_URL="https://raw.githubusercontent.com/v9mirza/lazyports/${LC_LZ_COMMIT}/install.sh"
+LC_LZ_REL="https://github.com/hesamhanari/LazyPorts/releases/download/v0.1.0"
 LC_CT_GIT="https://github.com/alienrobotarmy/ctunnel.git"
 
 LC_SAVED_HOME="$HOME"
@@ -3197,9 +3200,22 @@ mkdir -p "$LC_STUBS"
 mkstub "$LC_STUBS/uname" <<'EOF'
 echo "${FAKE_ARCH:-x86_64}"
 EOF
-# fake sha256sum: prints FAKE_SHA, so a test decides whether the "download" matches the pin
+# fake sha256sum: prints FAKE_SHA, so a test decides whether the "download" matches the pin.
+# With FAKE_SHA_CONTENT=1 the hash follows the file's content instead: a fake Lazyports binary
+# containing LZ-AMD64 / LZ-ARM64 "hashes" to the pinned value of that architecture, one containing
+# LZ-TAMPERED to a different value (the real pinned hashes belong to real release binaries, which
+# fake test data can not reproduce).
 mkstub "$LC_STUBS/sha256sum" <<'EOF'
-printf '%s  %s\n' "$FAKE_SHA" "$1"
+h="$FAKE_SHA"
+if [[ "${FAKE_SHA_CONTENT:-0}" == 1 && -f "$1" ]]; then
+    c="$(<"$1")"
+    case "$c" in
+        *LZ-TAMPERED*) h="1111111111111111111111111111111111111111111111111111111111111111" ;;
+        *LZ-AMD64*) h="$FAKE_LZ_SHA_AMD64" ;;
+        *LZ-ARM64*) h="$FAKE_LZ_SHA_ARM64" ;;
+    esac
+fi
+printf '%s  %s\n' "$h" "$1"
 EOF
 # fake curl: serves the installer for the tool named in FAKE_INSTALLER (a path)
 mkstub "$LC_STUBS/curl" <<'EOF'
@@ -3214,12 +3230,17 @@ echo "curl $url" >>"$FAKE_LOG"
 [[ "${FAKE_DOWNLOAD_FAIL:-0}" == 1 ]] && exit 22
 case "$url" in
     */install.sh) cp "$FAKE_INSTALLER" "$out"; exit 0 ;;
+    */releases/download/*)
+        # Lazyports release files, served from FAKE_LZ_DIR; a missing file is a 404 (curl -f exits 22)
+        [[ -f "$FAKE_LZ_DIR/${url##*/}" ]] || exit 22
+        cp "$FAKE_LZ_DIR/${url##*/}" "$out"; exit 0 ;;
 esac
 echo "curl UNEXPECTED $*" >>"$FAKE_LOG"
 exit 1
 EOF
-# fake go
+# fake go (Lazyports must never call it; a call is logged as "go ...")
 mkstub "$LC_STUBS/go" <<'EOF'
+echo "go $*" >>"$FAKE_LOG"
 [[ "${1:-}" == version ]] && echo "go version go${FAKE_GO_VERSION:-1.24.12} linux/amd64"
 exit 0
 EOF
@@ -3335,17 +3356,33 @@ fi
 echo "[fake] Installed. Open the menu with: sudo backpack"
 exit 0
 EOF
-# fake official Lazyports installer: needs `go`, puts the binary in the prefix, appends a PATH line to ~/.bashrc
-mkstub "$LCW/fake-installer-lazyports.sh" <<'EOF'
-echo "INSTALLER lazyports args=$* go=$(command -v go || echo none)" >>"$FAKE_LOG"
-[[ "${FAKE_INSTALLER_FAIL:-0}" == 1 ]] && { echo "[fake] go install failed" >&2; exit 1; }
-mkdir -p "$EZVPS_TOOL_PREFIX/bin"
-printf '#!%s\necho LAZYPORTS-TUI\n' "$BASH_BIN_PATH" >"$EZVPS_TOOL_PREFIX/bin/lazyports"
-chmod +x "$EZVPS_TOOL_PREFIX/bin/lazyports"
-[[ "${FAKE_APPEND_RC:-1}" == 1 ]] && printf '\n# Added by Lazyports installer\nexport PATH=$PATH:/fake/go/bin\n' >>"$HOME/.bashrc"
-echo "[fake] Lazyports installed"
-exit 0
-EOF
+# fake Lazyports release: lc_lz_release <dir> [variant] writes lazyports-linux-amd64/-arm64 and SHA256SUMS
+# into <dir> and points the fake curl at it. Variants: (none) all consistent, tampered (binaries differ
+# from the pin, SHA256SUMS lists the pin), tampered-with-sums (binary differs from the pin, SHA256SUMS
+# lists the tampered hash), sums-differ (binary matches the pin, SHA256SUMS lists another hash),
+# sums-missing (SHA256SUMS has no entries), sums-amd-only, no-binary (404), no-sums (404).
+lc_lz_release() {
+    local d="$1" v="${2:-ok}" a
+    rm -rf "$d"
+    mkdir -p "$d"
+    for a in amd64 arm64; do
+        if [[ "$v" == tampered || "$v" == tampered-with-sums ]]; then
+            printf '#!%s\necho LAZYPORTS-TUI LZ-TAMPERED LZ-%s\n' "$BASH_BIN" "${a^^}" >"$d/lazyports-linux-$a"
+        else
+            printf '#!%s\necho LAZYPORTS-TUI LZ-%s\n' "$BASH_BIN" "${a^^}" >"$d/lazyports-linux-$a"
+        fi
+    done
+    case "$v" in
+        ok | tampered) printf '%s  lazyports-linux-amd64\n%s  lazyports-linux-arm64\n' "$LC_LZ_SHA_AMD64" "$LC_LZ_SHA_ARM64" >"$d/SHA256SUMS" ;;
+        tampered-with-sums) printf '%s  lazyports-linux-amd64\n%s  lazyports-linux-arm64\n' "1111111111111111111111111111111111111111111111111111111111111111" "1111111111111111111111111111111111111111111111111111111111111111" >"$d/SHA256SUMS" ;;
+        sums-differ) printf '%s  lazyports-linux-amd64\n%s  lazyports-linux-arm64\n' "2222222222222222222222222222222222222222222222222222222222222222" "2222222222222222222222222222222222222222222222222222222222222222" >"$d/SHA256SUMS" ;;
+        sums-missing) printf '# nothing here\n' >"$d/SHA256SUMS" ;;
+        sums-amd-only) printf '%s  lazyports-linux-amd64\n' "$LC_LZ_SHA_AMD64" >"$d/SHA256SUMS" ;;
+        no-binary) rm -f "$d/lazyports-linux-amd64" "$d/lazyports-linux-arm64"; printf '%s  lazyports-linux-amd64\n' "$LC_LZ_SHA_AMD64" >"$d/SHA256SUMS" ;;
+        no-sums) rm -f "$d/SHA256SUMS" ;;
+    esac
+    export FAKE_LZ_DIR="$d"
+}
 
 # --- sandboxes and scenarios -------------------------------------------------------------------
 LC_CORE=(bash cp mkdir mv rm rmdir mktemp date chmod ln readlink)
@@ -3377,6 +3414,8 @@ lc_scene() {
     export FAKE_PIN_COMMIT="$LC_CT_COMMIT" FAKE_TOOLS_DIR="$LC_BOX"
     export FAKE_SHA="$LC_BP_SHA" FAKE_INSTALLER="$LCW/fake-installer-backpack.sh" FAKE_ARCH=x86_64
     export FAKE_BP_NEWVER="v1.9.1" FAKE_UNITS="$LC_DIR/units"
+    export FAKE_SHA_CONTENT=1 FAKE_LZ_SHA_AMD64="$LC_LZ_SHA_AMD64" FAKE_LZ_SHA_ARM64="$LC_LZ_SHA_ARM64"
+    lc_lz_release "$LC_DIR/rel"
     unset FAKE_DOWNLOAD_FAIL FAKE_INSTALLER_FAIL FAKE_INSTALLER_NOBIN FAKE_GIT_FAIL FAKE_GIT_HEAD FAKE_MAKE_FAIL \
         FAKE_CT_VERSION FAKE_GO_VERSION FAKE_APPEND_RC FAKE_BP_INSTALLVER
     : >"$FAKE_LOG"
@@ -3748,100 +3787,189 @@ for osf in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
     check "ctunnel install accepted on ${osf}" contains "$OUT" "ezvps will install ctunnel (this system and architecture are supported):"
 done
 
-echo "-- Lazyports: install (Go build via the pinned official installer)"
+echo "-- Lazyports: install (prebuilt binary from the fork's release, no Go)"
 lc_scene lz-install
-export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
 printf '# my bashrc\nalias ll="ls -l"\n' >"$HOME/.bashrc"
 lc_run "2\n\n0\n" lazyports
 check "Lazyports status: not installed" contains "$OUT" "Installed:  no"
 lc_run "1\nn\n\n0\n" lazyports
-check "Lazyports plan: pinned installer URL" contains "$OUT" "installer: ${LC_LZ_URL}"
-check "Lazyports plan: pinned to a commit, says upstream has no tags" contains "$OUT" "pinned to: commit ${LC_LZ_COMMIT} (upstream publishes no tags or releases)"
-check "Lazyports plan: expected sha256" contains "$OUT" "sha256:    ${LC_LZ_SHA} (expected)"
-check "Lazyports plan: says the built code (main) is not pinned" contains "$OUT" "the code it builds is upstream's current"
-check "Lazyports plan: names go install ...@main" contains "$OUT" "go install github.com/v9mirza/lazyports@main"
-check "Lazyports plan: warns about the shell startup file" contains "$OUT" "may append a PATH line to"
+check "Lazyports plan: names the fork project" contains "$OUT" "project:   https://github.com/hesamhanari/LazyPorts"
+check "Lazyports plan: pinned binary URL (amd64)" contains "$OUT" "binary:    ${LC_LZ_REL}/lazyports-linux-amd64"
+check "Lazyports plan: SHA256SUMS URL" contains "$OUT" "checksums: ${LC_LZ_REL}/SHA256SUMS"
+check "Lazyports plan: new pin text" contains "$OUT" "pinned to: fork hesamhanari/LazyPorts release v0.1.0, per-architecture SHA256 pinned, verified against the release SHA256SUMS"
+check "Lazyports plan: expected pinned sha256 for amd64" contains "$OUT" "sha256:    ${LC_LZ_SHA_AMD64} (expected for lazyports-linux-amd64)"
+check "Lazyports plan: says no Go is needed" contains "$OUT" "no Go is needed and nothing is built"
+check "Lazyports plan: no Go 1.24 requirement and no unpinned-main text" bash -c '[[ "$1" != *"Go 1.24"* && "$1" != *"@main"* && "$1" != *"NOT pinned"* && "$1" != *"PATH line"* ]]' _ "$OUT"
+check "Lazyports plan: installs to /usr/local/bin (mode 755)" contains "$OUT" "It is installed to ${LC_DIR}/prefix/bin/lazyports (mode 755)."
 check "Lazyports declined: nothing downloaded" log_lacks "curl "
+check "Lazyports declined: nothing installed" test ! -e "$LC_DIR/prefix/bin/lazyports"
 lc_run "1\ny\n\n2\n\n0\n" lazyports
-check "Lazyports install: pinned URL downloaded once" equals "$(log_count "curl ${LC_LZ_URL}")" 1
+check "Lazyports install: binary URL downloaded once" equals "$(log_count "curl ${LC_LZ_REL}/lazyports-linux-amd64")" 1
+check "Lazyports install: SHA256SUMS downloaded once" equals "$(log_count "curl ${LC_LZ_REL}/SHA256SUMS")" 1
+check "Lazyports install: nothing else downloaded" equals "$(log_count 'curl ')" 2
 check "Lazyports install: downloaded with --proto =https --tlsv1.2" log_lacks "INSECURE-FLAGS"
-check "Lazyports install: installer ran once, no arguments" log_has "INSTALLER lazyports args= go="
-check "Lazyports install: binary installed" test -x "$LC_DIR/prefix/bin/lazyports"
-check "Lazyports install: shell startup file backed up BEFORE the installer appended to it" equals "$(<"$(first_backup lazyports-1-bashrc)")" $'# my bashrc\nalias ll="ls -l"'
-check "Lazyports install: the installer's PATH line is in the real .bashrc, not the backup" contains "$(<"$HOME/.bashrc")" "Added by Lazyports installer"
+check "Lazyports install: verified against the pin and SHA256SUMS" contains "$OUT" "matches the pinned sha256 and the release SHA256SUMS"
+check "Lazyports install: binary installed to the prefix" test -x "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports install: mode is 755" equals "$(stat -c %a "$LC_DIR/prefix/bin/lazyports")" 755
+check "Lazyports install: it is the downloaded amd64 binary" contains "$(<"$LC_DIR/prefix/bin/lazyports")" "LZ-AMD64"
+check "Lazyports install: no leftover temp file next to the binary" equals "$(printf '%s\n' "$LC_DIR"/prefix/bin/* | wc -l)" 1
+check "Lazyports install: not installed to ~/go/bin" test ! -e "$HOME/go"
+check "Lazyports install: no Go was called, no go install" log_lacks "go "
+check "Lazyports install: .bashrc is untouched" equals "$(<"$HOME/.bashrc")" $'# my bashrc\nalias ll="ls -l"'
+check "Lazyports install: no .zshrc created" test ! -e "$HOME/.zshrc"
+check "Lazyports install: nothing to back up on a fresh system" equals "$(backup_count '')" 0
 check "Lazyports install: version honestly not reported" contains "$OUT" "Version:   not reported (Lazyports documents no version command)"
 check "Lazyports install: only says how to open it" contains "$OUT" "To open Lazyports: run: lazyports"
 check "Lazyports install: status afterwards: installed" contains "$OUT" "Installed:  yes"
 check "Lazyports status: no service is invented" contains "$OUT" "Lazyports is an interactive terminal program"
 check "Lazyports status: no systemctl call at all" log_lacks "systemctl"
+lc_run "1\nn\n\n0\n" lazyports
+check "Lazyports already installed: asks before reinstalling" contains "$OUT" "Lazyports is already installed"
+check "Lazyports already installed, declined: nothing downloaded again" equals "$(log_count 'curl ')" 2
 lc_run "1\ny\ny\n\n0\n" lazyports
-check "Lazyports reinstall: asks first, backs up the existing binary" test -x "$(first_backup lazyports-2-lazyports)"
-lc_scene lz-go
-export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
+check "Lazyports reinstall: existing binary backed up first" test -x "$(first_backup lazyports-1-lazyports)"
+check "Lazyports reinstall: the backup is the old binary" contains "$(<"$(first_backup lazyports-1-lazyports)")" "LZ-AMD64"
+check "Lazyports reinstall: no shell startup file backed up (none is touched)" equals "$(backup_count lazyports-1-bashrc)" 0
+
+echo "-- Lazyports: aarch64 uses the arm64 asset"
+lc_scene lz-arm64
+export FAKE_ARCH=aarch64
+lc_run "1\nn\n\n0\n" lazyports
+check "Lazyports arm64 plan: arm64 binary URL" contains "$OUT" "binary:    ${LC_LZ_REL}/lazyports-linux-arm64"
+check "Lazyports arm64 plan: pinned arm64 sha256" contains "$OUT" "sha256:    ${LC_LZ_SHA_ARM64} (expected for lazyports-linux-arm64)"
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports arm64 install: arm64 URL downloaded, amd64 not" equals "$(log_count "curl ${LC_LZ_REL}/lazyports-linux-arm64")$(log_count "curl ${LC_LZ_REL}/lazyports-linux-amd64")" 10
+check "Lazyports arm64 install: installed to the prefix, it is the arm64 binary" contains "$(<"$LC_DIR/prefix/bin/lazyports")" "LZ-ARM64"
+check "Lazyports arm64 install: mode 755" equals "$(stat -c %a "$LC_DIR/prefix/bin/lazyports")" 755
+export FAKE_ARCH=x86_64
+
+echo "-- Lazyports: a missing Go binary does not block the install"
+lc_scene lz-nogo
 lc_box "$LC_BOX" go
+check "no-Go sandbox really has no go" test ! -e "$LC_BOX/go"
 lc_run "1\ny\n\n0\n" lazyports
-check "Lazyports without Go: refused with how to get Go" contains "$OUT" "needs Go 1.24 or newer, and 'go' was not found."
-check "Lazyports without Go: nothing downloaded or changed" equals "$(log_count 'curl ')$(backup_count '')" 00
+check "Lazyports without Go: installed" test -x "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports without Go: no complaint about Go" not_contains "$OUT" "needs Go"
+check "Lazyports without Go: no Go was looked for or installed" log_lacks "go "
+check "Lazyports without Go: no apt-get call" log_lacks "apt-get"
+check "Lazyports without Go: exit 0" equals "$RC" 0
+check "Lazyports: ezvps has no Go check or go call left" bash -c '! grep -vE "^[[:space:]]*#" "$1" | grep -qE "lc_check_go|LC_NEEDS_GO|go install|go version|have_cmd go|\.bashrc|\.zshrc"' _ "$EZVPS"
+lc_scene lz-oldgo
 export FAKE_GO_VERSION=1.19.8
-lc_box "$LC_BOX"
 lc_run "1\ny\n\n0\n" lazyports
-check "Lazyports with Go 1.19: refused (cannot fetch the newer toolchain)" contains "$OUT" "older than 1.21"
-check "Lazyports with Go 1.19: nothing downloaded" log_lacks "curl "
-export FAKE_GO_VERSION=1.22.2
-lc_run "1\ny\n\n0\n" lazyports
-check "Lazyports with Go 1.22: warns, then installs" contains "$OUT" "Go 1.22 will try to download the newer toolchain"
-check "Lazyports with Go 1.22: installed" test -x "$LC_DIR/prefix/bin/lazyports"
-export FAKE_GO_VERSION=1.24.12
+check "Lazyports with an old Go on the box: Go is ignored, installs" test -x "$LC_DIR/prefix/bin/lazyports"
+unset FAKE_GO_VERSION
+
+echo "-- Lazyports: verification failures install nothing"
 lc_scene lz-hash
-export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="1111111111111111111111111111111111111111111111111111111111111111"
+lc_seed_lazyports system
+cp "$LC_DIR/prefix/bin/lazyports" "$LC_DIR/old-binary"
+lc_lz_release "$LC_DIR/rel" tampered
+lc_run "1\ny\ny\n\n0\n" lazyports
+check "Lazyports: tampered binary refused (differs from the pin)" contains "$OUT" "SHA-256 mismatch for the downloaded lazyports-linux-amd64; refusing to install it."
+check "Lazyports: tampered binary: shows expected and got" contains "$OUT" "expected (pinned): ${LC_LZ_SHA_AMD64}"
+check "Lazyports: tampered binary: the existing binary is untouched" equals "$(<"$LC_DIR/prefix/bin/lazyports")" "$(<"$LC_DIR/old-binary")"
+check "Lazyports: tampered binary: no backup made (nothing was changed)" equals "$(backup_count '')" 0
+check "Lazyports: tampered binary: menu continues, exit 0" equals "$RC" 0
+lc_scene lz-hash-fresh
+lc_lz_release "$LC_DIR/rel" tampered
 lc_run "1\ny\n\n0\n" lazyports
-check "Lazyports: hash mismatch refused, installer not run" equals "$(log_count INSTALLER)$(contains "$OUT" 'SHA-256 mismatch' && echo mismatch)" 0mismatch
+check "Lazyports: tampered binary on a fresh system installs nothing" test ! -e "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports: tampered binary: no go fallback" log_lacks "go "
+lc_scene lz-sums-differ
+lc_lz_release "$LC_DIR/rel" sums-differ
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports: binary matches the pin but not SHA256SUMS: refused" contains "$OUT" "matches the pinned hash but not the downloaded SHA256SUMS; refusing to install it."
+check "Lazyports: binary matches the pin but not SHA256SUMS: nothing installed" test ! -e "$LC_DIR/prefix/bin/lazyports"
+lc_scene lz-pin-differs
+lc_lz_release "$LC_DIR/rel" tampered-with-sums
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports: binary matches SHA256SUMS but not the pin: refused" contains "$OUT" "SHA-256 mismatch for the downloaded lazyports-linux-amd64; refusing to install it."
+check "Lazyports: binary matches SHA256SUMS but not the pin: nothing installed" test ! -e "$LC_DIR/prefix/bin/lazyports"
+lc_scene lz-sums-missing
+lc_lz_release "$LC_DIR/rel" sums-missing
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports: SHA256SUMS without an entry for the binary: refused" contains "$OUT" "has no entry for lazyports-linux-amd64; refusing to install."
+check "Lazyports: SHA256SUMS without an entry: nothing installed" test ! -e "$LC_DIR/prefix/bin/lazyports"
+lc_scene lz-sums-arm-only
+export FAKE_ARCH=aarch64
+lc_lz_release "$LC_DIR/rel" sums-amd-only
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports arm64: only the amd64 entry in SHA256SUMS: refused" contains "$OUT" "has no entry for lazyports-linux-arm64; refusing to install."
+export FAKE_ARCH=x86_64
+
+echo "-- Lazyports: a 404 aborts with no fallback"
+lc_scene lz-404
+lc_lz_release "$LC_DIR/rel" no-binary
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports 404: clear message with the URL" contains "$OUT" "Download failed: ${LC_LZ_REL}/lazyports-linux-amd64"
+check "Lazyports 404: says there is no fallback" contains "$OUT" "no fallback to another install method"
+check "Lazyports 404: nothing installed" test ! -e "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports 404: only the one download was tried" equals "$(log_count 'curl ')" 1
+check "Lazyports 404: no go install fallback, no installer download" bash -c '! grep -qE "go |install\.sh|raw\.githubusercontent" "$1"' _ "$FAKE_LOG"
+check "Lazyports 404: exit 0" equals "$RC" 0
+lc_scene lz-404-sums
+lc_lz_release "$LC_DIR/rel" no-sums
+lc_run "1\ny\n\n0\n" lazyports
+check "Lazyports 404 on SHA256SUMS: clear message" contains "$OUT" "Download failed: ${LC_LZ_REL}/SHA256SUMS"
+check "Lazyports 404 on SHA256SUMS: nothing installed" test ! -e "$LC_DIR/prefix/bin/lazyports"
+
+echo "-- Lazyports: unsupported system and architecture"
 lc_scene lz-unsupported
-export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
 run_os "$OSD/debian11" "$LC_BOX" "1\ny\n\n0\n" lazyports
 check "Lazyports install refused on Debian 11" contains "$OUT" "Lazyports install needs a supported system: ${OS_LIST_TEXT}; found 'debian 11 bullseye'. Nothing was changed."
 check "Lazyports install refused on Debian 11: nothing downloaded" log_lacks "curl "
-export FAKE_ARCH=i686
-lc_run "1\ny\n\n0\n" lazyports
-check "Lazyports install refused on i686" contains "$OUT" "Lazyports install does not support architecture 'i686' (supported: x86_64, aarch64). Nothing was changed."
-check "Lazyports install on i686: nothing downloaded" log_lacks "curl "
+for arch in i686 armv7l ppc64le; do
+    export FAKE_ARCH="$arch"
+    lc_run "1\ny\n\n0\n" lazyports
+    check "Lazyports install refused on ${arch}" contains "$OUT" "Lazyports install does not support architecture '${arch}' (supported: x86_64, aarch64). Nothing was changed."
+    check "Lazyports install on ${arch}: nothing downloaded, nothing installed" equals "$(log_count 'curl ')$(test -e "$LC_DIR/prefix/bin/lazyports" && echo bin)$(backup_count '')" 00
+done
 export FAKE_ARCH=x86_64
 for osf in debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2604; do
     run_os "$OSD/$osf" "$LC_BOX" "1\nn\n\n0\n" lazyports
     check "Lazyports install accepted on ${osf}" contains "$OUT" "ezvps will install Lazyports (this system and architecture are supported):"
 done
 
-echo "-- Lazyports: update (no documented method) and uninstall (remove the binary)"
+echo "-- Lazyports: update (unchanged: no documented method) and uninstall (both locations)"
 lc_scene lz-life
-export FAKE_INSTALLER="$LCW/fake-installer-lazyports.sh" FAKE_SHA="$LC_LZ_SHA"
 lc_seed_lazyports system
 lc_run "3\nn\n\n0\n" lazyports
 check "Lazyports update: says clearly there is no documented update command" contains "$OUT" "Lazyports has no documented update command upstream, and ezvps does not guess one."
 check "Lazyports update: points at the documented reinstall" contains "$OUT" "The documented way to get a newer Lazyports is to install it again from its source."
 check "Lazyports update declined: nothing changed" equals "$(log_count 'curl ')$(backup_count '')" 00
 lc_run "3\ny\ny\n\n0\n" lazyports
-check "Lazyports update: reinstalled through the documented installer" log_has "INSTALLER lazyports"
-check "Lazyports update: binary and shell file backed up first" equals "$(backup_count lazyports-1-bashrc)$(backup_count lazyports-2-lazyports)" 11
-check "Lazyports update: no update command was invented" log_lacks "lazyports update"
+check "Lazyports update: reinstalled from the pinned release" contains "$(<"$LC_DIR/prefix/bin/lazyports")" "LZ-AMD64"
+check "Lazyports update: the old binary was backed up first" equals "$(backup_count lazyports-1-lazyports)" 1
+check "Lazyports update: no update command was invented, no latest-release lookup" bash -c '! grep -qE "lazyports update|releases/latest|api\.github" "$1"' _ "$FAKE_LOG"
 lc_scene lz-uninstall
 lc_run "4\n\n0\n" lazyports
 check "Lazyports uninstall when not installed: says so" contains "$OUT" "Lazyports is not installed; there is nothing to uninstall."
 lc_seed_lazyports both
+printf 'unrelated\n' >"$HOME/go/bin/other-tool"
+printf 'unrelated\n' >"$LC_DIR/prefix/bin/other-tool"
 lc_run "4\nn\n\n0\n" lazyports
-check "Lazyports uninstall: lists both documented locations" contains "$OUT" "$HOME/go/bin/lazyports"
+check "Lazyports uninstall: lists both locations" bash -c '[[ "$1" == *"$2/prefix/bin/lazyports"* && "$1" == *"$3/go/bin/lazyports"* ]]' _ "$OUT" "$LC_DIR" "$HOME"
 check "Lazyports uninstall declined: both binaries remain" equals "$(test -x "$LC_DIR/prefix/bin/lazyports" && test -x "$HOME/go/bin/lazyports" && echo both)$(backup_count '')" both0
 lc_run "4\ny\n\n0\n" lazyports
 check "Lazyports uninstall: system-wide binary removed" test ! -e "$LC_DIR/prefix/bin/lazyports"
-check "Lazyports uninstall: user-local binary removed" test ! -e "$HOME/go/bin/lazyports"
-check "Lazyports uninstall: backed up first" test -x "$(first_backup lazyports-2-lazyports)"
-check "Lazyports uninstall: shell startup file backed up and untouched" equals "$(<"$HOME/.bashrc")" "$(<"$(first_backup lazyports-1-bashrc)")"
+check "Lazyports uninstall: user-local (old Go install) binary removed" test ! -e "$HOME/go/bin/lazyports"
+check "Lazyports uninstall: backed up first" test -x "$(first_backup lazyports-1-lazyports)"
+check "Lazyports uninstall: both binaries backed up" equals "$(backup_count lazyports-1-lazyports)$(backup_count lazyports-2-lazyports)" 11
+check "Lazyports uninstall: nothing else removed (other files, go dir, .bashrc)" equals "$(<"$HOME/go/bin/other-tool")|$(<"$LC_DIR/prefix/bin/other-tool")|$(<"$HOME/.bashrc")" $'unrelated|unrelated|# my bashrc\nalias ll="ls -l"'
 check "Lazyports uninstall: ezvps verifies the binary is gone" contains "$OUT" "Verified: the lazyports binary is gone."
 check "Lazyports uninstall: says the config files are left alone" contains "$OUT" "your config and shell startup files stay as they are"
 lc_scene lz-uninstall-home
 lc_seed_lazyports home
 lc_run "2\n\n4\ny\n\n0\n" lazyports
-check "Lazyports installed only in ~/go/bin counts as installed" contains "$OUT" "Binary:     $HOME/go/bin/lazyports"
-check "Lazyports user-local install is removed on uninstall" test ! -e "$HOME/go/bin/lazyports"
+check "Lazyports installed only in ~/go/bin (old Go install) counts as installed" contains "$OUT" "Binary:     $HOME/go/bin/lazyports"
+check "Lazyports old Go install is removed on uninstall" test ! -e "$HOME/go/bin/lazyports"
+lc_scene lz-old-then-new
+lc_seed_lazyports home
+lc_run "1\ny\ny\n\n2\n\n0\n" lazyports
+check "Lazyports new install over an old Go install: goes to the prefix" test -x "$LC_DIR/prefix/bin/lazyports"
+check "Lazyports new install: the old ~/go/bin copy is left alone and noted" bash -c '[[ -x "$1/go/bin/lazyports" && "$2" == *"older copy from a Go build is still at $1/go/bin/lazyports"* ]]' _ "$HOME" "$OUT"
+check "Lazyports status lists both copies" bash -c '[[ "$1" == *"Binary:     $2/prefix/bin/lazyports"* && "$1" == *"Binary:     $3/go/bin/lazyports"* ]]' _ "$OUT" "$LC_DIR" "$HOME"
 
 echo "-- lifecycle: modules never fail the menu"
 lc_scene never-fail
@@ -3855,7 +3983,7 @@ check "Backpack: update/uninstall/status on a machine without it all return to t
 # leave the environment as the later sections expect it
 export HOME="$LC_SAVED_HOME"
 if [[ -n "$LC_SAVED_BACKUP" ]]; then export EZVPS_BACKUP_DIR="$LC_SAVED_BACKUP"; else unset EZVPS_BACKUP_DIR; fi
-unset EZVPS_TOOL_PREFIX EZVPS_BACKPACK_CONF_DIR FAKE_LOG FAKE_ARCH FAKE_SHA FAKE_INSTALLER FAKE_GO_VERSION
+unset EZVPS_TOOL_PREFIX EZVPS_BACKPACK_CONF_DIR FAKE_LOG FAKE_ARCH FAKE_SHA FAKE_INSTALLER FAKE_GO_VERSION FAKE_SHA_CONTENT FAKE_LZ_DIR FAKE_LZ_SHA_AMD64 FAKE_LZ_SHA_ARM64
 
 echo "== SSH and Users module (fake passwd/group/sshd_config, stub useradd/usermod/userdel/passwd/chown/sshd/systemctl/ss, no real accounts)"
 
@@ -7083,8 +7211,9 @@ only_pinned_urls() {
             'https://github.com/${ACME_UPSTREAM}'* | 'https://raw.githubusercontent.com/${ACME_UPSTREAM}/${ACME_PINNED_TAG}/acme.sh') ;;
             # Backpack / ctunnel / Lazyports: the projects, their pinned installers and the pinned ctunnel commit, and Go's install page (text only)
             'https://github.com/${LC_BACKPACK_REPO}' | 'https://github.com/${LC_CTUNNEL_REPO}' | 'https://github.com/${LC_CTUNNEL_REPO}.git' | 'https://github.com/${LC_LAZYPORTS_REPO}') ;;
-            'https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh' | 'https://raw.githubusercontent.com/${LC_LAZYPORTS_REPO}/${LC_LAZYPORTS_COMMIT}/install.sh') ;;
-            'https://go.dev/doc/install') ;;
+            'https://raw.githubusercontent.com/${LC_BACKPACK_REPO}/${LC_BACKPACK_TAG}/install.sh') ;;
+            # Lazyports: the fork's pinned release download directory (the binary and SHA256SUMS)
+            'https://github.com/${LC_LAZYPORTS_REPO}/releases/download/${LC_LAZYPORTS_TAG}'*) ;;
             # Certificates module: nginx syntax in the site template and text for the user, not network access
             'https://$host$request_uri;'* | 'https://\$host\$request_uri'* | 'https://${domain}/'* | 'http://${1};') ;;
             # Nginx module: upstream parsing/rendering, not network access
@@ -7096,7 +7225,7 @@ only_pinned_urls() {
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
     ((bad == 0))
 }
-check "curl is invoked only by the 3x-ui download/probe functions, the nginx.org key download, the pinned acme.sh download and the pinned Backpack/Lazyports installer download" equals "$(curl_functions "$EZVPS")" "acme_fetch_script() lc_fetch_installer() ngx_fetch_key() xui_fetch_installer() xui_probe() "
+check "curl is invoked only by the 3x-ui download/probe functions, the nginx.org key download, the pinned acme.sh download and the pinned Backpack installer / Lazyports release download" equals "$(curl_functions "$EZVPS")" "acme_fetch_script() lc_fetch_installer() ngx_fetch_key() xui_fetch_installer() xui_probe() "
 check "ezvps never pipes a download into a shell" no_pipe_to_shell "$EZVPS"
 check "ezvps only knows the pinned upstream URL" only_pinned_urls "$EZVPS"
 check "ezvps has no URL for the private easyl2tp repo" not_contains "$(<"$EZVPS")" "raw.githubusercontent.com/<owner>"
@@ -7107,8 +7236,8 @@ lc_body() { awk '/^(lc_[a-z_]+|module_(backpack|ctunnel|lazyports))\(\)/ {on=1} 
 git_network_functions() {
     awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""} !/^[[:space:]]*#/ && /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && /"\$\{g\[@\]\}"|git[[:space:]]+-/ {print (fn==""?"<top-level>":fn)}' "$1" | sort -u | tr '\n' ' '
 }
-reads_outside_menu() { # `read` in lc_* other than the submenu choice and the parsers of a tool's own output
-    awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""} !/^[[:space:]]*#/ && /(^|[[:space:];])read[[:space:]]+-/ && fn ~ /^lc_/ && fn != "lc_module()" && fn != "lc_version()" && fn != "lc_print_services()" {print fn": "$0}' "$EZVPS"
+reads_outside_menu() { # `read` in lc_* other than the submenu choice and the parsers of a tool's own output (version, services, the release SHA256SUMS file)
+    awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""} !/^[[:space:]]*#/ && /(^|[[:space:];])read[[:space:]]+-/ && fn ~ /^lc_/ && fn != "lc_module()" && fn != "lc_version()" && fn != "lc_print_services()" && fn != "lc_sums_lookup()" {print fn": "$0}' "$EZVPS"
 }
 check "git touches the network only inside lc_fetch_source (the pinned ctunnel commit) and upd_fetch_latest (main of the private repository)" equals "$(git_network_functions "$EZVPS")" "lc_fetch_source() upd_fetch_latest() "
 check "the update fetch allows https and ssh only, with the user's own authentication" contains "$(<"$EZVPS")" "-c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always"
@@ -7118,7 +7247,7 @@ check "the lifecycle code asks for no token, link, password or key (no read outs
 check "the lifecycle code never launches a tool with tunnel arguments" not_contains "$(lc_body | grep -E '"\$LC_BIN_FOUND"|\$1" "\$LC_VERSION_ARG"')" "-s "
 check "one shared submenu: the four labels are declared once" equals "$(grep -c '"Install" "Status" "Update" "Uninstall"' "$EZVPS")" 1
 check "the three module functions are one-line wrappers around the shared flow" equals "$(grep -cE '^module_(backpack|ctunnel|lazyports)\(\) \{ lc_module (backpack|ctunnel|lazyports); \}$' "$EZVPS")" 3
-check "Backpack and Lazyports installers are pinned (no main/master/HEAD in their URLs)" not_contains "$(grep -E '^[[:space:]]*LC_URL=' "$EZVPS")" "/main/"
+check "Backpack and Lazyports downloads are pinned (no main/master/HEAD in their URLs)" not_contains "$(grep -E '^[[:space:]]*LC_URL=' "$EZVPS")" "/main/"
 ezb_code() { awk '/^(ezb_[a-z_]+|upd_[a-z_]+|module_uninstall)\(\) \{/ {on=1} on {print} /^}/ {on=0}' "$EZVPS" | grep -vE '^[[:space:]]*#'; }
 ezb_fn() { awk -v f="$1" '$0 ~ "^" f "\\(\\) \\{" {on=1} on {print} /^}/ {on=0}' "$EZVPS" | grep -vE '^[[:space:]]*#'; }
 check "the Backup, Update and Uninstall code exists (ezb_*, upd_*, module_uninstall)" bash -c '[[ "$(grep -c "^ezb_\|^upd_" <<<"$1")" -gt 0 ]]' _ "$(grep -E '^(ezb_|upd_)[a-z_]+\(\) \{' "$EZVPS")"

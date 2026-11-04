@@ -14,8 +14,8 @@
 # needs nginx, systemctl, curl and sha256sum (acme.sh install only) and openssl
 # (expiry dates only). The Backpack, ctunnel and Lazyports modules need
 # coreutils, uname, bash, sha256sum and curl (installer download), git, make and
-# gcc (ctunnel build), go (Lazyports) and optionally systemctl (Backpack
-# services) and apt-get. The SSH and Users module needs coreutils, useradd,
+# gcc (ctunnel build) and optionally systemctl (Backpack services) and apt-get.
+# Lazyports is a prebuilt binary and needs no Go. The SSH and Users module needs coreutils, useradd,
 # usermod, userdel, passwd, chown, sshd, systemctl and optionally ss and
 # apt-get (to offer the sudo package). The Firewall module needs coreutils and
 # the one backend it finds (ufw, firewall-cmd, nft or iptables), plus ss and
@@ -3515,7 +3515,7 @@ module_certs() {
 # Tool lifecycle modules: Backpack, ctunnel, Lazyports (PR 9)
 #
 # These three tools have their own interface (Backpack: an interactive CLI,
-# ctunnel: a command-line tunnel program, Lazyports: a Go TUI). ezvps manages
+# ctunnel: a command-line tunnel program, Lazyports: a terminal UI). ezvps manages
 # only their lifecycle: Install, Status, Update, Uninstall. Tunnel setup, ports,
 # tokens and every other setting stay in the tool's own interface; ezvps never
 # asks for, stores, prints or logs a tunnel token, setup link, password or key.
@@ -3526,7 +3526,9 @@ module_certs() {
 # documents nothing, ezvps says so instead of guessing.
 #
 # To bump a pin: read the upstream installer at the new tag/commit, then change
-# the tag/commit and the SHA-256 together, plus SPEC.md 6.5-6.7.
+# the tag/commit and the SHA-256 together, plus SPEC.md 6.5-6.7. For Lazyports
+# (a prebuilt binary from the fork's release) change the tag and both
+# per-architecture SHA-256 values together.
 # ---------------------------------------------------------------------------
 
 LC_BACKPACK_REPO="AminMGMT/BackPack"
@@ -3534,9 +3536,10 @@ LC_BACKPACK_TAG="v1.9.0"
 LC_BACKPACK_SHA256="270be80ff0599fc63f03e952b66f4721552c1965b448f5269d62645bacb9e20d"
 LC_CTUNNEL_REPO="alienrobotarmy/ctunnel"
 LC_CTUNNEL_COMMIT="ec5e388e1dd3b684cd1cea1ed5c67f99d42bf4f3"
-LC_LAZYPORTS_REPO="v9mirza/lazyports"
-LC_LAZYPORTS_COMMIT="84647db0ea0e0c7b90b247e35a6c47d44d4bba95"
-LC_LAZYPORTS_SHA256="6324d8c6e4fe736f994e41de5a985040b0d4d6b734968f0ad554833ca0940a60"
+LC_LAZYPORTS_REPO="hesamhanari/LazyPorts"
+LC_LAZYPORTS_TAG="v0.1.0"
+LC_LAZYPORTS_SHA256_AMD64="edf030c28163605f360097ece2a2207619f88bab0446b22a52a3863971eb8f87"
+LC_LAZYPORTS_SHA256_ARM64="9d4eb016a4df7ae3ff0a5b7f67ec830c36e9978c0fd72d28ab0f4d3150538b8a"
 
 LC_PREFIX="${EZVPS_TOOL_PREFIX:-/usr/local}"
 LC_BACKPACK_CONF="${EZVPS_BACKPACK_CONF_DIR:-/etc/backpack}"
@@ -3544,7 +3547,7 @@ LC_HOME="${HOME:-/root}"
 
 # Filled by lc_load (the per-tool table), lc_find and lc_version.
 LC_KEY="" LC_LABEL="" LC_CMD="" LC_PROJECT="" LC_KIND="" LC_URL="" LC_SHA="" LC_PIN_TEXT=""
-LC_GIT_URL="" LC_GIT_COMMIT="" LC_ARCHES="" LC_NEEDS_GO=0 LC_VERSION_ARG="" LC_UNITS_GLOB=""
+LC_GIT_URL="" LC_GIT_COMMIT="" LC_ARCHES="" LC_VERSION_ARG="" LC_UNITS_GLOB="" LC_ASSET=""
 LC_NO_SERVICE_TEXT="" LC_UPDATE="" LC_UNINSTALL="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT=""
 LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=() LC_BINS_FOUND=()
 LC_BIN_FOUND="" LC_VERSION=""
@@ -3553,7 +3556,7 @@ LC_BIN_FOUND="" LC_VERSION=""
 # is here; the flow below is shared.
 lc_load() {
     LC_KEY="$1"
-    LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=() LC_NEEDS_GO=0
+    LC_BINS=() LC_CONFIGS=() LC_REMOVE_PATHS=() LC_NOTES=()
     LC_URL="" LC_SHA="" LC_GIT_URL="" LC_GIT_COMMIT="" LC_UNITS_GLOB="" LC_VERSION_ARG=""
     LC_NO_SERVICE_TEXT="" LC_UPDATE_HINT="" LC_UNINSTALL_HINT="" LC_OPEN_HINT=""
     case "$1" in
@@ -3613,26 +3616,24 @@ lc_load() {
         lazyports)
             LC_LABEL="Lazyports" LC_CMD="lazyports"
             LC_PROJECT="https://github.com/${LC_LAZYPORTS_REPO}"
-            LC_KIND="script"
-            LC_URL="https://raw.githubusercontent.com/${LC_LAZYPORTS_REPO}/${LC_LAZYPORTS_COMMIT}/install.sh"
-            LC_SHA="$LC_LAZYPORTS_SHA256"
-            LC_PIN_TEXT="commit ${LC_LAZYPORTS_COMMIT} (upstream publishes no tags or releases)"
-            # A Go source build (go install); upstream states no architecture list.
+            # A prebuilt binary from the fork's GitHub release: no installer script, no Go, no build.
+            # LC_URL is the release download directory; the asset names and the pinned SHA-256
+            # per architecture are chosen by lc_select_asset.
+            LC_KIND="binary"
+            LC_URL="https://github.com/${LC_LAZYPORTS_REPO}/releases/download/${LC_LAZYPORTS_TAG}"
+            LC_PIN_TEXT="fork ${LC_LAZYPORTS_REPO} release ${LC_LAZYPORTS_TAG}, per-architecture SHA256 pinned, verified against the release SHA256SUMS"
             LC_ARCHES="x86_64 aarch64"
-            LC_NEEDS_GO=1
-            LC_BINS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # README: /usr/local/bin or ~/go/bin
-            # The installer may append a PATH line to a shell startup file; back them up first.
-            LC_CONFIGS=("${LC_HOME}/.bashrc" "${LC_HOME}/.zshrc")
+            LC_BINS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # new installs: /usr/local/bin; ~/go/bin is where a Go-built copy lives
             LC_NO_SERVICE_TEXT="none documented upstream (Lazyports is an interactive terminal program)"
             LC_UPDATE="none"
             LC_UNINSTALL="remove"
-            LC_REMOVE_PATHS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # README "Uninstallation"
+            LC_REMOVE_PATHS=("${LC_PREFIX}/bin/lazyports" "${LC_HOME}/go/bin/lazyports") # both places Lazyports has ever been installed to
             LC_OPEN_HINT="run: lazyports   (its own terminal interface)"
             LC_NOTES=(
-                "Lazyports needs Go 1.24 or newer. The installer runs 'go install github.com/${LC_LAZYPORTS_REPO}@main'"
-                "(GOPROXY=direct), then copies the binary to ${LC_PREFIX}/bin/lazyports, and may append a PATH line to"
-                "${LC_HOME}/.bashrc or ${LC_HOME}/.zshrc. The script is pinned and hash-checked; the code it builds is upstream's current"
-                "main branch and is NOT pinned (upstream publishes no tags or releases)."
+                "Lazyports is a prebuilt binary from the fork's release: no Go is needed and nothing is built."
+                "The binary must match BOTH the release SHA256SUMS and the SHA-256 pinned in ezvps, or nothing is installed."
+                "It is installed to ${LC_PREFIX}/bin/lazyports (mode 755). No shell startup file is changed."
+                "A copy installed the old way (Go build) in ${LC_HOME}/go/bin is left alone; Uninstall removes both places."
             )
             ;;
         *) return 1 ;;
@@ -3688,32 +3689,6 @@ lc_check_arch() {
     return 1
 }
 
-# lc_check_go: Lazyports builds from source with Go (go.mod: go 1.24; toolchain go1.24.12).
-# ezvps does not install Go (upstream says: install Go yourself).
-lc_check_go() {
-    local out minor
-    if ! have_cmd go; then
-        err "${LC_LABEL} needs Go 1.24 or newer, and 'go' was not found."
-        err "Install Go first (https://go.dev/doc/install); ezvps does not install it. Nothing was changed."
-        return 1
-    fi
-    out="$(go version 2>/dev/null)" || out=""
-    info "Found: ${out:-go (version unknown)}"
-    if [[ "$out" =~ go1\.([0-9]+) ]]; then
-        minor="${BASH_REMATCH[1]}"
-        if ((minor < 21)); then
-            err "${LC_LABEL} needs Go 1.24 or newer; this is older than 1.21, which cannot fetch the newer toolchain itself."
-            err "Install a current Go (https://go.dev/doc/install). Nothing was changed."
-            return 1
-        elif ((minor < 24)); then
-            warn "${LC_LABEL} needs Go 1.24 or newer; Go 1.${minor} will try to download the newer toolchain itself and the install fails if it cannot."
-        fi
-    else
-        warn "Could not read the Go version; the installer will report if it is too old."
-    fi
-    return 0
-}
-
 # lc_ensure_build_tools: ctunnel is built from source. Offer the packages after a yes.
 lc_ensure_build_tools() {
     local c missing=()
@@ -3744,9 +3719,9 @@ lc_prereqs() {
     if [[ "$LC_KIND" == "script" ]]; then
         require_cmds sha256sum bash || return 1
         ensure_curl "download the ${LC_LABEL} installer" || return 1
-        if ((LC_NEEDS_GO == 1)); then
-            lc_check_go || return 1
-        fi
+    elif [[ "$LC_KIND" == "binary" ]]; then
+        require_cmds sha256sum || return 1
+        ensure_curl "download the ${LC_LABEL} binary" || return 1
     else
         lc_ensure_build_tools || return 1
     fi
@@ -3784,6 +3759,13 @@ lc_show_plan() {
         info "  sha256:    ${LC_SHA} (expected)"
         info "The installer is saved to a temporary directory and checked against that hash first;"
         info "it is never piped into a shell."
+    elif [[ "$LC_KIND" == "binary" ]]; then
+        info "  binary:    ${LC_URL}/${LC_ASSET}"
+        info "  checksums: ${LC_URL}/SHA256SUMS"
+        info "  pinned to: ${LC_PIN_TEXT}"
+        info "  sha256:    ${LC_SHA} (expected for ${LC_ASSET})"
+        info "Both files are saved to a temporary directory and the binary is checked against the"
+        info "pinned hash and the downloaded SHA256SUMS first; it is installed only if both match."
     else
         info "  source:    ${LC_GIT_URL}"
         info "  pinned to: ${LC_PIN_TEXT}"
@@ -3798,10 +3780,10 @@ lc_show_plan() {
     info ""
 }
 
-# Downloads the pinned installer and nothing else (the only curl for these tools).
-lc_fetch_installer() { # lc_fetch_installer <outfile>
+# Downloads the pinned installer or release file and nothing else (the only curl for these tools).
+lc_fetch_installer() { # lc_fetch_installer <outfile> [url] (url defaults to LC_URL)
     curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 --max-time 120 \
-        -o "$1" "$LC_URL"
+        -o "$1" "${2:-$LC_URL}"
 }
 
 # Fetches exactly the pinned commit (the only git network access for these tools).
@@ -3858,6 +3840,127 @@ lc_run_script() {
     if ((rc != 0)); then
         err "The ${LC_LABEL} installer exited with status ${rc}."
         return 1
+    fi
+    return 0
+}
+
+# lc_select_asset: Lazyports release asset and pinned SHA-256 for this architecture
+# (uname -m: x86_64 -> amd64, aarch64 -> arm64). Any other architecture was already
+# refused by lc_check_arch; this refuses again rather than guess.
+lc_select_asset() {
+    local m
+    m="$(uname -m 2>/dev/null)" || m=""
+    case "$m" in
+        x86_64)
+            LC_ASSET="lazyports-linux-amd64" LC_SHA="$LC_LAZYPORTS_SHA256_AMD64" ;;
+        aarch64)
+            LC_ASSET="lazyports-linux-arm64" LC_SHA="$LC_LAZYPORTS_SHA256_ARM64" ;;
+        *)
+            err "${LC_LABEL} install does not support architecture '${m:-unknown}' (supported: ${LC_ARCHES// /, }). Nothing was changed."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# lc_sums_lookup <SHA256SUMS file> <name>: prints the hash listed for <name>
+# ("<hash>  <name>" or "<hash> *<name>"); pure bash. Fails when there is no such line.
+lc_sums_lookup() {
+    local line hash rest
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        hash="${line%%[[:space:]]*}"
+        [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+        rest="${line#"$hash"}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        rest="${rest#\*}"
+        rest="${rest#./}"
+        if [[ "$rest" == "$2" ]]; then
+            printf '%s\n' "$hash"
+            return 0
+        fi
+    done <"$1"
+    return 1
+}
+
+# lc_file_sha <file>: the file's SHA-256 (hex) on stdout; fails if sha256sum does.
+lc_file_sha() {
+    local out
+    out="$(sha256sum "$1")" || return 1
+    printf '%s\n' "${out%% *}"
+}
+
+# lc_run_binary: download the release binary and SHA256SUMS, verify the binary against
+# BOTH the pinned hash and the downloaded SHA256SUMS, and only then back up any existing
+# binary and install it (mode 755). Nothing is installed on any failure, and there is no
+# fallback to a Go build or any other source.
+lc_run_binary() {
+    local tmp actual listed dest="${LC_PREFIX}/bin/lazyports" part installed
+    tmp="$(mktemp -d)" || {
+        err "Cannot create a temporary directory."
+        return 1
+    }
+    info "Downloading ${LC_URL}/${LC_ASSET}"
+    if ! lc_fetch_installer "${tmp}/${LC_ASSET}" "${LC_URL}/${LC_ASSET}"; then
+        err "Download failed: ${LC_URL}/${LC_ASSET}"
+        err "(A 404 means that release asset does not exist.) Nothing was installed; there is no fallback to another install method."
+        rm -rf "$tmp"
+        return 1
+    fi
+    info "Downloading ${LC_URL}/SHA256SUMS"
+    if ! lc_fetch_installer "${tmp}/SHA256SUMS" "${LC_URL}/SHA256SUMS"; then
+        err "Download failed: ${LC_URL}/SHA256SUMS"
+        err "(A 404 means the release has no SHA256SUMS file.) Nothing was installed; there is no fallback to another install method."
+        rm -rf "$tmp"
+        return 1
+    fi
+    actual="$(lc_file_sha "${tmp}/${LC_ASSET}")" || {
+        err "sha256sum failed."
+        rm -rf "$tmp"
+        return 1
+    }
+    if [[ "$actual" != "$LC_SHA" ]]; then
+        err "SHA-256 mismatch for the downloaded ${LC_ASSET}; refusing to install it."
+        err "  expected (pinned): ${LC_SHA}"
+        err "  got:               ${actual}"
+        rm -rf "$tmp"
+        return 1
+    fi
+    listed="$(lc_sums_lookup "${tmp}/SHA256SUMS" "$LC_ASSET")" || listed=""
+    if [[ -z "$listed" ]]; then
+        err "The downloaded SHA256SUMS has no entry for ${LC_ASSET}; refusing to install."
+        rm -rf "$tmp"
+        return 1
+    fi
+    listed="${listed,,}"
+    if [[ "$actual" != "$listed" ]]; then
+        err "SHA-256 mismatch: the binary matches the pinned hash but not the downloaded SHA256SUMS; refusing to install it."
+        err "  SHA256SUMS lists: ${listed}"
+        err "  binary:           ${actual}"
+        rm -rf "$tmp"
+        return 1
+    fi
+    info "Downloaded ${LC_ASSET} matches the pinned sha256 and the release SHA256SUMS."
+    lc_backup_all || {
+        rm -rf "$tmp"
+        return 1
+    }
+    part="${dest}.ezvps-new.$$"
+    if ! { mkdir -p "${LC_PREFIX}/bin" && cp "${tmp}/${LC_ASSET}" "$part" && chmod 755 "$part" && mv -f "$part" "$dest"; }; then
+        err "Could not install ${dest}."
+        rm -f "$part"
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    installed="$(lc_file_sha "$dest")" || installed=""
+    if [[ "$installed" != "$LC_SHA" ]]; then
+        err "The installed ${dest} does not match the verified download; ${LC_LABEL} is NOT installed correctly."
+        return 1
+    fi
+    info "Installed ${dest} (mode 755, release ${LC_LAZYPORTS_TAG}, sha256 verified)."
+    if [[ -e "${LC_HOME}/go/bin/lazyports" ]]; then
+        info "Note: an older copy from a Go build is still at ${LC_HOME}/go/bin/lazyports; Uninstall removes both."
     fi
     return 0
 }
@@ -3945,8 +4048,21 @@ lc_install_flow() {
             }
         fi
     fi
+    if [[ "$LC_KIND" == "binary" ]]; then
+        lc_select_asset || return 0
+    fi
     lc_prereqs || return 0
     lc_show_plan
+    if [[ "$LC_KIND" == "binary" ]]; then
+        ask_yes_no "Download, verify and install ${LC_LABEL} now?" || {
+            info "Cancelled. Nothing was changed."
+            return 0
+        }
+        # The existing binary is backed up inside lc_run_binary, after the download is verified.
+        lc_run_binary || return 0
+        lc_report_installed "$old" || true
+        return 0
+    fi
     ask_yes_no "Download and run the ${LC_LABEL} install now?" || {
         info "Cancelled. Nothing was changed."
         return 0
