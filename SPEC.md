@@ -2,7 +2,7 @@
 
 Version: 0.0.1 (in development). This file is the source of truth for scope.
 Each later PR implements one module from the list below and updates the
-status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10), Firewall (PR 11), Backup, Check For Updates and Uninstall (PR 12): **the panel is complete, every menu item is implemented**.
+status table here. Done so far: L2TP (PR 1), 3x-ui (PR 2), Nginx (PR 3, conf.d in PR 4, nginx.org stable in PR 5), Ubuntu 24.04 LTS support (PR 6), Debian and Ubuntu LTS family support (PR 7), Certificates and the new Nginx site template (PR 8), the Backpack, ctunnel and Lazyports lifecycle modules (PR 9), SSH and Users (PR 10), Firewall (PR 11), Backup, Check For Updates and Uninstall (PR 12): **the panel is complete, every menu item is implemented**. Later: a Run item and shorter install/status output for the lifecycle submenu (6.5).
 
 ## 1. What ezvps is
 
@@ -995,8 +995,11 @@ flow. Menu items 3, 4 and 7 open the **same submenu** for each tool. Clean label
  2) Status
  3) Update
  4) Uninstall
+ 5) Run
  0) Back
 ```
+
+Run was added as item 5, after Uninstall, so items 1 to 4 kept their numbers.
 
 `0` or EOF returns to the main menu; after each action "Press Enter to continue...";
 invalid input prints `Invalid choice: <input>`. Module keys `backpack`, `ctunnel`,
@@ -1005,19 +1008,20 @@ one-line wrapper around the shared `lc_module <key>`; all helpers are prefixed `
 
 **Scope: lifecycle only.** These three tools have their own interface (Backpack: an
 interactive CLI, ctunnel: a command-line tunnel program, Lazyports: a terminal UI).
-ezvps manages Install, Status, Update and Uninstall and **nothing else**. Tunnel setup,
+ezvps manages Install, Status, Update, Uninstall and Run and **nothing else**. Tunnel setup,
 port management, tokens, setup links, certificates, ciphers and every other setting stay
 in the tool's own CLI or TUI: ezvps does not rebuild, wrap or script them, does not
-launch a tool after installing it (it prints how to open it), and **never asks for,
+launch a tool after installing it (only Run, below, starts it), and **never asks for,
 stores, prints or logs a tunnel token, setup link, password or private key**. The
 lifecycle code contains no input prompt other than the submenu choice and yes/no
-confirmations (a test enforces it). The one place ezvps starts a tool is Update and
-Uninstall of Backpack, whose documented method *is* Backpack's own menu: ezvps opens it
-as a child process on the terminal, the user picks the menu item, and ezvps goes on when
-it exits.
+confirmations (a test enforces it). ezvps starts a tool only in two places: **Run**, when
+the user picks it, and Update and Uninstall of Backpack, whose documented method *is*
+Backpack's own menu: ezvps opens it as a child process on the terminal, the user picks the
+menu item, and ezvps goes on when it exits.
 
 One table, `lc_load`, holds what differs per tool (installer, binary, config, version
-command, services, update and uninstall method, architectures, the text of the plan);
+command, services, update and uninstall method, architectures, the text of the plan, the
+one-line open hint `LC_OPEN_HINT` and the Run arguments `LC_RUN_ARGS` / `LC_RUN_INPUT`);
 everything else is the shared flow below. Only what **upstream documents** is used; each
 fact has its upstream source named in 6.5 to 6.7. Where upstream documents nothing, ezvps
 says so and does not guess (no invented service, version flag or update command).
@@ -1036,10 +1040,15 @@ says so and does not guess (no invented service, version flag or update command)
    `apt-get` after a yes, as elsewhere); Lazyports needs only `sha256sum` and `curl`, no Go (6.7); ctunnel needs `git`,
    `make`, `gcc` (offered via one `apt-get install git make gcc libssl-dev zlib1g-dev`
    after a yes).
-4. The plan is printed before anything is fetched: project, installer URL or git URL, the
-   pin (tag or commit), the expected SHA-256, what the upstream install does and which
-   files it touches, that existing files are backed up first and that the tool is not
-   started and nothing is asked for. Then `ezvps` asks once; `n` changes nothing.
+4. The plan is printed before anything is fetched, in **three lines**:
+   `Install:     <what>` (e.g. `Lazyports (prebuilt release binary)`),
+   `Version:     <pin>` (`installer at tag v1.9.0`, `commit <first 12 hex>`,
+   `release v0.1.0`) and `Destination: <binary path>`. No URL, no SHA-256 and no per-tool
+   notes are printed: the project and download URLs, the pinned hashes, what each upstream
+   install does and which files it touches are in this section and README (ezvps still
+   checks every hash; a mismatch prints the expected and the actual value). Existing files
+   are still backed up first and the tool is still not started; nothing is asked for.
+   Then `ezvps` asks once; `n` changes nothing.
 5. **Backup before overwriting.** Each existing config path and binary of the tool is
    copied byte for byte with `cp -a` to `/var/backups/ezvps/<key>-<n>-<name>.<timestamp>.<pid>`
    (dir mode 700; configs first, then binaries, `n` counts the copies). ezvps never reads
@@ -1050,8 +1059,13 @@ says so and does not guess (no invented service, version flag or update command)
    failure, is reported and the module returns to the menu.
 7. **Verify afterwards:** the binary must exist at a documented location, otherwise
    `The installer finished, but no <cmd> binary was found ... <Label> is NOT installed.`
-   On success print `Installed: <path>`, the version (or that none is reported) and
-   `To open <Label>: run: <command>`; nothing is launched.
+   On success print **one line**: `Installed <path> (version <v>).` (`<old> -> <new>` on a
+   reinstall or update) for an installer or source build, or, for the Lazyports binary,
+   `Installed <path> (mode 755, sha256 verified).`; nothing is launched. Progress is one
+   short line per step: `Downloading the Backpack installer...`, `Downloading <asset>...`,
+   `Downloading SHA256SUMS...`, `Fetching ctunnel source (commit <12 hex>)...`,
+   `Building ctunnel (make)...`. Failure messages keep their full reason (the failed URL,
+   both hashes, the build log tail, the unsupported architecture).
 
 **Fetching rules.** An installer script is downloaded with `curl --proto '=https'
 --tlsv1.2` into a private temp directory by `lc_fetch_installer` (the only `curl` of these
@@ -1059,7 +1073,8 @@ modules), hashed, compared with the pinned SHA-256 and **refused on a mismatch**
 with `bash <file> </dev/null` (the script's terminal input is `/dev/null`: Backpack's
 installer would otherwise open Backpack's menu on a terminal, and ezvps must not launch the
 tool). It is never piped or process-substituted into a shell. Nothing from the network is
-run without the URL and pin having been shown and a yes. Lazyports is the exception to
+run without the pin (tag, release or commit) having been shown and a yes; the URLs are
+fixed in the code and listed here. Lazyports is the exception to
 "installer script": it downloads a prebuilt release binary and its `SHA256SUMS` through the
 same `lc_fetch_installer`, runs nothing it downloaded, and installs the binary only when it
 matches both the pinned hash and the `SHA256SUMS` entry (6.7); for it the existing binary is
@@ -1069,10 +1084,26 @@ the new tag or commit, change the tag/commit and the hash together, update 6.5 t
 run the tests (`tests/lint.sh` checks that the pins exist and are well formed).
 
 **Status.** Read-only. `Installed: yes/no`, each binary path found, `Version:` (the first
-line of the tool's documented version command, or `not reported` when it has none),
-services (below), and how to open the tool. A tool without a documented service says so
-(`Service: none documented upstream ...`): status is then *installed + binary present*,
-never *running* or *stopped*.
+line of the tool's documented version command; no line when it has none), services (below)
+and one line `Open: Run, or type: <LC_OPEN_HINT>`. A tool without a documented service
+(ctunnel, Lazyports) gets no service line at all: status is then *installed + binary
+present*, never *running* or *stopped*.
+
+**Run** (item 5). Starts the installed binary (the one Status finds) in the foreground with
+the per-tool arguments from `lc_load`, and returns to the same submenu when it exits; a
+non-zero exit is reported in one line. Nothing is backed up, installed or changed.
+* Lazyports: `lazyports`, no arguments, with the real terminal inherited (no `</dev/null`,
+  no pipe, no background job); `q` quits the TUI.
+* Backpack: `backpack`, its documented open command (upstream says `sudo backpack`; ezvps
+  already runs as root, so no `sudo`), with the terminal; its menu's Exit returns.
+* ctunnel: it has no interactive interface and is not started bare. Run executes
+  `ctunnel -h` only, with `/dev/null` as input: it prints usage and returns. ezvps never
+  passes tunnel arguments, never opens a port and never starts a tunnel.
+* Not installed: `<Label> is not installed. Install it first.` and nothing is run.
+Only these three tools have Run. Nginx, Certificates, SSH and Users, Firewall, Backup,
+Check For Updates and Uninstall are ezvps functions, not external programs (running the
+`nginx` binary directly would bypass the config test), and L2TP already launches `ezl2tp`
+from the main menu.
 
 **Update.** Only through the tool's documented update method, never a guessed command.
 * *Documented menu update* (Backpack): explain, ask, back up the config and binary, open
@@ -1167,9 +1198,10 @@ printed.
   printed, and never deleted or created by ezvps (ctunnel creates it itself on first run).
 * **Version:** `ctunnel -v` ("Print Version information then exit", `src/opt.c`; with no
   other option ctunnel prints its banner, then usage, and exits 0). ezvps shows the first
-  line, `ctunnel <major>.<minor> Copyright ...`. It is the only way ezvps ever runs ctunnel.
-* **Services:** none documented upstream: Status says so and reports installed + binary
-  present, not running/stopped. Tunnels are started by hand by the user.
+  line, `ctunnel <major>.<minor> Copyright ...`. Apart from Run's `ctunnel -h` (usage
+  only, input `/dev/null`), it is the only way ezvps ever runs ctunnel.
+* **Services:** none documented upstream: Status prints no service line and reports
+  installed + binary present, not running/stopped. Tunnels are started by hand by the user.
 * **Update:** upstream documents **no update command**. Update says so
   (`ctunnel has no documented update command upstream, and ezvps does not guess one.`) and
   offers the documented reinstall (the Install flow above, backup first), then reports the
@@ -1200,8 +1232,9 @@ printed.
   * amd64: `edf030c28163605f360097ece2a2207619f88bab0446b22a52a3863971eb8f87`
   * arm64: `9d4eb016a4df7ae3ff0a5b7f67ec830c36e9978c0fd72d28ab0f4d3150538b8a`
 
-  Pin text shown in the plan: *fork hesamhanari/LazyPorts release v0.1.0, per-architecture
-  SHA256 pinned, verified against the release SHA256SUMS*. Both files are downloaded to a
+  The plan shows only `Version: release v0.1.0` and `Destination: /usr/local/bin/lazyports`;
+  the URLs and hashes above are not printed (a mismatch prints both hashes). Both files are
+  downloaded to a
   temporary directory (`curl --proto =https --tlsv1.2`); the binary is installed **only if**
   its `sha256sum` equals the pinned value **and** the entry for that asset in the downloaded
   `SHA256SUMS`. A mismatch against either, a `SHA256SUMS` without an entry for the asset, or
@@ -1218,8 +1251,8 @@ printed.
   installed the old Go way). Status finds both, and so does Uninstall, so an old Go-built
   install is still detected and removed. A reinstall while an old `~/go/bin` copy exists
   installs to `/usr/local/bin` and says the old copy is left alone.
-* **Version:** none documented; Status prints `not reported`. No `--version` is guessed.
-* **Services:** none (an interactive TUI): Status says so.
+* **Version:** none documented; Status prints no version line. No `--version` is guessed.
+* **Services:** none (an interactive TUI): Status prints no service line.
 * **Update:** unchanged: no update command is documented for Lazyports, so Update says so
   and offers the same reinstall (the pinned release above). There is **no latest-release
   check**; a later PR can add Update against the fork's releases.

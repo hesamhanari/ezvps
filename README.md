@@ -144,6 +144,7 @@ The exact source URL, pin and behaviour are in [SPEC.md](SPEC.md) section 6.2.
  2) Status
  3) Update
  4) Uninstall
+ 5) Run
  0) Back
 ```
 
@@ -152,22 +153,33 @@ ctunnel: a command-line tunnel program, Lazyports: a terminal UI). ezvps manages
 only their **lifecycle**. Tunnel setup, ports, tokens, setup links and every other
 setting stay in the tool's own interface: ezvps never rebuilds them, never asks for
 a tunnel token, setup link, password or key, and never prints, stores or logs one.
-After an install it only tells you how to open the tool; it does not launch it.
+An install never launches the tool; **Run** does, when you pick it.
 
 The same rules apply to all three:
 
 * **Install** is refused, with nothing changed, outside the five supported systems
   and outside `x86_64` / `aarch64`. If the tool is already installed it says so and
-  does not reinstall unless you say yes. It shows the official source and the pin,
-  asks, backs up any existing config and binary under `/var/backups/ezvps/`, and only
-  then runs upstream's documented install. Installer scripts are downloaded to a
-  temporary file, checked against a pinned SHA-256 and run with no terminal input
-  (never piped into a shell). Lazyports has no installer script: its prebuilt
-  release binary is downloaded, verified (pinned hash and `SHA256SUMS`) and only
-  then backed up over and installed; a failed download or hash installs nothing.
+  does not reinstall unless you say yes. It shows a three-line plan (what, the pinned
+  version, the destination), asks, backs up any existing config and binary under
+  `/var/backups/ezvps/`, and only then runs upstream's documented install. Installer
+  scripts are downloaded to a temporary file, checked against a pinned SHA-256 and run
+  with no terminal input (never piped into a shell). Lazyports has no installer script:
+  its prebuilt release binary is downloaded, verified (pinned hash and `SHA256SUMS`) and
+  only then backed up over and installed; a failed download or hash installs nothing.
+  The screen stays short: one line per download and one `Installed ...` line. The
+  source URLs and pinned hashes are not printed (ezvps checks them; they are listed
+  below and in SPEC.md); a failure still prints its reason, and a hash mismatch prints
+  the expected and the actual hash.
 * **Status** shows installed or not, the binary path, the version when the tool has a
-  documented version command, and whether its services run when upstream documents
-  any. Where there is no service it says so instead of inventing one.
+  documented version command, Backpack's services, and one line on how to open the
+  tool. ctunnel and Lazyports document no service, so there is no service line (never
+  "running" or "stopped").
+* **Run** starts the installed tool in the foreground and comes back to the submenu
+  when it exits: `lazyports` (its TUI; quit with `q`), `backpack` (its own menu; ezvps
+  is already root, so no `sudo`), and for ctunnel only `ctunnel -h` (its usage).
+  ctunnel has no interactive interface, so Run never starts it bare or with tunnel
+  arguments and never opens a port: tunnels are started by hand. If the tool is not
+  installed, Run says `<Tool> is not installed. Install it first.` and runs nothing.
 * **Update** uses only the tool's documented update method, after a config backup, and
   reports the old and new version when the tool reports them. Where upstream documents
   no update command it says so and offers a reinstall from the documented source.
@@ -179,6 +191,25 @@ The same rules apply to all three:
 | [Backpack](https://github.com/AminMGMT/BackPack) | `/usr/local/bin/backpack` | `/etc/backpack` | official `install.sh` at tag `v1.9.0` (SHA-256 checked); it downloads the latest release and verifies it against the release's `SHA256SUMS` | `backpack version` | `backpack-*.service` units (one per tunnel, plus monitor) | Backpack's own **Update** menu item (8): ezvps opens its menu for you to pick it | Backpack's own **Uninstall** menu item (9), same way |
 | [ctunnel](https://github.com/alienrobotarmy/ctunnel) | `/usr/local/bin/ctunnel` (+ man page) | `~/.passkey` | upstream has no installer or releases: its documented `make; make install` on one pinned commit (fetched with git) | `ctunnel -v` | none documented | none documented: ezvps says so and offers a reinstall | what `make uninstall` removes: the binary and the man page |
 | [Lazyports](https://github.com/hesamhanari/LazyPorts) | `/usr/local/bin/lazyports` (a copy installed the old Go way in `~/go/bin/lazyports` is still found and removed) | none (only an existing binary is backed up) | prebuilt binary from the fork, release `v0.1.0`: `lazyports-linux-amd64` or `-arm64`, per-architecture SHA-256 pinned and verified against the release `SHA256SUMS` (both must match, else nothing is installed); no Go needed | none documented | none documented | none documented: ezvps says so and offers a reinstall | remove the binary, as upstream documents |
+
+Where the files come from (not printed by Install, which only shows the tag, release or
+commit):
+
+| Tool | Source | Pinned SHA-256 |
+|------|--------|----------------|
+| Backpack | `https://raw.githubusercontent.com/AminMGMT/BackPack/v1.9.0/install.sh` | in `ezvps` as `LC_BACKPACK_SHA256` (value in SPEC.md 6.5) |
+| ctunnel | `https://github.com/alienrobotarmy/ctunnel.git`, commit `ec5e388e1dd3b684cd1cea1ed5c67f99d42bf4f3` (git, https only) | n/a: `git rev-parse HEAD` must equal the commit |
+| Lazyports | `https://github.com/hesamhanari/LazyPorts/releases/download/v0.1.0/lazyports-linux-amd64` (or `-arm64`) and `.../v0.1.0/SHA256SUMS` | one per architecture (`LC_LAZYPORTS_SHA256_AMD64` / `_ARM64`, values in SPEC.md 6.7); the binary must match both the pin and `SHA256SUMS` |
+
+What each install does: Backpack's installer downloads the latest Backpack release for the
+architecture, verifies it against that release's `SHA256SUMS`, and installs
+`/usr/local/bin/backpack`, `/etc/backpack` and `/root/BackPack`; ezvps runs it with no
+terminal input, so it only installs and does not open Backpack's menu. ctunnel is built
+from source in a temporary directory with upstream's `make; make install` (OpenSSL build;
+`git`, `make`, `gcc`, `libssl-dev`, `zlib1g-dev` are offered via `apt-get` when missing).
+Lazyports needs no Go and builds nothing; it goes to `/usr/local/bin/lazyports` (mode 755),
+no shell startup file is changed, and a copy installed the old way in `~/go/bin` is left
+alone (Uninstall removes both).
 
 Config backups are byte-for-byte copies that ezvps never reads or prints; they can
 contain a tunnel token or key, which is why `/var/backups/ezvps` is root-only. Details,

@@ -479,10 +479,14 @@ tunnel setup in this section happens inside each tool's own interface.
 
 **8a. Submenus (all three)**
 - [ ] `ezvps` -> `3`, `4`, `7` each show exactly `1) Install`, `2) Status`,
-      `3) Update`, `4) Uninstall`, `0) Back` under the tool's name; `abc` prints
+      `3) Update`, `4) Uninstall`, `5) Run`, `0) Back` under the tool's name; `abc` prints
       `Invalid choice: abc`; Ctrl-D exits cleanly
 - [ ] with the tool not installed, `Status`, `Update` and `Uninstall` each say it is
-      not installed and change nothing
+      not installed and change nothing; `Run` prints one line,
+      `<Tool> is not installed. Install it first.`, runs nothing and returns to the submenu
+- [ ] the `Install` plan is three lines (`Install:`, `Version:`, `Destination:`): no URL and
+      no SHA-256 hash; the download lines are one short line each; a success is one
+      `Installed ...` line
 
 **8b. Unsupported systems and architectures** (use a spare VM or a copy of
 `/etc/os-release` via `EZVPS_OS_RELEASE`; do not edit the real file)
@@ -492,13 +496,15 @@ tunnel setup in this section happens inside each tool's own interface.
       `does not support architecture '...' (supported: x86_64, aarch64)`
 
 **8c. Backpack**
-- [ ] `Install` shows the project, the installer URL
-      `https://raw.githubusercontent.com/AminMGMT/BackPack/v1.9.0/install.sh`, the tag,
-      the expected SHA-256 and what the installer does; answering `n` downloads and
-      changes nothing
+- [ ] `Install` shows `Install: Backpack (official installer script)`,
+      `Version: installer at tag v1.9.0` and `Destination: /usr/local/bin/backpack`;
+      answering `n` downloads and changes nothing. (The URL and SHA-256 it checks are in
+      SPEC 6.5.)
 - [ ] answering `y` installs `/usr/local/bin/backpack`, `/etc/backpack` and
-      `/root/BackPack`; **Backpack's menu does not open**; ezvps prints only
-      `To open Backpack: run: backpack` and the version (`backpack version`)
+      `/root/BackPack`; **Backpack's menu does not open**; ezvps prints one line,
+      `Installed /usr/local/bin/backpack (version v1.9.0).`
+- [ ] `Run` opens Backpack's own menu on the terminal (no `sudo`, ezvps is root); leaving
+      it with `10` (Exit) returns to the ezvps submenu, nothing was backed up or changed
 - [ ] `Install` again: it says Backpack is already installed and asks before
       reinstalling; `n` changes nothing
 - [ ] open Backpack yourself (`backpack`), create a throwaway tunnel with fake values
@@ -516,15 +522,17 @@ tunnel setup in this section happens inside each tool's own interface.
       `10` instead makes ezvps say Backpack is still present
 
 **8d. ctunnel**
-- [ ] `Install` plan shows `https://github.com/alienrobotarmy/ctunnel.git`, the pinned
-      commit and that upstream has no installer or release; with `git`, `make` or
+- [ ] `Install` plan shows `Install: ctunnel (built from source: make; make install)`, the
+      first 12 characters of the pinned commit and the destination; with `git`, `make` or
       `gcc` missing it offers `apt-get install git make gcc libssl-dev zlib1g-dev`
       and installs nothing on `n`
 - [ ] after `y`: `/usr/local/bin/ctunnel` and `/usr/local/share/man/man1/ctunnel.1`
-      exist, `Version:` shows the `ctunnel 0.8 ...` line from `ctunnel -v`, nothing was
-      started (`pgrep ctunnel` prints nothing)
-- [ ] `Status`: installed, version, and the text that no service is documented (it
+      exist, the `Installed ...` line shows the `ctunnel 0.8 ...` version from `ctunnel -v`,
+      nothing was started (`pgrep ctunnel` prints nothing)
+- [ ] `Status`: installed, binary, version and the one-line open hint; no service line (it
       never says running or stopped)
+- [ ] `Run` prints ctunnel's usage (`ctunnel -h`) and returns to the submenu at once;
+      `pgrep ctunnel` prints nothing, no port is opened (`ss -tlnp` unchanged)
 - [ ] create `~/.passkey` the way ctunnel does (run ctunnel once by hand with fake
       values) and `Update`: ezvps says there is **no documented update command**,
       offers a reinstall, backs up the binary and `~/.passkey` to
@@ -536,13 +544,15 @@ tunnel setup in this section happens inside each tool's own interface.
 
 **8e. Lazyports**
 - [ ] `Install` works **without Go installed** (`command -v go` prints nothing); the plan
-      shows the fork `hesamhanari/LazyPorts`, the release `v0.1.0` binary URL for this
-      architecture (`lazyports-linux-amd64` or `-arm64`), the `SHA256SUMS` URL and the
-      pinned SHA-256; no Go requirement and no `go install` text
-- [ ] after `y`: `/usr/local/bin/lazyports` exists with mode 755 and `sha256sum` of it
-      equals the pinned value; nothing is created in `~/go`; `~/.bashrc` and `~/.zshrc`
-      are unchanged; ezvps prints only `To open Lazyports: run: lazyports` and
-      `Version: not reported`; Lazyports itself did not start
+      is `Install: Lazyports (prebuilt release binary)`, `Version: release v0.1.0`,
+      `Destination: /usr/local/bin/lazyports`; no Go requirement and no `go install` text
+- [ ] after `y`: `Downloading lazyports-linux-amd64...` (or `-arm64`) and
+      `Downloading SHA256SUMS...`, then one line,
+      `Installed /usr/local/bin/lazyports (mode 755, sha256 verified).`; the file has mode
+      755 and `sha256sum` of it equals the pinned value in SPEC 6.7; nothing is created in
+      `~/go`; `~/.bashrc` and `~/.zshrc` are unchanged; Lazyports itself did not start
+- [ ] `Run` opens the Lazyports TUI full screen and responsive to keys; `q` quits it and
+      ezvps is back in the Lazyports submenu
 - [ ] a second `Install` asks before reinstalling; after `y` the old binary is in
       `/var/backups/ezvps/lazyports-1-lazyports.*`
 - [ ] on an unsupported architecture, `Install` is refused with nothing changed

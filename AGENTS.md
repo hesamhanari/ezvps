@@ -80,15 +80,19 @@ SPEC.md  README.md  AGENTS.md
   the pinned Lazyports release binary and `SHA256SUMS`); git may touch the network only in `lc_fetch_source` (the
   pinned ctunnel commit, https only) and in `upd_fetch_latest` (a shallow clone of `main` of the user's own
   private ezvps repository, https/ssh only, with the user's own authentication). Lint enforces both.
-  Download to a temp file, show URL and hash, verify, ask, then run. Never
+  Download to a temp file, show URL and hash, verify, ask, then run (Backpack, ctunnel
+  and Lazyports show only the pinned tag/release/commit; their URLs and hashes are in
+  README and SPEC 6.5-6.7, and a mismatch prints both hashes). Never
   pipe or process-substitute a download into a shell. Pin a tag/version plus
   a SHA-256 (the nginx.org key is pinned by fingerprint); never
   `master`/`main`. acme.sh is the script at a release tag with a SHA-256 (SPEC
   6.4), never `get.acme.sh`.
 * Backpack, ctunnel, Lazyports are **lifecycle modules only** (Install, Status, Update,
-  Uninstall) on one shared flow (`lc_*`, per-tool table in `lc_load`). Tunnel setup,
+  Uninstall, Run) on one shared flow (`lc_*`, per-tool table in `lc_load`). Tunnel setup,
   ports, tokens and every other setting stay in the tool's own interface: never rebuild
-  them, never launch a tool after installing it, never ask for, store, print or log a
+  them, never launch a tool after installing it (only Run, the user's own choice, starts
+  it, with the per-tool `LC_RUN_ARGS` from `lc_load`; ctunnel gets `-h` only and never
+  tunnel arguments), never ask for, store, print or log a
   tunnel token, setup link, password or key (config backups are byte-for-byte copies that
   ezvps does not read). Use only what upstream documents: no invented service name,
   version flag or update command; where upstream has none, say so and offer the
@@ -97,7 +101,10 @@ SPEC.md  README.md  AGENTS.md
   binary from the fork's release (tag plus one SHA-256 per architecture, also checked against
   the release `SHA256SUMS`; both must match, nothing is installed otherwise, no Go and no
   fallback to another source; existing binaries are backed up after the verification).
-  Adding a tool means a new `lc_load` entry, not a new submenu.
+  Adding a tool means a new `lc_load` entry, not a new submenu. Install output stays short:
+  a three-line plan (what, version, destination), one line per download, one success line;
+  URLs, hashes and per-tool notes belong in README/SPEC, not on screen. Never shorten a
+  warning or a failure reason (a hash mismatch still prints expected and got).
 * SSH and Users (SPEC 6.8): never read `/etc/shadow`, never print, store or log a password,
   a password hash or a private key (a pasted private key is refused and discarded). A
   password is only ever asked for by the system's own `passwd` prompt. Delete user refuses
