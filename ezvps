@@ -35,11 +35,23 @@ EZVPS_VERSION="0.0.1-dev"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_BOLD=$'\033[1m'
+    C_CYAN=$'\033[38;5;51m'
+    C_BLUE=$'\033[38;5;39m'
+    C_PURPLE=$'\033[38;5;141m'
+    C_PINK=$'\033[38;5;177m'
+    C_MUTED=$'\033[38;5;245m'
+    C_LINE=$'\033[38;5;238m'
+    C_PILL=$'\033[48;5;45;38;5;16;1m'
+    C_SEL_BG=$'\033[48;5;23m'
+    C_SEL_FG=$'\033[38;5;51;1m'
+    C_SEL_TXT=$'\033[38;5;255;1m'
     C_YELLOW=$'\033[33m'
     C_RED=$'\033[31m'
     C_RESET=$'\033[0m'
 else
-    C_BOLD="" C_YELLOW="" C_RED="" C_RESET=""
+    C_BOLD="" C_CYAN="" C_BLUE="" C_PURPLE="" C_PINK=""
+    C_MUTED="" C_LINE="" C_PILL="" C_SEL_BG="" C_SEL_FG="" C_SEL_TXT=""
+    C_YELLOW="" C_RED="" C_RESET=""
 fi
 
 info() { printf '%s\n' "$*"; }
@@ -51,6 +63,177 @@ clear_screen() {
     return 0
 }
 
+# Pure-bash interactive TUI helpers (zero external commands).
+tui_interactive() {
+    [[ -t 0 && -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]
+}
+
+tui_cursor_show() {
+    tui_interactive && printf '\033[?25h'
+    return 0
+}
+
+tui_sys_summary() {
+    local host="" ip="" line tok prev=""
+    if [[ -r /proc/sys/kernel/hostname ]]; then
+        read -r host </proc/sys/kernel/hostname || true
+    fi
+    [[ -z "$host" ]] && host="${HOSTNAME:-vps}"
+    detect_os
+    if [[ -r /proc/net/fib_trie ]]; then
+        while IFS= read -r line; do
+            if [[ "$prev" == *"|-- "* && "$line" == *"/32 host LOCAL"* ]]; then
+                tok="${prev#*|-- }"
+                tok="${tok%%[[:space:]]*}"
+                if [[ "$tok" != 127.* && "$tok" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    ip="$tok"
+                    break
+                fi
+            fi
+            prev="$line"
+        done </proc/net/fib_trie
+    fi
+    printf '%s' "$host"
+    [[ -n "$ip" ]] && printf ' ? %s' "$ip"
+    [[ -n "$OS_ID" ]] && printf ' ? %s %s' "${OS_ID^}" "$OS_VERSION"
+}
+
+tui_print_banner() {
+    local meta width=68 rule="" i
+    meta="$(tui_sys_summary)"
+    for ((i = 0; i < width; i++)); do rule+="?"; done
+    printf '\n'
+    printf '  %s????????%s????????%s???   ???%s??????? %s????????%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"
+    printf '  %s????????%s????????%s???   ???%s????????%s????????%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"
+    printf '  %s??????  %s  ????? %s???   ???%s????????%s????????%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"
+    printf '  %s??????  %s ?????  %s???? ????%s??????? %s????????%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"
+    printf '  %s????????%s????????%s ??????? %s???     %s????????%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"
+    printf '  %s????????%s????????%s  ?????  %s???     %s????????%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"
+    printf '\n'
+    printf '  %s v%s %s  %sVPS management, made simple%s   %s%s%s\n'         "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+    printf '  %s%s%s\n\n' "$C_LINE" "$rule" "$C_RESET"
+}
+
+tui_sub_header() {
+    local title="$1" sub="${2:-}" width=68 rule="" i
+    for ((i = 0; i < width; i++)); do rule+="?"; done
+    printf '\n'
+    printf '  %s%s%s%s' "$C_BOLD" "$C_CYAN" "$title" "$C_RESET"
+    [[ -n "$sub" ]] && printf '   %s%s%s' "$C_MUTED" "$sub" "$C_RESET"
+    printf '\n  %s%s%s\n\n' "$C_LINE" "$rule" "$C_RESET"
+}
+
+# tui_select <prompt> <zero_label> <item1> <item2> ...
+# Sets TUI_CHOICE to 1..N or 0. Uses arrow keys on an interactive TTY; falls
+# back to standard line input in non-TTY / smoke-test environments.
+TUI_CHOICE=""
+tui_select() {
+    local prompt="$1" zero_label="$2"
+    shift 2
+    local items=("$@") n=${#@} total=$((${#@} + 1)) idx=0 i num label pad buf="" key rest
+    TUI_CHOICE=""
+
+    if ! tui_interactive; then
+        for i in "${!items[@]}"; do
+            printf '%2d) %s\n' "$((i + 1))" "${items[$i]}"
+        done
+        printf '%2d) %s\n' 0 "$zero_label"
+        info ""
+        if ! read -r -p "Select: " TUI_CHOICE; then
+            info ""
+            TUI_CHOICE="0"
+        fi
+        TUI_CHOICE="${TUI_CHOICE//[[:space:]]/}"
+        return 0
+    fi
+
+    printf '\033[?25l'
+    while true; do
+        printf '  %s?%s %s%s%s' "$C_CYAN" "$C_RESET" "$C_BOLD" "$prompt" "$C_RESET"
+        [[ -n "$buf" ]] && printf '  %s[%s]%s' "$C_CYAN" "$buf" "$C_RESET"
+        printf '\033[K\n'
+
+        for ((i = 0; i < total; i++)); do
+            if ((i < n)); then
+                num=$((i + 1))
+                label="${items[$i]}"
+            else
+                num=0
+                label="$zero_label"
+            fi
+            printf -v pad '%2d) %-54s' "$num" "$label"
+            if ((i == idx)); then
+                printf '  %s%s ? %s%s%s\033[K\n' "$C_SEL_BG" "$C_SEL_FG" "$C_SEL_TXT" "$pad" "$C_RESET"
+            elif ((num == 0)); then
+                printf '     %s%s%s\033[K\n' "$C_MUTED" "$pad" "$C_RESET"
+            else
+                printf '     %s%s%s\033[K\n' "$C_BOLD" "$pad" "$C_RESET"
+            fi
+        done
+        printf '  %s?/? move ? Enter select ? 0-%d jump ? q back%s\033[K' "$C_MUTED" "$n" "$C_RESET"
+
+        IFS= read -rsn1 key || {
+            printf '\033[?25h\n'
+            TUI_CHOICE="0"
+            return 0
+        }
+
+        if [[ "$key" == $'\x1b' ]]; then
+            read -rsn2 -t 0.05 rest || rest=""
+            case "$rest" in
+                "[A" | "OA")
+                    buf=""
+                    idx=$(((idx - 1 + total) % total))
+                    ;;
+                "[B" | "OB")
+                    buf=""
+                    idx=$(((idx + 1) % total))
+                    ;;
+                "")
+                    printf '\033[?25h\n'
+                    TUI_CHOICE="0"
+                    return 0
+                    ;;
+            esac
+        elif [[ "$key" == "" || "$key" == $'\n' || "$key" == $'\r' ]]; then
+            printf '\033[?25h\n'
+            if [[ -n "$buf" ]]; then
+                TUI_CHOICE="$buf"
+            elif ((idx < n)); then
+                TUI_CHOICE="$((idx + 1))"
+            else
+                TUI_CHOICE="0"
+            fi
+            return 0
+        elif [[ "$key" == $'\x7f' || "$key" == $'\b' ]]; then
+            buf="${buf%?}"
+        elif [[ "$key" == "k" || "$key" == "K" ]]; then
+            buf=""
+            idx=$(((idx - 1 + total) % total))
+        elif [[ "$key" == "j" || "$key" == "J" ]]; then
+            buf=""
+            idx=$(((idx + 1) % total))
+        elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+            printf '\033[?25h\n'
+            TUI_CHOICE="0"
+            return 0
+        elif [[ "$key" =~ ^[0-9]$ ]]; then
+            buf+="$key"
+            if [[ "$buf" == "0" ]]; then
+                idx=$n
+            elif ((10#$buf >= 1 && 10#$buf <= n)); then
+                idx=$((10#$buf - 1))
+            fi
+            if ((${#buf} >= 2 || (10#$buf * 10 > n && 10#$buf > 0))); then
+                printf '\033[?25h\n'
+                TUI_CHOICE="$buf"
+                return 0
+            fi
+        fi
+        printf '\033[%dA\r' "$((total + 1))"
+    done
+}
+
 # Global temp-directory cleanup on exit or termination signals.
 XUI_TMP_DIR=""
 NGX_KEY_TMP=""
@@ -59,6 +242,7 @@ LC_TMP_DIR=""
 UPD_TMP=""
 
 cleanup_all_tmp() {
+    tui_cursor_show
     [[ -n "${XUI_TMP_DIR:-}" && -d "$XUI_TMP_DIR" ]] && rm -rf -- "$XUI_TMP_DIR"
     [[ -n "${NGX_KEY_TMP:-}" && -d "$NGX_KEY_TMP" ]] && rm -rf -- "$NGX_KEY_TMP"
     [[ -n "${ACME_TMP_DIR:-}" && -d "$ACME_TMP_DIR" ]] && rm -rf -- "$ACME_TMP_DIR"
@@ -1046,21 +1230,18 @@ xui_change_password() {
 XUI_MENU_LABELS=("Install 3x-ui" "Install with 3x-ui self installer" "Status" "Restart" "Panel info" "Change password")
 
 module_3x_ui() {
-    local choice i
+    local choice
     while true; do
-        info ""
-        info "${C_BOLD}3x-ui${C_RESET}"
-        info ""
-        for i in "${!XUI_MENU_LABELS[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${XUI_MENU_LABELS[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "3x-ui" "Xray proxy panel"
+        else
             info ""
-            return 0
+            info "${C_BOLD}3x-ui${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "3x-ui" "Back" "${XUI_MENU_LABELS[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) xui_install_default || true ;;
@@ -2844,21 +3025,18 @@ ngx_remove_site() {
 NGX_MENU_LABELS=("Install Nginx" "Status" "Restart" "List sites" "Add site" "Remove site")
 
 module_nginx() {
-    local choice i
+    local choice
     while true; do
-        info ""
-        info "${C_BOLD}Nginx${C_RESET}"
-        info ""
-        for i in "${!NGX_MENU_LABELS[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${NGX_MENU_LABELS[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "Nginx" "reverse proxy & sites"
+        else
             info ""
-            return 0
+            info "${C_BOLD}Nginx${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "Nginx" "Back" "${NGX_MENU_LABELS[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) ngx_install || true ;;
@@ -3555,21 +3733,18 @@ cert_remove() {
 CERT_MENU_LABELS=("Install acme.sh" "Issue certificate" "List certificates" "Renew certificates" "Remove certificate")
 
 module_certs() {
-    local choice i
+    local choice
     while true; do
-        info ""
-        info "${C_BOLD}Certificates${C_RESET}"
-        info ""
-        for i in "${!CERT_MENU_LABELS[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${CERT_MENU_LABELS[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "Certificates" "Let's Encrypt HTTP-01"
+        else
             info ""
-            return 0
+            info "${C_BOLD}Certificates${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "Certificates" "Back" "${CERT_MENU_LABELS[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) cert_install_acme || true ;;
@@ -4289,23 +4464,20 @@ lc_uninstall() {
 }
 
 lc_module() { # lc_module <key>: the shared submenu
-    local choice i
+    local choice
     local labels=("Install" "Status" "Update" "Uninstall" "Run")
     lc_load "$1" || return 0
     while true; do
-        info ""
-        info "${C_BOLD}${LC_LABEL}${C_RESET}"
-        info ""
-        for i in "${!labels[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "$LC_LABEL" "tool lifecycle"
+        else
             info ""
-            return 0
+            info "${C_BOLD}${LC_LABEL}${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "$LC_LABEL" "Back" "${labels[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) lc_install || true ;;
@@ -5298,21 +5470,18 @@ ssh_add_key() {
 SSH_MENU_LABELS=("List users" "Add user" "Delete user" "SSH settings" "Add SSH key")
 
 module_ssh() {
-    local choice i
+    local choice
     while true; do
-        info ""
-        info "${C_BOLD}SSH and Users${C_RESET}"
-        info ""
-        for i in "${!SSH_MENU_LABELS[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${SSH_MENU_LABELS[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "SSH and Users" "accounts, keys & sshd"
+        else
             info ""
-            return 0
+            info "${C_BOLD}SSH and Users${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "SSH and Users" "Back" "${SSH_MENU_LABELS[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) usr_list || true ;;
@@ -6480,20 +6649,17 @@ module_firewall() {
         return 0
     fi
     while true; do
-        info ""
-        info "${C_BOLD}Firewall${C_RESET}"
-        info "Backend: ${FW_BACKEND}"
-        info ""
-        for i in "${!FW_MENU_LABELS[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${FW_MENU_LABELS[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "Firewall" "backend: ${FW_BACKEND}"
+        else
             info ""
-            return 0
+            info "${C_BOLD}Firewall${C_RESET}"
+            info "Backend: ${FW_BACKEND}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "Firewall" "Back" "${FW_MENU_LABELS[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) fw_show_status || true ;;
@@ -7289,21 +7455,18 @@ ezb_restore_cmd() {
 }
 
 ezb_backup_menu() {
-    local choice i labels=("Create backup" "List backups" "Restore backup")
+    local choice labels=("Create backup" "List backups" "Restore backup")
     while true; do
-        info ""
-        info "${C_BOLD}Backup${C_RESET}"
-        info ""
-        for i in "${!labels[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "Backup" "ezvps snapshots & restore"
+        else
             info ""
-            return 0
+            info "${C_BOLD}Backup${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "Backup" "Back" "${labels[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) ezb_create_cmd || true ;;
@@ -7588,21 +7751,18 @@ upd_update_cmd() {
 }
 
 upd_menu() {
-    local choice i labels=("Check for updates" "Update ezvps")
+    local choice labels=("Check for updates" "Update ezvps")
     while true; do
-        info ""
-        info "${C_BOLD}Check For Updates${C_RESET}"
-        info ""
-        for i in "${!labels[@]}"; do
-            printf '%2d) %s\n' "$((i + 1))" "${labels[$i]}"
-        done
-        printf '%2d) %s\n' 0 "Back"
-        info ""
-        if ! read -r -p "Select: " choice; then
+        if tui_interactive; then
+            clear_screen
+            tui_sub_header "Check For Updates" "git repository sync"
+        else
             info ""
-            return 0
+            info "${C_BOLD}Check For Updates${C_RESET}"
+            info ""
         fi
-        choice="${choice//[[:space:]]/}"
+        tui_select "Check For Updates" "Back" "${labels[@]}"
+        choice="$TUI_CHOICE"
         case "$choice" in
             0) return 0 ;;
             1) upd_check_cmd || true ;;
@@ -7721,6 +7881,10 @@ run_module() {
 
 print_menu() {
     local i
+    if tui_interactive; then
+        tui_print_banner
+        return 0
+    fi
     info "${C_BOLD}ezvps ${EZVPS_VERSION}${C_RESET}"
     info ""
     for i in "${!MODULE_LABELS[@]}"; do
@@ -7734,12 +7898,18 @@ main_menu() {
     local choice
     while true; do
         clear_screen
-        print_menu
-        if ! read -r -p "Select: " choice; then
-            info ""
-            return 0 # EOF on stdin: leave cleanly
+        if tui_interactive; then
+            tui_print_banner
+            tui_select "Main menu" "Exit" "${MODULE_LABELS[@]}"
+            choice="$TUI_CHOICE"
+        else
+            print_menu
+            if ! read -r -p "Select: " choice; then
+                info ""
+                return 0 # EOF on stdin: leave cleanly
+            fi
+            choice="${choice//[[:space:]]/}"
         fi
-        choice="${choice//[[:space:]]/}"
         if [[ "$choice" == "0" ]]; then
             return 0
         elif [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#MODULE_KEYS[@]})); then
