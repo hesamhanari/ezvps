@@ -64,16 +64,32 @@ done
 #      authentication; never an anonymous URL).
 #    - Nothing is ever piped or process-substituted from the network into a shell.
 #    - install.sh downloads nothing.
-bad_curl="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
-    !/^[[:space:]]*#/ && /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/ {
-        if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()" && fn != "acme_fetch_script()" && fn != "lc_fetch_installer()") print NR": "$0 }' ezvps)"
+bad_curl="$(awk '
+    /^[A-Za-z_0-9]+\(\)[[:space:]]*\{/ { fn=$1; sub(/\(.*/, "()", fn); depth=0 }
+    fn != "" {
+        line=$0; sub(/#.*/, "", line)
+        o=gsub(/\{/, "&", line); c=gsub(/\}/, "&", line)
+        if ($0 !~ /^[[:space:]]*#/ && $0 ~ /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/) {
+            if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()" && fn != "acme_fetch_script()" && fn != "lc_fetch_installer()") print NR": "$0
+        }
+        depth += o - c
+        if (depth <= 0) { fn=""; depth=0 }
+    }' ezvps)"
 if [[ -n "$bad_curl" ]]; then
     bad "ezvps: curl/wget outside xui_fetch_installer/xui_probe/ngx_fetch_key/acme_fetch_script/lc_fetch_installer:"
     printf '%s\n' "$bad_curl" >&2
 fi
-bad_git="$(awk '/^[A-Za-z_0-9]+\(\) \{/ {fn=$1} /^}/ {fn=""}
-    !/^[[:space:]]*#/ && /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && /"\$\{g\[@\]\}"|git[[:space:]]+-/ {
-        if (fn != "lc_fetch_source()" && fn != "upd_fetch_latest()") print NR": "$0 }' ezvps)"
+bad_git="$(awk '
+    /^[A-Za-z_0-9]+\(\)[[:space:]]*\{/ { fn=$1; sub(/\(.*/, "()", fn); depth=0 }
+    fn != "" {
+        line=$0; sub(/#.*/, "", line)
+        o=gsub(/\{/, "&", line); c=gsub(/\}/, "&", line)
+        if ($0 !~ /^[[:space:]]*#/ && $0 ~ /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && $0 ~ /"\$\{g\[@\]\}"|git[[:space:]]+-/) {
+            if (fn != "lc_fetch_source()" && fn != "upd_fetch_latest()") print NR": "$0
+        }
+        depth += o - c
+        if (depth <= 0) { fn=""; depth=0 }
+    }' ezvps)"
 if [[ -n "$bad_git" ]]; then
     bad "ezvps: git network access outside lc_fetch_source/upd_fetch_latest:"
     printf '%s\n' "$bad_git" >&2

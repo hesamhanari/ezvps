@@ -2473,7 +2473,7 @@ D="$(CD example.com)"
 check "issue: asked acme.sh for one domain, HTTP-01 through nginx, Let's Encrypt" has_line "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --issue -d example.com --nginx --server letsencrypt"
 check "issue: no DNS mode, no wildcard, no extra domain" equals "$(nlog_count '--dns|-d \*|-d [^ ]+ .*-d ')" 0
 check "issue: nginx config tested after acme.sh edited it" contains "$(log)" "nginx -t"
-check "issue: installed into the store with the documented file names" contains "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --install-cert -d example.com --fullchain-file ${D}/fullchain.pem --key-file ${D}/privkey.pem --reloadcmd nginx -t && systemctl reload nginx"
+check "issue: installed into the store with the documented file names" contains "$(log)" "acme.sh --home ${EZVPS_ACME_HOME} --install-cert -d example.com --fullchain-file ${D}/fullchain.pem --key-file ${D}/privkey.pem --reloadcmd nginx -t && { systemctl is-active --quiet nginx && systemctl reload nginx || true; }"
 check "store: certificate chain exists" test -s "$(CRTF example.com)"
 check "store: private key exists" test -s "$(KEYF example.com)"
 check "store: private key is mode 600 (root only)" equals "$(mode_of "$(KEYF example.com)")" 600

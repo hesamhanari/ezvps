@@ -51,6 +51,24 @@ clear_screen() {
     return 0
 }
 
+# Global temp-directory cleanup on exit or termination signals.
+XUI_TMP_DIR=""
+NGX_KEY_TMP=""
+ACME_TMP_DIR=""
+LC_TMP_DIR=""
+UPD_TMP=""
+
+cleanup_all_tmp() {
+    [[ -n "${XUI_TMP_DIR:-}" && -d "$XUI_TMP_DIR" ]] && rm -rf -- "$XUI_TMP_DIR"
+    [[ -n "${NGX_KEY_TMP:-}" && -d "$NGX_KEY_TMP" ]] && rm -rf -- "$NGX_KEY_TMP"
+    [[ -n "${ACME_TMP_DIR:-}" && -d "$ACME_TMP_DIR" ]] && rm -rf -- "$ACME_TMP_DIR"
+    [[ -n "${LC_TMP_DIR:-}" && -d "$LC_TMP_DIR" ]] && rm -rf -- "$LC_TMP_DIR"
+    [[ -n "${UPD_TMP:-}" && -d "$UPD_TMP" ]] && rm -rf -- "$UPD_TMP"
+    return 0
+}
+
+trap cleanup_all_tmp EXIT HUP TERM
+
 # Wait for Enter so the user can read a message before the menu redraws.
 # Returns non-zero on EOF (stdin closed); callers ignore that on purpose.
 pause() {
@@ -197,7 +215,6 @@ XUI_BACKUP_BASE="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
 # Filled by xui_read_settings / xui_probe / xui_fetch_installer.
 XUI_CUR_PORT="" XUI_CUR_PATH="" XUI_CUR_TLS=""
 XUI_PROBE_CODE="" XUI_PROBE_URL=""
-XUI_TMP_DIR=""
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -528,15 +545,27 @@ xui_ensure_curl() { ensure_curl "download the 3x-ui installer"; }
 # panel binary) to /var/backups/ezvps/x-ui.<timestamp>.<pid>/ (mode 700).
 # A failed copy aborts the caller before anything is changed.
 xui_backup() {
-    local dest copied=0 want_bin=0
+    local dest copied=0 want_bin=0 stamp n=1
     [[ "${1:-}" == "--binary" && -f "$XUI_BIN" ]] && want_bin=1
-        dest="${XUI_BACKUP_BASE}/x-ui.$(date +%Y%m%d-%H%M%S).$$"
     if [[ ! -d "$XUI_DB_DIR" && ! -f "${XUI_DIR}/bin/config.json" ]] && ((want_bin == 0)); then
         info "Nothing to back up yet."
         return 0
     fi
-    if ! { mkdir -p "$XUI_BACKUP_BASE" && chmod 700 "$XUI_BACKUP_BASE" && mkdir -m 700 "$dest"; }; then
-        err "Cannot create backup directory ${dest}; aborting before any change."
+    if ! { mkdir -p "$XUI_BACKUP_BASE" && chmod 700 "$XUI_BACKUP_BASE"; }; then
+        err "Cannot create backup base directory ${XUI_BACKUP_BASE}; aborting before any change."
+        return 1
+    fi
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dest=""
+    while ((n <= 99)); do
+        if mkdir -m 700 -- "${XUI_BACKUP_BASE}/x-ui.${stamp}.$$-${n}" 2>/dev/null; then
+            dest="${XUI_BACKUP_BASE}/x-ui.${stamp}.$$-${n}"
+            break
+        fi
+        n=$((n + 1))
+    done
+    if [[ -z "$dest" ]]; then
+        err "Cannot create backup directory under ${XUI_BACKUP_BASE}; aborting before any change."
         return 1
     fi
     if [[ -d "$XUI_DB_DIR" ]]; then
@@ -1205,10 +1234,30 @@ ngx_reload() {
 # backup_file <src> <label>: copy to /var/backups/ezvps/<label>.<timestamp>.<pid>
 # (dir mode 700). Sets BACKUP_FILE_PATH. Non-zero (and a message) on failure.
 backup_file() {
-    local dest
+    local base stamp dest n=1
     BACKUP_FILE_PATH=""
-    dest="${NGX_BACKUP_BASE}/${2}.$(date +%Y%m%d-%H%M%S).$$"
-    if ! { mkdir -p "$NGX_BACKUP_BASE" && chmod 700 "$NGX_BACKUP_BASE" && cp -a "$1" "$dest"; }; then
+    if ! { mkdir -p "$NGX_BACKUP_BASE" && chmod 700 "$NGX_BACKUP_BASE"; }; then
+        err "Cannot create backup directory ${NGX_BACKUP_BASE}; aborting before any change."
+        return 1
+    fi
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    base="${NGX_BACKUP_BASE}/${2}.${stamp}.$$"
+    dest="$base"
+    while [[ -e "$dest" || -L "$dest" ]]; do
+        n=$((n + 1))
+        if ((n > 99)); then
+            err "Too many backups in the same second for ${2}; aborting before any change."
+            return 1
+        fi
+        printf -v dest '%s-%02d' "$base" "$n"
+    done
+    if [[ -d "$1" && ! -L "$1" ]]; then
+        if ! { mkdir -m 700 -- "$dest" && cp -a -- "$1/." "$dest/"; }; then
+            rm -rf -- "$dest" 2>/dev/null
+            err "Backup of ${1} to ${dest} failed; aborting before any change."
+            return 1
+        fi
+    elif ! cp -a -- "$1" "$dest"; then
         err "Backup of ${1} to ${dest} failed; aborting before any change."
         return 1
     fi
@@ -1249,7 +1298,7 @@ NGX_APT_PREF="${NGX_APT_DIR}/preferences.d/99nginx"
 # Filled by the helpers below.
 NGX_ORG_REPO_URL="" NGX_CODENAME="" NGX_SRC="" NGX_PKGVER="" NGX_CAND=""
 NGX_VER_MAJOR=0 NGX_VER_MINOR=0 NGX_VER_CLASS=""
-NGX_KEY_FPS=() NGX_KEY_TMP="" NGX_PURGE_PKGS=()
+NGX_KEY_FPS=() NGX_PURGE_PKGS=()
 NGX_REPO_UNDO_PATH=() NGX_REPO_UNDO_BK=()
 NGX_RESTORED=() NGX_NOT_RESTORED=()
 
@@ -1919,7 +1968,7 @@ ngx_parse_upstream() {
                 err "Not a valid IPv4 address: ${host}"
                 return 1
             }
-        elif [[ ! "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+        elif [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
             err "Not a valid upstream host: ${host}"
             return 1
         fi
@@ -1953,7 +2002,7 @@ ngx_read_site() {
             "# ezvps:upstream="*) NGX_SITE_UPSTREAM="${line#\# ezvps:upstream=}" ;;
             "# ezvps:https=on"*) NGX_SITE_HTTPS=1 ;;
             *)
-                code="${line%%#*}"
+                code="$(ngx_strip_line "$line")"
                 if [[ -z "$first_name" && "$code" =~ $NGX_SERVER_NAME_RE ]]; then
                     read -r first_name _ <<<"${BASH_REMATCH[1]}"
                 fi
@@ -2073,7 +2122,7 @@ ngx_find_conflict() {
             [[ "$f" == "${NGX_CONFD}/${1}.conf" || "$f" == "$NGX_DEFAULT_CONF" ]] && continue
         fi
         while IFS= read -r line; do
-            code="${line%%#*}"
+            code="$(ngx_strip_line "$line")"
             if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
                 for tok in ${BASH_REMATCH[1]}; do
                     [[ "$tok" == "$1" ]] && hit=1
@@ -2108,7 +2157,7 @@ ngx_default_site_conflicts() {
     ngx_read_site "$f" || return 1
     ((NGX_SITE_MANAGED == 0)) || return 1
     while IFS= read -r line; do
-        code="${line%%#*}"
+        code="$(ngx_strip_line "$line")"
         [[ "$code" =~ $NGX_LISTEN80_RE ]] && listens=1
         if [[ "$code" =~ $NGX_SERVER_NAME_RE ]]; then
             for tok in ${BASH_REMATCH[1]}; do
@@ -2173,6 +2222,31 @@ NGX_HAS_HTTP=0 NGX_HAS_INCLUDE=0 NGX_INSERTED=0
 NGX_INCLUDE_RE='^[[:space:]]*include[[:space:]]+[^;]*conf\.d/[^;]*\*[^;]*;'
 NGX_HTTP_OPEN_RE='^[[:space:]]*http[[:space:]]*\{'
 
+ngx_strip_line() {
+    local s="$1" out="" i=0 len=${#1} ch q=""
+    while ((i < len)); do
+        ch="${s:i:1}"
+        if [[ -n "$q" ]]; then
+            if [[ "$ch" == "\\" ]]; then
+                i=$((i + 2))
+                continue
+            fi
+            [[ "$ch" == "$q" ]] && q=""
+        else
+            case "$ch" in
+                \" | \') q="$ch" ;;
+                \#) break ;;
+                *) out+="$ch" ;;
+            esac
+        fi
+        i=$((i + 1))
+    done
+    while [[ "$out" =~ (.*)\{[0-9]+(,[0-9]*)?\}(.*) ]]; do
+        out="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+    done
+    printf '%s' "$out"
+}
+
 # ngx_scan_conf <file> [<out>]: a small brace-depth scan (comments ignored).
 # Sets NGX_HAS_HTTP and NGX_HAS_INCLUDE (an `include .../conf.d/*...;` directly
 # inside the http block). With <out>, writes a copy of <file> that has the
@@ -2183,7 +2257,7 @@ ngx_scan_conf() {
     NGX_HAS_HTTP=0 NGX_HAS_INCLUDE=0 NGX_INSERTED=0
     [[ -n "${2:-}" ]] && : >"$2"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        code="${line%%#*}"
+        code="$(ngx_strip_line "$line")"
         trimmed="${code#"${code%%[![:space:]]*}"}"
         trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
         pre=$depth
@@ -2281,7 +2355,7 @@ ngx_file_has_map() {
     local line code
     [[ -r "$1" ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
-        code="${line%%#*}"
+        code="$(ngx_strip_line "$line")"
         [[ "$code" =~ $NGX_MAP_RE ]] && return 0
     done <"$1"
     return 1
@@ -2306,7 +2380,7 @@ ngx_scan_map() {
     NGX_HAS_HTTP=0 NGX_INSERTED=0
     : >"$2"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        code="${line%%#*}"
+        code="$(ngx_strip_line "$line")"
         trimmed="${code#"${code%%[![:space:]]*}"}"
         trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
         pre=$depth
@@ -2832,10 +2906,10 @@ ACME_HOME="${EZVPS_ACME_HOME:-${HOME:-/root}/.acme.sh}"
 CERT_CA_SERVER="letsencrypt"
 # Run by acme.sh after it installs a certificate (issue and every later renewal,
 # including its own cron job): reload nginx, but only with a valid config.
-CERT_RELOADCMD="nginx -t && systemctl reload nginx"
+CERT_RELOADCMD="nginx -t && { systemctl is-active --quiet nginx && systemctl reload nginx || true; }"
 
 # Filled by the helpers below.
-ACME_BIN="" ACME_ARGS=() ACME_OUT="" ACME_RC=0 ACME_VER="" ACME_TMP_DIR=""
+ACME_BIN="" ACME_ARGS=() ACME_OUT="" ACME_RC=0 ACME_VER=""
 CERT_EXPIRY_DATE="" CERT_EXPIRY_NOTE=""
 CERT_SITE_STATE="" CERT_SITE_UP="" CERT_USERS=()
 CERT_SSLCERT_RE='(^|[[:space:];{])ssl_certificate[[:space:]]+([^;[:space:]]+)[[:space:]]*;'
@@ -3051,7 +3125,7 @@ cert_sites_using() {
     for f in "$NGX_CONFD"/*.conf; do
         [[ -f "$f" ]] || continue
         while IFS= read -r line || [[ -n "$line" ]]; do
-            code="${line%%#*}"
+            code="$(ngx_strip_line "$line")"
             if [[ "$code" =~ $CERT_SSLCERT_RE && "${BASH_REMATCH[2]}" == "$want" ]]; then
                 CERT_USERS+=("${f##*/}")
                 break
@@ -3776,19 +3850,20 @@ lc_show_tail() {
 # must not launch the tool.
 lc_run_script() {
     local tmp actual rc
-    tmp="$(mktemp -d)" || {
+    LC_TMP_DIR="$(mktemp -d)" || {
         err "Cannot create a temporary directory."
         return 1
     }
+    tmp="$LC_TMP_DIR"
     info "Downloading the ${LC_LABEL} installer..."
     if ! lc_fetch_installer "${tmp}/install.sh"; then
         err "Download failed: ${LC_URL}"
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     actual="$(sha256sum "${tmp}/install.sh")" || {
         err "sha256sum failed."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     }
     actual="${actual%% *}"
@@ -3796,13 +3871,13 @@ lc_run_script() {
         err "SHA-256 mismatch for the downloaded installer; refusing to run it."
         err "  expected: ${LC_SHA}"
         err "  got:      ${actual}"
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     info "Running the ${LC_LABEL} installer (sha256 verified)..."
     bash "${tmp}/install.sh" </dev/null
     rc=$?
-    rm -rf "$tmp"
+    rm -rf "$tmp"; LC_TMP_DIR=""
     if ((rc != 0)); then
         err "The ${LC_LABEL} installer exited with status ${rc}."
         return 1
@@ -3862,40 +3937,41 @@ lc_file_sha() {
 # fallback to a Go build or any other source.
 lc_run_binary() {
     local tmp actual listed dest="${LC_PREFIX}/bin/lazyports" part installed
-    tmp="$(mktemp -d)" || {
+    LC_TMP_DIR="$(mktemp -d)" || {
         err "Cannot create a temporary directory."
         return 1
     }
+    tmp="$LC_TMP_DIR"
     info "Downloading ${LC_ASSET}..."
     if ! lc_fetch_installer "${tmp}/${LC_ASSET}" "${LC_URL}/${LC_ASSET}"; then
         err "Download failed: ${LC_URL}/${LC_ASSET}"
         err "(A 404 means that release asset does not exist.) Nothing was installed; there is no fallback to another install method."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     info "Downloading SHA256SUMS..."
     if ! lc_fetch_installer "${tmp}/SHA256SUMS" "${LC_URL}/SHA256SUMS"; then
         err "Download failed: ${LC_URL}/SHA256SUMS"
         err "(A 404 means the release has no SHA256SUMS file.) Nothing was installed; there is no fallback to another install method."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     actual="$(lc_file_sha "${tmp}/${LC_ASSET}")" || {
         err "sha256sum failed."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     }
     if [[ "$actual" != "$LC_SHA" ]]; then
         err "SHA-256 mismatch for the downloaded ${LC_ASSET}; refusing to install it."
         err "  expected (pinned): ${LC_SHA}"
         err "  got:               ${actual}"
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     listed="$(lc_sums_lookup "${tmp}/SHA256SUMS" "$LC_ASSET")" || listed=""
     if [[ -z "$listed" ]]; then
         err "The downloaded SHA256SUMS has no entry for ${LC_ASSET}; refusing to install."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     listed="${listed,,}"
@@ -3903,21 +3979,21 @@ lc_run_binary() {
         err "SHA-256 mismatch: the binary matches the pinned hash but not the downloaded SHA256SUMS; refusing to install it."
         err "  SHA256SUMS lists: ${listed}"
         err "  binary:           ${actual}"
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     lc_backup_all || {
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     }
     part="${dest}.ezvps-new.$$"
     if ! { mkdir -p "${LC_PREFIX}/bin" && cp "${tmp}/${LC_ASSET}" "$part" && chmod 755 "$part" && mv -f "$part" "$dest"; }; then
         err "Could not install ${dest}."
         rm -f "$part"
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
-    rm -rf "$tmp"
+    rm -rf "$tmp"; LC_TMP_DIR=""
     installed="$(lc_file_sha "$dest")" || installed=""
     if [[ "$installed" != "$LC_SHA" ]]; then
         err "The installed ${dest} does not match the verified download; ${LC_LABEL} is NOT installed correctly."
@@ -3933,14 +4009,15 @@ lc_run_binary() {
 # lc_run_source: fetch the pinned commit and run upstream's documented `make; make install`.
 lc_run_source() {
     local tmp
-    tmp="$(mktemp -d)" || {
+    LC_TMP_DIR="$(mktemp -d)" || {
         err "Cannot create a temporary directory."
         return 1
     }
+    tmp="$LC_TMP_DIR"
     info "Fetching ${LC_LABEL} source (${LC_PIN_TEXT})..."
     if ! lc_fetch_source "${tmp}/src"; then
         err "Could not fetch commit ${LC_GIT_COMMIT} from ${LC_GIT_URL}."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     info "Building ${LC_LABEL} (make)..."
@@ -3948,7 +4025,7 @@ lc_run_source() {
         err "The build failed. Last lines of the build output:"
         lc_show_tail "${tmp}/build.log"
         err "Build needs the OpenSSL and zlib development headers (apt-get install libssl-dev zlib1g-dev). Nothing was installed."
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
     info "Installing (make install)..."
@@ -3956,10 +4033,10 @@ lc_run_source() {
     if ! make -C "${tmp}/src" install PREFIX="$LC_PREFIX" >"${tmp}/install.log" 2>&1; then
         err "make install failed. Last lines of its output:"
         lc_show_tail "${tmp}/install.log"
-        rm -rf "$tmp"
+        rm -rf "$tmp"; LC_TMP_DIR=""
         return 1
     fi
-    rm -rf "$tmp"
+    rm -rf "$tmp"; LC_TMP_DIR=""
     return 0
 }
 
@@ -4336,6 +4413,9 @@ usr_login_shell() { # usr_login_shell <shell>
     case "${s##*/}" in nologin | false) return 1 ;; esac
     if [[ -r "$USR_SHELLS_FILE" ]]; then
         while IFS= read -r l; do
+            l="${l%$'\r'}"
+            l="$(usr_trim "$l")"
+            [[ -z "$l" || "$l" == \#* ]] && continue
             [[ "$l" == "$s" ]] && return 0
         done <"$USR_SHELLS_FILE"
         return 1
@@ -4696,11 +4776,12 @@ ssh_rewrite_config() { # ssh_rewrite_config <in> <out> <Key> <value>
     {
         printf '# ezvps:managed %s\n%s %s\n' "$key" "$key" "$value"
         while IFS= read -r line || [[ -n "$line" ]]; do
+            t="${line#"${line%%[![:space:]]*}"}"
             if ((skip)); then
                 skip=0
-                continue
+                kw="${t%%[[:space:]=]*}"
+                [[ "${kw,,}" == "$lk" ]] && continue
             fi
-            t="${line#"${line%%[![:space:]]*}"}"
             if [[ "$t" == "# ezvps:managed "* ]]; then
                 m="${t#"# ezvps:managed "}"
                 if [[ "${m,,}" == "$lk" ]]; then
@@ -5498,7 +5579,7 @@ fw_in_list() { # fw_in_list <word> <list...>
 }
 
 fw_ufw_load() {
-    local l text rest to body act src t port proto cover re num app_cover
+    local l text rest to body act src t port proto cover re re_act num app_cover
     fw_rules_clear
     if ! fw_run ufw status numbered; then
         err "ufw status failed: ${FW_OUT}"
@@ -5508,14 +5589,21 @@ fw_ufw_load() {
     FW_RULES_TEXT="$text"
     fw_ufw_apps
     re='^\[ *([0-9]+)\] (.*)$'
+    re_act='^(.*[^[:space:]])[[:space:]]+((ALLOW|DENY|REJECT|LIMIT)( IN| OUT| FWD)?)[[:space:]]+(.*)$'
     while IFS= read -r l; do
         [[ "$l" =~ $re ]] || continue
         num="${BASH_REMATCH[1]}"
         rest="$(usr_trim "${BASH_REMATCH[2]}")"
-        to="${rest%%  *}"
-        body="$(usr_trim "${rest#"$to"}")"
-        act="${body%%  *}"
-        src="$(usr_trim "${body#"$act"}")"
+        if [[ "$rest" =~ $re_act ]]; then
+            to="$(usr_trim "${BASH_REMATCH[1]}")"
+            act="${BASH_REMATCH[2]}"
+            src="$(usr_trim "${BASH_REMATCH[5]}")"
+        else
+            to="${rest%%  *}"
+            body="$(usr_trim "${rest#"$to"}")"
+            act="${body%%  *}"
+            src="$(usr_trim "${body#"$act"}")"
+        fi
         t="${to% (v6)}"
         port="-" proto="-" cover=""
         if [[ "$t" =~ ^([0-9][0-9,:]*)(/(tcp|udp))?$ ]]; then
@@ -6040,7 +6128,7 @@ fw_rule_affects_ssh() {
             return 0
             ;;
     esac
-    if [[ "${FW_PORT[$i]}" == - ]]; then
+    if [[ -z "${FW_COVER[$i]}" ]]; then
         case "${FW_PROTO[$i]}" in
             -)
                 FW_SSH_WHY="has no port or protocol restriction, so it may be what keeps SSH (port ${FW_SSH_PORTS[*]}) or your current connection working"
@@ -6450,7 +6538,6 @@ EZB_SITES=() EZB_NEW=()
 EZB_V_SCRIPT=0 EZB_V_STATE=() EZB_V_SITES=() EZB_V_CERTS=()
 UPD_INST_VERSION="" UPD_INST_COMMIT="" UPD_INST_WHY="" UPD_SOURCE=""
 UPD_LATEST_VERSION="" UPD_LATEST_COMMIT="" UPD_VERIFY_VERSION="" UPD_VERIFY_OUT=""
-UPD_TMP=""
 
 # --- checks that come before any of the three items --------------------------
 
@@ -6587,7 +6674,7 @@ upd_file_version() { # upd_file_version <script>: its EZVPS_VERSION, read as tex
     local line v
     [[ -r "$1" ]] || return 0
     while IFS= read -r line; do
-        if [[ "$line" =~ ^EZVPS_VERSION=\"([A-Za-z0-9._+-]+)\"$ ]]; then
+        if [[ "$line" =~ ^EZVPS_VERSION=[\"']([A-Za-z0-9._+-]+)[\"']$ ]]; then
             v="${BASH_REMATCH[1]}"
             printf '%s' "$v"
             return 0
@@ -7159,19 +7246,7 @@ ezb_restore_cmd() {
     ((${#EZB_A_SITES[@]} > 0)) && restored+=("nginx sites: ${EZB_A_SITES[*]} (nginx -t passed)")
     ((${#EZB_A_SKIPPED[@]} > 0)) && notes+=("nginx sites not overwritten (not made by ezvps): ${EZB_A_SKIPPED[*]}")
 
-    # Step 2: state files, then the script.
-    if ((${#EZB_V_STATE[@]} > 0)); then
-        if [[ ! -d "$EZB_STATE_DIR" ]]; then mkdir -p -- "$EZB_STATE_DIR" && chmod 700 -- "$EZB_STATE_DIR"; fi
-        for name in "${EZB_V_STATE[@]}"; do
-            if ezb_put_file "$sel/state/$name" "$EZB_STATE_DIR/$name" && cmp -s -- "$sel/state/$name" "$EZB_STATE_DIR/$name"; then
-                :
-            else
-                err "Could not restore ${EZB_STATE_DIR}/${name}."
-                failed=1
-            fi
-        done
-        ((failed == 0)) && restored+=("state files: ${EZB_V_STATE[*]} in ${EZB_STATE_DIR} (verified)")
-    fi
+    # Step 2: the script first (so state files are never left mismatched on rollback), then state files.
     if ((EZB_V_SCRIPT == 1)); then
         if ezb_install_script "$sel/bin/ezvps" && cmp -s -- "$sel/bin/ezvps" "$EZB_BIN" && upd_verify_script "$EZB_BIN"; then
             restored+=("ezvps script: ${EZB_BIN} (version ${UPD_VERIFY_VERSION}, verified)")
@@ -7183,6 +7258,22 @@ ezb_restore_cmd() {
                 err "Could not put the previous script back. It is in ${pre}/bin/ezvps."
             fi
             failed=1
+        fi
+    fi
+    if ((${#EZB_V_STATE[@]} > 0)); then
+        if ((failed == 1)); then
+            err "Skipping state file restore because the script restore failed."
+        else
+            if [[ ! -d "$EZB_STATE_DIR" ]]; then mkdir -p -- "$EZB_STATE_DIR" && chmod 700 -- "$EZB_STATE_DIR"; fi
+            for name in "${EZB_V_STATE[@]}"; do
+                if ezb_put_file "$sel/state/$name" "$EZB_STATE_DIR/$name" && cmp -s -- "$sel/state/$name" "$EZB_STATE_DIR/$name"; then
+                    :
+                else
+                    err "Could not restore ${EZB_STATE_DIR}/${name}."
+                    failed=1
+                fi
+            done
+            ((failed == 0)) && restored+=("state files: ${EZB_V_STATE[*]} in ${EZB_STATE_DIR} (verified)")
         fi
     fi
     info ""
