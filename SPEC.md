@@ -169,6 +169,17 @@ Behaviour: after a module returns, "Press Enter to return to the menu...",
 then the menu redraws. Invalid input prints `Invalid choice: <input>` and
 redraws. EOF on stdin exits 0.
 
+Interactive TUI (TTY only; non-TTY input uses the numbered list above
+with a `Select:` prompt): `Up`/`Down` or `j`/`k` move, `Enter` selects,
+digits jump (a digit that would go out of range is ignored; `0` then a
+digit is a fresh choice, never `01`), `q`/`Esc` go back, `Ctrl-C`
+restores the cursor. The banner shows host, public IP (private,
+CGNAT and benchmarking addresses are skipped) and OS; terminals under
+30 rows get a one-line banner instead of the art. All TUI glyphs are
+written as `\u` escapes so `ezvps` stays pure ASCII — never paste a
+literal glyph into the file. PTY tests: `bash tests/tui-test.sh`
+(needs python3; skips without it).
+
 ## 5. Module contract
 
 * A module is a function `module_<name>` dispatched by `run_module`.
