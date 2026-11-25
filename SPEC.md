@@ -1730,7 +1730,7 @@ Module key `update` maps to `module_update`; helpers are prefixed `upd_`.
 
 #### Where the latest version comes from, and the authentication
 
-`install.sh` downloads nothing and has no credentials: it runs from a checkout the user cloned **with their
+In checkout mode, `install.sh` downloads nothing and has no credentials: it runs from a checkout the user cloned **with their
 own authentication** (GitHub CLI login, SSH key, or a token typed at git's prompt). Check For Updates uses
 exactly that method and no other: **`git` against the private repository the checkout came from**, so
 nothing private is hardcoded and nothing is ever fetched from an anonymous or public URL (no `curl`, no
@@ -1835,14 +1835,28 @@ Menu item 12 (module key `uninstall`, `module_uninstall`). It has no submenu: it
 
 ## 7. Installer (`install.sh`)
 
-* Installs `ezvps` to `/usr/local/bin/ezvps` (mode 0755) from the checkout
-  it is run from. Downloads nothing.
+* Supports two modes, installing `ezvps` to `/usr/local/bin/ezvps` (mode 0755):
+  * **Checkout mode** (when `ezvps` exists alongside `install.sh`, or when
+    `EZVPS_SOURCE` is set): installs from that local file and downloads
+    nothing. Verifies with `bash -n` and `EZVPS_ALLOW_NONROOT=1 bash ... --version`.
+  * **Curl mode** (when `ezvps` does not exist alongside `install.sh`, e.g.
+    `bash <(curl -fsSL https://raw.githubusercontent.com/hesamhanari/ezvps/main/install.sh)`):
+    creates a temporary directory with `mktemp -d` and an `EXIT` cleanup trap,
+    downloads `https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps`
+    to a file inside it via `fetch_ezvps()`, verifies syntax with `bash -n` and
+    reads `EZVPS_VERSION` from the file **as text** (using the same
+    `[A-Za-z0-9._+-]+` version regex; the downloaded script is **never**
+    executed to verify it). On any failure, exits non-zero with `Nothing was changed.`
+* `fetch_ezvps <dest-file>` is the **only** function in `install.sh` allowed to
+  invoke `curl`: it checks `command -v curl` (printing a clear `"curl is not
+  installed... Nothing was changed."` error and returning 1 if missing), prints
+  the URL before downloading, and runs `curl -fsSL` to `<dest-file>`, never
+  piping to a shell and never executing the download.
 * Requires root; **refuses** (exit 1, nothing installed) when the OS is not
   in the supported list, using the same allowlist, check and error text as
   `require_supported_os` (section 1.1; a verbatim copy of the same block, kept
   identical by lint; it reads `/etc/os-release`, or `EZVPS_OS_RELEASE`, without
   sourcing it).
-* Refuses to install a script that fails `bash -n` or `--version`.
 * Safe to re-run: identical file => "already up to date", no backup. Changed
   file => old copy saved to `/var/backups/ezvps/ezvps.<timestamp>.<pid>`,
   then atomic replace (temp file + `mv`).
@@ -1850,10 +1864,15 @@ Menu item 12 (module key `uninstall`, `module_uninstall`). It has no submenu: it
   found.
 * **Records what it installed** in `/var/lib/ezvps/install.state` (dir 700, file 600): `version`,
   `commit` (only from a git checkout whose `ezvps` is tracked and identical to `HEAD`, else empty),
-  `source` (the checkout's `origin`, user name and token removed from an `https://` address, and only
-  an `https://`, `ssh://` or `user@host:path` address; else empty), `sha256` of the installed script and the
-  time. Written on every run, also when the script is already up to date. A failure only warns. Check For
-  Updates (6.11) reads it; `git` is used here only to read the local checkout, nothing is downloaded.
+  `source` (in checkout mode, the checkout's `origin` with any user name or token removed from an
+  `https://` address and only an `https://`, `ssh://` or `user@host:path` address; in curl mode,
+  the raw download URL `https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps`), `sha256`
+  of the installed script and the time. Written on every run, also when the script is already up to
+  date. A failure only warns. Check For Updates (6.11) reads it; `git` is used here only to read
+  the local checkout, nothing is downloaded.
+* `tests/lint.sh` replaces the blanket "install.sh must not download anything" rule with a scoped
+  brace-depth `awk` rule matching `ezvps`: `curl`/`wget` in `install.sh` is allowed **only** inside
+  `fetch_ezvps()`, while the pipe-to-shell ban remains enforced for both `ezvps` and `install.sh`.
 * Test overrides: `EZVPS_BIN_DIR`, `EZVPS_BACKUP_DIR`, `EZVPS_STATE_DIR`, `EZVPS_SOURCE`,
   `EZVPS_ALLOW_NONROOT=1`, `EZVPS_SKIP_OS_CHECK=1`.
 
@@ -1895,14 +1914,15 @@ Defaults are the real paths; none of these relax a check on a real server.
   scan (no non-documentation IPs, key material or token patterns) and the
   download rules: `curl` only inside `xui_fetch_installer` / `xui_probe` /
   `ngx_fetch_key` / `acme_fetch_script` / `lc_fetch_installer`, git network access only in `lc_fetch_source` and `upd_fetch_latest`, no
-  download piped into a shell, none in `install.sh`, installer URL pinned to
+  download piped into a shell, `curl`/`wget` in `install.sh` allowed only inside `fetch_ezvps`, installer URL pinned to
   a tag (not `master`), pin constants present.
 * `tests/smoke-test.sh`: runs in a temp dir with an empty/stub `PATH`;
   covers the exact menu, the L2TP launch path with a fake `ezl2tp` stub
   (success and non-zero exit), the missing-ezl2tp path, every
   not-yet-implemented module via menu and CLI, and `install.sh`
-  (fresh, re-run, changed file + backup, ezl2tp preserved, broken source
-  refused). 3x-ui is tested against a **fake panel settings CLI** (`x-ui`
+  (checkout mode: fresh, re-run, changed file + backup, ezl2tp preserved, broken source
+  refused; curl mode: good download with text-only version check, curl failure,
+  missing curl, syntax-broken download refused). 3x-ui is tested against a **fake panel settings CLI** (`x-ui`
   stub with its own fake database) plus stub `systemctl`, `curl`, `ss`,
   `sha256sum`, `apt-get` and a fake installer: submenu labels, prechecks
   (non-Debian-13, busy port, missing curl), default install settings,

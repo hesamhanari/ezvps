@@ -63,11 +63,13 @@ done
 #      upd_fetch_latest (main of the user's private ezvps repository, with the user's own
 #      authentication; never an anonymous URL).
 #    - Nothing is ever piped or process-substituted from the network into a shell.
-#    - install.sh downloads nothing.
+#    - install.sh downloads only the ezvps script itself, only in fetch_ezvps,
+#      to a file, verified (bash -n + version as text) before install, never piped
+#      to a shell.
 bad_curl="$(awk '
     /^[A-Za-z_0-9]+\(\)[[:space:]]*\{/ { fn=$1; sub(/\(.*/, "()", fn); depth=0 }
     fn != "" {
-        line=$0; sub(/#.*/, "", line)
+        line=$0; sub(/(^|[[:space:]])#.*/, "", line)
         o=gsub(/\{/, "&", line); c=gsub(/\}/, "&", line)
         if ($0 !~ /^[[:space:]]*#/ && $0 ~ /(^|[[:space:]($`])(curl|wget)[[:space:]]+-/) {
             if (fn != "xui_fetch_installer()" && fn != "xui_probe()" && fn != "ngx_fetch_key()" && fn != "acme_fetch_script()" && fn != "lc_fetch_installer()") print NR": "$0
@@ -82,7 +84,7 @@ fi
 bad_git="$(awk '
     /^[A-Za-z_0-9]+\(\)[[:space:]]*\{/ { fn=$1; sub(/\(.*/, "()", fn); depth=0 }
     fn != "" {
-        line=$0; sub(/#.*/, "", line)
+        line=$0; sub(/(^|[[:space:]])#.*/, "", line)
         o=gsub(/\{/, "&", line); c=gsub(/\}/, "&", line)
         if ($0 !~ /^[[:space:]]*#/ && $0 ~ /[[:space:]](fetch|clone|pull|ls-remote|submodule)[[:space:]]/ && $0 ~ /"\$\{g\[@\]\}"|git[[:space:]]+-/) {
             if (fn != "lc_fetch_source()" && fn != "upd_fetch_latest()") print NR": "$0
@@ -99,8 +101,22 @@ for f in ezvps install.sh; do
         bad "$f: pipes a download into a shell"
     fi
 done
-if grep -vE '^[[:space:]]*#' install.sh | grep -qE 'curl|wget'; then
-    bad "install.sh must not download anything"
+bad_inst_curl="$(awk '
+    /^[A-Za-z_0-9]+\(\)[[:space:]]*\{/ { fn=$1; sub(/\(.*/, "()", fn); depth=0 }
+    {
+        line=$0; sub(/(^|[[:space:]])#.*/, "", line)
+        if (line ~ /(^|[[:space:]($`";|&])(curl|wget)([[:space:];|&)]|$)/) {
+            if (fn != "fetch_ezvps()") print NR": "$0
+        }
+        if (fn != "") {
+            o=gsub(/\{/, "&", line); c=gsub(/\}/, "&", line)
+            depth += o - c
+            if (depth <= 0) { fn=""; depth=0 }
+        }
+    }' install.sh)"
+if [[ -n "$bad_inst_curl" ]]; then
+    bad "install.sh: curl/wget outside fetch_ezvps:"
+    printf '%s\n' "$bad_inst_curl" >&2
 fi
 # 3x-ui installer must be fetched from a pinned tag, never a moving branch.
 if grep -nE 'raw\.githubusercontent\.com/[^"]*/(master|main|HEAD)/' ezvps | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
