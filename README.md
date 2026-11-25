@@ -70,6 +70,13 @@ ezvps --version
 ezvps --help
 ```
 
+On an interactive terminal the menus are arrow-key driven: `Up`/`Down`
+(or `j`/`k`) move, `Enter` selects, digits jump straight to an item,
+`q` or `Esc` goes back. A digit that would go out of range is ignored.
+On a non-TTY (piped input, scripts) the same menus fall back to the
+numbered list with a `Select:` prompt. Short terminals (under 30 rows)
+get a one-line banner instead of the art banner.
+
 Menu:
 
 ```
