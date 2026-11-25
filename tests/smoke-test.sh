@@ -6712,11 +6712,13 @@ check "restore without nginx: certificates restored without sites get a note" co
 bk_restore_setup
 BK_EXTRA=(FAKE_BASH_FAIL_PATH="$D/bin/ezvps")
 cp -a "$D/bin/ezvps" "$BKW/B-ezvps"
+before_state_file="$(<"$D/state/3x-ui.state")"
 run_bk "$BKBIN" "3\n1\nYES\n0\n" backup
 check "restore: a script that fails its syntax check after the copy is rolled back" contains "$OUT" "The restored ezvps script did not verify; putting the previous one back."
 check "restore: the previous script is back, byte for byte" cmp -s "$BKW/B-ezvps" "$D/bin/ezvps"
 check "restore: the problem is reported" contains "$OUT" "The restore finished with problems"
-check "restore: the other parts were restored" cmp -s "$BKA/state/3x-ui.state" "$D/state/3x-ui.state"
+check "restore: state files are skipped when the script fails verification" contains "$OUT" "Skipping state file restore because the script restore failed."
+check "restore: state files are unchanged when the script fails verification" equals "$(<"$D/state/3x-ui.state")" "$before_state_file"
 
 echo "-- Restore backup: backups with anything unexpected are refused before any change"
 bk_tamper() { # bk_tamper <description> <command...>: a fresh backup is made, tampered with, and must be refused
