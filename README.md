@@ -81,10 +81,14 @@ On an interactive terminal the menus are arrow-key driven: `Up`/`Down`
 `q` or `Esc` goes back. A digit that would go out of range is ignored.
 On a non-TTY (piped input, scripts) the same menus fall back to the
 numbered list with a `Select:` prompt. Short terminals (under 30 rows)
-get a one-line banner instead of the art banner. Narrow terminals
-(under 72 columns, e.g. a phone SSH client in portrait) get the
-one-line banner too, and menu rows are sized to the terminal width so
-nothing wraps.
+get a one-line banner instead of the art banner. Menu rows are sized
+to the terminal width so nothing wraps on narrow terminals (e.g. a
+phone SSH client in portrait); under 44 columns the banner is the
+one-liner too. At startup the banner animates in and on exit it wipes
+away (about a second each; any key skips, `EZVPS_NO_ANIM=1` turns
+both off). `install.sh` starts
+`ezvps` automatically when run on an interactive terminal
+(`EZVPS_NO_AUTORUN=1` opts out; piped runs never do).
 
 Menu:
 

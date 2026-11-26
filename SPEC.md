@@ -177,11 +177,21 @@ restores the cursor. The banner shows host, public IP (private,
 CGNAT and benchmarking addresses are skipped) and OS; terminals under
 30 rows get a one-line banner instead of the art. The TUI is
 width-aware (`tui_term_size` via `stty size`, falling back to
-`LINES`/`COLUMNS`): terminals under 72 columns also get the one-line
-banner (without the tagline), menu label fields shrink from 54 to fit
-the width (labels truncated, never wrapped — wrapping breaks the
-fixed-line redraw), rule lines shrink, and under 50 columns the hint
-line shortens. Unknown width keeps the original 54-column layout. All TUI glyphs are
+`LINES`/`COLUMNS`): the art banner is a 6-row, 41-column
+ANSI Shadow EZVPS; terminals under 44 columns get the one-line
+banner instead, menu label fields shrink from 54 to fit the width
+(labels truncated, never wrapped — wrapping breaks the fixed-line
+redraw), rule lines shrink, under 50 columns the tagline is dropped
+and the hint line shortens. Unknown width keeps the original
+54-column layout. Startup animation (once per run, interactive TTY
+only, ~1s, any keypress skips the rest, `EZVPS_NO_ANIM=1` disables):
+the art banner reveals line by line; the compact banner is preceded
+by a braille spinner. Exit animation (same gates): the banner is
+redrawn and wiped line by line bottom-up, then `ezvps closed` is
+printed. Delays are `read -t` on `/dev/tty` (no external commands).
+`install.sh` starts the installed `ezvps` at the end when stdin and
+stdout are TTYs (`EZVPS_NO_AUTORUN=1` opts out; piped runs print
+`Done. Run: ezvps` as before). All TUI glyphs are
 written as `\u` escapes so `ezvps` stays pure ASCII — never paste a
 literal glyph into the file. PTY tests: `bash tests/tui-test.sh`
 (needs python3; skips without it).
