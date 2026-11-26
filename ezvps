@@ -7135,16 +7135,16 @@ upd_installed_info() {
     if [[ ! -f "$EZB_BIN" ]]; then
         UPD_INST_WHY="ezvps is not installed at ${EZB_BIN}"
     elif [[ ! -f "$EZB_INSTALL_STATE" ]]; then
-        UPD_INST_WHY="no install record in ${EZB_STATE_DIR}: this ezvps was installed before versions were recorded"
+        UPD_INST_WHY="no install record"
     elif [[ ! "$st_commit" =~ ^[0-9a-f]{40}$ ]]; then
-        UPD_INST_WHY="the install record has no commit (installed from a copy that is not a git checkout, or an unclean one)"
+        UPD_INST_WHY="install record has no commit"
     elif [[ ! "$st_sha" =~ ^[0-9a-f]{64}$ ]] || ! have_cmd sha256sum; then
-        UPD_INST_WHY="the install record cannot be checked against the installed script"
+        UPD_INST_WHY="install record cannot be verified"
     else
         sha="$(sha256sum "$EZB_BIN" 2>/dev/null)"
         sha="${sha%% *}"
         if [[ "$sha" != "$st_sha" ]]; then
-            UPD_INST_WHY="the installed script differs from the one the install record describes"
+            UPD_INST_WHY="installed script differs from the record"
         else
             UPD_INST_COMMIT="$st_commit"
         fi
@@ -7824,24 +7824,22 @@ upd_get_latest() {
     local c
     UPD_LATEST_COMMIT="" UPD_LATEST_VERSION=""
     if ! have_cmd git; then
-        err "git is not installed. It is needed to fetch the latest ezvps from the private repository"
-        err "(ezvps never uses an anonymous URL for it). Install it with: apt-get install git"
+        err "git is not installed (needed to fetch updates). Install: apt-get install git"
         return 1
     fi
     if ! UPD_TMP="$(mktemp -d)"; then
         err "Cannot create a temporary directory."
         return 1
     fi
-    info "Fetching the latest '${EZB_UPDATE_BRANCH}' from ${UPD_SOURCE} with git."
-    info "git uses your own authentication (a GitHub CLI login, an SSH key, or a token typed at git's prompt)."
+    info "Fetching latest ${EZB_UPDATE_BRANCH} from ${UPD_SOURCE}..."
     if ! upd_fetch_latest "${UPD_TMP}/src"; then
-        err "Could not fetch '${EZB_UPDATE_BRANCH}' from ${UPD_SOURCE}. Check the address and that you have access to the repository. Nothing was changed."
+        err "Fetch failed from ${UPD_SOURCE}. Nothing was changed."
         upd_cleanup
         return 1
     fi
     c="$(git -C "${UPD_TMP}/src" rev-parse HEAD 2>/dev/null)"
     if [[ ! "$c" =~ ^[0-9a-f]{40}$ ]] || [[ ! -f "${UPD_TMP}/src/ezvps" ]]; then
-        err "The fetched '${EZB_UPDATE_BRANCH}' is not an ezvps checkout (no commit or no ezvps script). Nothing was changed."
+        err "Fetched ${EZB_UPDATE_BRANCH} is not an ezvps checkout. Nothing was changed."
         upd_cleanup
         return 1
     fi
@@ -7854,24 +7852,19 @@ upd_get_latest() {
 upd_compare() {
     local iv="${UPD_INST_VERSION:-unknown}" lv="${UPD_LATEST_VERSION:-unknown}"
     info ""
-    if [[ -n "$UPD_INST_COMMIT" ]]; then
-        info "Installed:  version ${iv}, commit ${UPD_INST_COMMIT:0:12}"
-    else
-        info "Installed:  version ${iv}, commit unknown"
-        info "            (${UPD_INST_WHY})"
-    fi
-    info "Latest:     version ${lv}, commit ${UPD_LATEST_COMMIT:0:12} (${EZB_UPDATE_BRANCH} of ${UPD_SOURCE})"
-    info ""
     if [[ -z "$UPD_INST_COMMIT" ]]; then
-        warn "Unknown: ezvps cannot tell whether this install is up to date, so it is NOT reported as current."
-        [[ "$iv" != "$lv" ]] && info "The versions differ (${iv} installed, ${lv} latest)."
-        info "Use 'Update ezvps' to install the latest ${EZB_UPDATE_BRANCH}; that also records the version and commit."
+        warn "Commit unknown (${UPD_INST_WHY})"
     elif [[ "$UPD_INST_COMMIT" == "$UPD_LATEST_COMMIT" ]]; then
-        info "Up to date: the installed commit is the latest ${EZB_UPDATE_BRANCH}."
+        info "Up to date"
     else
-        info "Update available: the latest ${EZB_UPDATE_BRANCH} is a different commit than the installed one."
-        info "Use 'Update ezvps' to install it."
+        info "Update available"
     fi
+    if [[ -n "$UPD_INST_COMMIT" ]]; then
+        info "Current: ${iv} (${UPD_INST_COMMIT:0:12})"
+    else
+        info "Current: ${iv}"
+    fi
+    info "Latest:  ${lv} (${UPD_LATEST_COMMIT:0:12})"
     return 0
 }
 
@@ -7882,8 +7875,14 @@ upd_check_cmd() {
     upd_resolve_source || return 0
     upd_get_latest || return 0
     upd_compare
+    if [[ "$UPD_INST_COMMIT" != "$UPD_LATEST_COMMIT" ]]; then
+        # An update is available (or the installed commit is unknown):
+        # offer the already-fetched candidate right away. The write
+        # preflight (backup directory) runs inside upd_apply_latest,
+        # after a yes, so declining writes nothing.
+        require_cmds bash && upd_apply_latest
+    fi
     upd_cleanup
-    info "Nothing was changed."
     return 0
 }
 
@@ -7954,8 +7953,66 @@ ezb_state_unchanged() { # ezb_state_unchanged <backup dir>
     return 0
 }
 
-upd_update_cmd() {
+# upd_apply_latest: install the already-fetched candidate (UPD_TMP/src/ezvps):
+# verify, confirm, back up, install, verify, record. The caller cleans up UPD_TMP.
+upd_apply_latest() {
     local cand bak old_v new_v
+    cand="${UPD_TMP}/src/ezvps"
+    old_v="${UPD_INST_VERSION:-unknown}"
+    if [[ ! -f "$EZB_BIN" ]]; then
+        err "ezvps is not installed at ${EZB_BIN}; nothing to update. Nothing was changed."
+        return 0
+    fi
+    # The candidate is checked before anything is touched.
+    if ! upd_verify_script "$cand"; then
+        err "Latest script is not usable (${UPD_VERIFY_OUT}). Nothing was changed."
+        return 0
+    fi
+    new_v="$UPD_VERIFY_VERSION"
+    if cmp -s -- "$cand" "$EZB_BIN"; then
+        info "Already the latest script; nothing to replace."
+        if [[ "$UPD_INST_COMMIT" == "$UPD_LATEST_COMMIT" ]]; then
+            info "Install record already matches."
+        elif upd_state_write "$new_v" "$UPD_LATEST_COMMIT" "$UPD_SOURCE"; then
+            info "Recorded ${new_v} (${UPD_LATEST_COMMIT:0:12})."
+        else
+            warn "Could not write ${EZB_INSTALL_STATE}; the commit stays unknown."
+        fi
+        return 0
+    fi
+    info ""
+    if ! ask_yes_no "Update?"; then
+        info "Nothing was changed."
+        return 0
+    fi
+    ezb_preflight "Update ezvps" write || return 0
+    ezb_create pre-update core || {
+        err "Update cancelled: could not back up the current ezvps. Nothing was changed."
+        return 0
+    }
+    bak="$EZB_LAST_PATH"
+    if ! ezb_install_script "$cand" || ! cmp -s -- "$cand" "$EZB_BIN" || ! upd_verify_script "$EZB_BIN"; then
+        err "New script did not verify after install${UPD_VERIFY_OUT:+ (${UPD_VERIFY_OUT})}. Rolling back..."
+        if [[ -f "$bak/bin/ezvps" ]] && ezb_install_script "$bak/bin/ezvps" && cmp -s -- "$bak/bin/ezvps" "$EZB_BIN"; then
+            info "Rolled back to the previous script (verified)."
+        else
+            err "Rollback could not be verified. Previous script: ${bak}/bin/ezvps; copy it to ${EZB_BIN}."
+        fi
+        return 0
+    fi
+    if ! upd_state_write "$new_v" "$UPD_LATEST_COMMIT" "$UPD_SOURCE"; then
+        warn "Updated, but ${EZB_INSTALL_STATE} could not be written; the commit stays unknown."
+    fi
+    info ""
+    info "Updated: ${old_v} -> ${UPD_VERIFY_VERSION} (${UPD_LATEST_COMMIT:0:12}). Verified."
+    if ! ezb_state_unchanged "$bak"; then
+        warn "A state file differs from the backup; compare ${bak}/state with ${EZB_STATE_DIR}."
+    fi
+    info "Backup: ${bak}. Restart ezvps to use the new version."
+    return 0
+}
+
+upd_update_cmd() {
     ezb_preflight "Update ezvps" write || return 0
     require_cmds sha256sum bash || return 0
     if [[ ! -f "$EZB_BIN" ]]; then
@@ -7966,65 +8023,7 @@ upd_update_cmd() {
     upd_resolve_source || return 0
     upd_get_latest || return 0
     upd_compare
-    cand="${UPD_TMP}/src/ezvps"
-    old_v="${UPD_INST_VERSION:-unknown}"
-
-    # The candidate is checked before anything is touched.
-    if ! upd_verify_script "$cand"; then
-        err "The latest ${EZB_UPDATE_BRANCH} script is not usable (${UPD_VERIFY_OUT}). Nothing was changed."
-        upd_cleanup
-        return 0
-    fi
-    new_v="$UPD_VERIFY_VERSION"
-    if cmp -s -- "$cand" "$EZB_BIN"; then
-        info "The installed script is byte-for-byte the latest ${EZB_UPDATE_BRANCH}; there is nothing to replace."
-        if [[ "$UPD_INST_COMMIT" == "$UPD_LATEST_COMMIT" ]]; then
-            info "The install record already matches."
-        elif upd_state_write "$new_v" "$UPD_LATEST_COMMIT" "$UPD_SOURCE"; then
-            info "Recorded version ${new_v} and commit ${UPD_LATEST_COMMIT:0:12} in ${EZB_INSTALL_STATE} (verified)."
-        else
-            warn "Could not write ${EZB_INSTALL_STATE}; the commit stays unknown."
-        fi
-        upd_cleanup
-        return 0
-    fi
-    info ""
-    info "ezvps will replace ${EZB_BIN}: version ${old_v} -> ${new_v} (commit ${UPD_LATEST_COMMIT:0:12})."
-    info "The current script and the ezvps state files are backed up first. Tool configs, nginx sites,"
-    info "certificates, users and all other state are not touched."
-    if ! ask_yes_no "Update ezvps now?"; then
-        info "Nothing was changed."
-        upd_cleanup
-        return 0
-    fi
-    ezb_create pre-update core || {
-        err "Update cancelled: the current ezvps could not be backed up. Nothing was changed."
-        upd_cleanup
-        return 0
-    }
-    bak="$EZB_LAST_PATH"
-    if ! ezb_install_script "$cand" || ! cmp -s -- "$cand" "$EZB_BIN" || ! upd_verify_script "$EZB_BIN"; then
-        err "The new script did not verify after it was installed${UPD_VERIFY_OUT:+ (${UPD_VERIFY_OUT})}. Rolling back..."
-        if [[ -f "$bak/bin/ezvps" ]] && ezb_install_script "$bak/bin/ezvps" && cmp -s -- "$bak/bin/ezvps" "$EZB_BIN"; then
-            info "Rolled back: ${EZB_BIN} is the previous script again (verified byte for byte against ${bak})."
-        else
-            err "The rollback could not be verified. The previous script is in ${bak}/bin/ezvps; copy it to ${EZB_BIN}."
-        fi
-        upd_cleanup
-        return 0
-    fi
-    if ! upd_state_write "$new_v" "$UPD_LATEST_COMMIT" "$UPD_SOURCE"; then
-        warn "ezvps was updated but ${EZB_INSTALL_STATE} could not be written; its commit stays unknown."
-    fi
-    info ""
-    info "Updated ${EZB_BIN}: version ${old_v} -> ${UPD_VERIFY_VERSION}, commit ${UPD_LATEST_COMMIT:0:12}."
-    info "Verified: the installed file is byte-for-byte the fetched ${EZB_UPDATE_BRANCH}, passes bash -n and reports 'ezvps ${UPD_VERIFY_VERSION}'."
-    if ezb_state_unchanged "$bak"; then
-        info "Verified: the other ezvps state files are unchanged. Tool configs, sites, certificates and users were not touched."
-    else
-        warn "A state file differs from the backup; compare ${bak}/state with ${EZB_STATE_DIR}."
-    fi
-    info "Previous version backed up at ${bak}. Restart ezvps to use the new version."
+    upd_apply_latest
     upd_cleanup
     return 0
 }

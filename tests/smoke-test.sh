@@ -6760,52 +6760,60 @@ bk_new
 before="$(bk_snap_all)"
 run_bk "$BKBIN" "1\n0\n" update
 check "check (update available): exits 0" equals "$RC" 0
-check "check: shows the installed version and commit" contains "$OUT" "Installed:  version 0.0.1-old, commit ${BK_OLD_COMMIT:0:12}"
-check "check: shows the latest version and commit, and where from" contains "$OUT" "Latest:     version 0.0.2-new, commit ${BK_NEW_COMMIT:0:12} (main of ${BK_SRC_HTTPS})"
+check "check: shows the installed version and commit" contains "$OUT" "Current: 0.0.1-old (${BK_OLD_COMMIT:0:12})"
+check "check: shows the latest version and commit, and where from" contains "$OUT" "Latest:  0.0.2-new (${BK_NEW_COMMIT:0:12})"
 check "check: says an update is available" contains "$OUT" "Update available"
 check "check: does not claim to be up to date" not_contains "$OUT" "Up to date"
 check "check: nothing was changed (no backup directory entry, nothing written)" equals "$(bk_snap_all)" "$before"
 check "check: git cloned main shallowly from the recorded source (after '--')" bk_log_has "--depth 1 --branch main --single-branch -- ${BK_SRC_HTTPS} "
 check "check: git is limited to https and ssh" bk_log_has "-c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always"
 check "check: git was called once to clone and once to read the commit" equals "$(grep -c '^git ' "$D/log")" 2
-check "check: says what authentication git uses" contains "$OUT" "git uses your own authentication"
+check "check: says where it fetches from" contains "$OUT" "Fetching latest main from ${BK_SRC_HTTPS}..."
 check "check: no temporary directory is left behind" bk_tmp_clean
 BK_EXTRA=(FAKE_MAIN_COMMIT="$BK_OLD_COMMIT")
 run_bk "$BKBIN" "1\n0\n" update
-check "check (same commit): reports up to date" contains "$OUT" "Up to date: the installed commit is the latest main."
+check "check (same commit): reports up to date" contains "$OUT" "Up to date"
 check "check (same commit): does not offer an update" not_contains "$OUT" "Update available"
+bk_new
+run_bk "$BKBIN" "1\ny\n0\n" update
+check "check then yes: exits 0" equals "$RC" 0
+check "check then yes: the update ran without a second fetch" equals "$(grep -c '^git ' "$D/log")" 2
+check "check then yes: the installed file is the fetched main" cmp -s "$D/main/ezvps" "$D/bin/ezvps"
+check "check then yes: the new commit is recorded" equals "$(bk_state_get commit)" "$BK_NEW_COMMIT"
+check "check then yes: reports the update" contains "$OUT" "Updated: 0.0.1-old -> 0.0.2-new (${BK_NEW_COMMIT:0:12}). Verified."
+check "check then yes: exactly one backup was made" equals "$(bk_n)" 1
 bk_new
 rm -f "$D/state/install.state"
 run_bk "$BKBIN" "1\n${BK_SRC_HTTPS}\n0\n" update
-check "check (no install record): version known, commit unknown" contains "$OUT" "Installed:  version 0.0.1-old, commit unknown"
-check "check (no install record): says why" contains "$OUT" "no install record in ${D}/state"
-check "check (no install record): treated as unknown, NOT as up to date" contains "$OUT" "Unknown: ezvps cannot tell whether this install is up to date, so it is NOT reported as current."
+check "check (no install record): version known, commit unknown" contains "$OUT" "Current: 0.0.1-old"
+check "check (no install record): says why" contains "$OUT" "Commit unknown (no install record)"
+check "check (no install record): treated as unknown, NOT as up to date" contains "$OUT" "Commit unknown"
 check "check (no install record): never says 'Up to date'" not_contains "$OUT" "Up to date"
-check "check (no install record): points to Update ezvps" contains "$OUT" "Use 'Update ezvps' to install the latest main; that also records the version and commit."
-check "check (no install record): notes that the versions differ" contains "$OUT" "The versions differ (0.0.1-old installed, 0.0.2-new latest)."
+check "check (no install record): offers the update right away (declined: nothing changed)" contains "$OUT" "Nothing was changed."
+check "check (no install record): shows the latest version" contains "$OUT" "Latest:  0.0.2-new (${BK_NEW_COMMIT:0:12})"
 check "check (no install record): asks for the repository (placeholder example)" contains "$OUT" "git@github.com:<owner>/ezvps.git"
 check "check (no install record): used the address that was typed" bk_log_has "-- ${BK_SRC_HTTPS} "
 check "check (no install record): did not record anything" test ! -e "$D/state/install.state"
 bk_new
 bk_record "" "$BK_SRC_HTTPS"
 run_bk "$BKBIN" "1\n0\n" update
-check "check (record without a commit): commit unknown, and why" contains "$OUT" "the install record has no commit"
+check "check (record without a commit): commit unknown, and why" contains "$OUT" "install record has no commit"
 check "check (record without a commit): not reported as up to date" not_contains "$OUT" "Up to date"
 bk_new
 bk_record "$BK_NEW_COMMIT"
 printf '# edited by hand\n' >>"$D/bin/ezvps"
 BK_EXTRA=(FAKE_MAIN_COMMIT="$BK_NEW_COMMIT")
 run_bk "$BKBIN" "1\n0\n" update
-check "check (installed script edited after the record, same commit): unknown, not up to date" contains "$OUT" "the installed script differs from the one the install record describes"
+check "check (installed script edited after the record, same commit): unknown, not up to date" contains "$OUT" "installed script differs from the record"
 check "check (edited script): never says 'Up to date'" not_contains "$OUT" "Up to date"
 bk_new
 run_bk "$BKBIN_NOGIT" "1\n0\n" update
-check "check without git: says git is needed and why (private repository, no anonymous URL)" contains "$OUT" "git is not installed. It is needed to fetch the latest ezvps from the private repository"
+check "check without git: says git is needed and how to install it" contains "$OUT" "git is not installed (needed to fetch updates). Install: apt-get install git"
 check "check without git: nothing was changed" equals "$(bk_n)$(<"$D/log")" 0
 bk_new
 BK_EXTRA=(FAKE_GIT_FAIL=1)
 run_bk "$BKBIN" "1\n0\n" update
-check "check: a failing git fetch is reported, nothing changed" contains "$OUT" "Could not fetch 'main' from ${BK_SRC_HTTPS}. Check the address and that you have access to the repository. Nothing was changed."
+check "check: a failing git fetch is reported, nothing changed" contains "$OUT" "Fetch failed from ${BK_SRC_HTTPS}. Nothing was changed."
 check "check: a failing fetch exits 0" equals "$RC" 0
 bk_new
 rm -f "$D/main/ezvps"
@@ -6820,7 +6828,7 @@ bk_record "$BK_OLD_COMMIT" "https://raw.githubusercontent.com/owner/ezvps/main/e
 run_bk "$BKBIN" "1\n0\n" update
 check "check: a raw file URL recorded by an older curl install is rewritten to the git address" bk_log_has "-- https://github.com/owner/ezvps.git "
 check "check: the raw file URL is never cloned" not_contains "$(<"$D/log")" "raw.githubusercontent.com"
-check "check: the rewritten source is the one shown" contains "$OUT" "(main of https://github.com/owner/ezvps.git)"
+check "check: the rewritten source is the one shown" contains "$OUT" "Fetching latest main from https://github.com/owner/ezvps.git..."
 bk_new
 bk_record "$BK_OLD_COMMIT" "http://example.com/owner/ezvps.git"
 run_bk "$BKBIN" "1\n\n0\n" update
@@ -6862,7 +6870,7 @@ printf 'x\n' >"$D/state/extra.state"
 tools_before="$(bk_snap_tools)"
 other_before="$(bk_snap "$D/bin/ezl2tp" 2>/dev/null)"
 run_bk "$BKBIN" "2\nn\n0\n" update
-check "update declined: the plan is shown first" contains "$OUT" "ezvps will replace ${D}/bin/ezvps: version 0.0.1-old -> 0.0.2-new"
+check "update declined: the verdict is shown first" contains "$OUT" "Update available"
 check "update declined: nothing changed" bash -c 'cmp -s "$1" "$2" && [[ "$3" == 0 ]]' _ "$BKW/U-old-ezvps" "$D/bin/ezvps" "$(bk_n)"
 check "update declined: says so" contains "$OUT" "Nothing was changed."
 run_bk "$BKBIN" "2\n\n0\n" update
@@ -6873,10 +6881,10 @@ check "update: EOF at the question is a no" bash -c 'cmp -s "$1" "$2" && [[ "$3"
 run_bk "$BKBIN" "2\ny\n0\n" update
 BKU="$(bk_last)"
 check "update: exits 0" equals "$RC" 0
-check "update: shows installed versus latest before the plan" out_order "Installed:  version 0.0.1-old" "ezvps will replace"
-check "update: shows the plan (what is replaced, what is preserved)" contains "$OUT" "ezvps will replace ${D}/bin/ezvps: version 0.0.1-old -> 0.0.2-new (commit ${BK_NEW_COMMIT:0:12})."
+check "update: shows the verdict before updating" out_order "Update available" "Updated: 0.0.1-old"
+check "update: shows current versus latest" contains "$OUT" "Latest:  0.0.2-new (${BK_NEW_COMMIT:0:12})"
 check "update: exactly one backup was made, under the backup directory" equals "$(bk_n)" 1
-check "update: the backup is announced before the new script is installed" out_order "Backup created and verified: ${BKU}" "Updated ${D}/bin/ezvps"
+check "update: the backup is announced before the new script is installed" out_order "Backup created and verified: ${BKU}" "Updated: 0.0.1-old"
 check "update: the backup holds the OLD script, byte for byte" cmp -s "$BKW/U-old-ezvps" "$BKU/bin/ezvps"
 check "update: the backup holds the state files" bash -c 'cmp -s "$1" "$2/state/3x-ui.state" && [[ -f "$2/state/install.state" && -f "$2/state/extra.state" ]]' _ "$BKW/U-old-3xui.state" "$BKU"
 check "update: the backup is marked pre-update, script and state only" bash -c 'm="$(<"$1/MANIFEST")"; [[ "$m" == *"reason=pre-update"* && "$m" == *"scope=core"* && ! -e "$1/nginx-sites" && ! -e "$1/certs" ]]' _ "$BKU"
@@ -6885,15 +6893,15 @@ check "update: the installed file is byte for byte the fetched main" cmp -s "$D/
 check "update: the installed file is executable (mode 755)" mode_is "$D/bin/ezvps" 755
 check "update: the installed file passes bash -n (checked on the file system)" bash -n "$D/bin/ezvps"
 check "update: the installed file reports the new version" equals "$(EZVPS_ALLOW_NONROOT=1 "$BASH_BIN" "$D/bin/ezvps" --version)" "ezvps 0.0.2-new"
-check "update: reports old -> new and the commit" contains "$OUT" "Updated ${D}/bin/ezvps: version 0.0.1-old -> 0.0.2-new, commit ${BK_NEW_COMMIT:0:12}."
-check "update: reports what was verified" contains "$OUT" "Verified: the installed file is byte-for-byte the fetched main, passes bash -n and reports 'ezvps 0.0.2-new'."
+check "update: announces the backup and the restart" contains "$OUT" "Backup: ${BKU}. Restart ezvps to use the new version."
+check "update: reports what was verified" contains "$OUT" "Updated: 0.0.1-old -> 0.0.2-new (${BK_NEW_COMMIT:0:12}). Verified."
 check "update: records the new version in the install record" equals "$(bk_state_get version)" "0.0.2-new"
 check "update: records the new commit" equals "$(bk_state_get commit)" "$BK_NEW_COMMIT"
 check "update: keeps the source" equals "$(bk_state_get source)" "$BK_SRC_HTTPS"
 check "update: records the sha256 of the installed script" equals "$(bk_state_get sha256)" "$(sha256sum "$D/bin/ezvps" | cut -d' ' -f1)"
 check "update: the install record is mode 600" mode_is "$D/state/install.state" 600
 check "update: the other state files are unchanged" bash -c 'cmp -s "$1" "$2/state/3x-ui.state" && [[ "$(<"$2/state/extra.state")" == x ]]' _ "$BKW/U-old-3xui.state" "$D"
-check "update: says the other state is unchanged" contains "$OUT" "Verified: the other ezvps state files are unchanged. Tool configs, sites, certificates and users were not touched."
+check "update: no state-file warning" not_contains "$OUT" "A state file differs"
 check "update: sites, certificates, tool configs and users are untouched" equals "$(bk_snap_tools)" "$tools_before"
 check "update: ezl2tp next to it is untouched" equals "$(bk_snap "$D/bin/ezl2tp" 2>/dev/null)" "$other_before"
 check "update: no temporary files left behind" no_tmp_in_bin
@@ -6902,14 +6910,14 @@ check "update: only git was used to fetch (no curl or wget in the sandbox, no ra
 check "update: tells the user to restart ezvps" contains "$OUT" "Restart ezvps to use the new version."
 echo "-- Check for updates after the update"
 run_bk "$BKBIN" "1\n0\n" update
-check "check after the update: up to date" contains "$OUT" "Up to date: the installed commit is the latest main."
-check "check after the update: installed equals latest" contains "$OUT" "Installed:  version 0.0.2-new, commit ${BK_NEW_COMMIT:0:12}"
+check "check after the update: up to date" contains "$OUT" "Up to date"
+check "check after the update: installed equals latest" contains "$OUT" "Current: 0.0.2-new (${BK_NEW_COMMIT:0:12})"
 echo "-- Update again (already the latest)"
 run_bk "$BKBIN" "2\ny\n0\n" update
-check "update again: nothing to replace" contains "$OUT" "The installed script is byte-for-byte the latest main; there is nothing to replace."
+check "update again: nothing to replace" contains "$OUT" "Already the latest script; nothing to replace."
 check "update again: no new backup" equals "$(bk_n)" 1
-check "update again: the install record already matches" contains "$OUT" "The install record already matches."
-check "update again: no plan is shown, nothing is offered" not_contains "$OUT" "ezvps will replace"
+check "update again: the install record already matches" contains "$OUT" "Install record already matches."
+check "update again: no update is offered" not_contains "$OUT" "Update available"
 
 echo "-- Update ezvps: a candidate that is not usable is refused before anything changes"
 bk_new
@@ -6917,14 +6925,14 @@ bk_write_ezvps "$D/main/ezvps" "0.0.2-new" broken
 cp -a "$D/bin/ezvps" "$BKW/U-old-ezvps"
 before="$(bk_snap_all)"
 run_bk "$BKBIN" "2\ny\n0\n" update
-check "failed syntax check of the new script: refused" contains "$OUT" "The latest main script is not usable (syntax check failed:"
-check "failed syntax check: no plan is shown, nothing is offered" not_contains "$OUT" "ezvps will replace"
+check "failed syntax check of the new script: refused" contains "$OUT" "Latest script is not usable (syntax check failed:"
+check "failed syntax check: nothing is offered, no backup is made" not_contains "$OUT" "Backup created and verified"
 check "failed syntax check: the installed script and everything else is as before" equals "$(bk_snap_all)" "$before"
 bk_new
 bk_write_ezvps "$D/main/ezvps" "0.0.2-new" noversion
 before="$(bk_snap_all)"
 run_bk "$BKBIN" "2\ny\n0\n" update
-check "a new script whose --version fails: refused" contains "$OUT" "The latest main script is not usable (--version failed"
+check "a new script whose --version fails: refused" contains "$OUT" "Latest script is not usable (--version failed"
 check "a new script whose --version fails: nothing changed" equals "$(bk_snap_all)" "$before"
 bk_new
 printf '#!/usr/bin/env bash\necho hello\n' >"$D/main/ezvps"
@@ -6941,8 +6949,8 @@ tools_before="$(bk_snap_tools)"
 BK_EXTRA=(FAKE_BASH_FAIL_PATH="$D/bin/ezvps")
 run_bk "$BKBIN" "2\ny\n0\n" update
 BKU="$(bk_last)"
-check "rollback: the failed check after the install is reported" contains "$OUT" "The new script did not verify after it was installed (syntax check failed:"
-check "rollback: says it rolled back and verified it byte for byte" contains "$OUT" "Rolled back: ${D}/bin/ezvps is the previous script again (verified byte for byte against ${BKU})."
+check "rollback: the failed check after the install is reported" contains "$OUT" "New script did not verify after install (syntax check failed:"
+check "rollback: says it rolled back and verified it byte for byte" contains "$OUT" "Rolled back to the previous script (verified)."
 check "rollback: the previous script is back, byte for byte" cmp -s "$BKW/U-old-ezvps" "$D/bin/ezvps"
 check "rollback: the previous script still runs" equals "$(EZVPS_ALLOW_NONROOT=1 "$BASH_BIN" "$D/bin/ezvps" --version)" "ezvps 0.0.1-old"
 check "rollback: the backup was made before the replacement and is kept" bash -c 'cmp -s "$1" "$2/bin/ezvps"' _ "$BKW/U-old-ezvps" "$BKU"
@@ -6964,12 +6972,12 @@ cp "$D/main/ezvps" "$D/bin/ezvps"
 chmod 755 "$D/bin/ezvps"
 rm -f "$D/state/install.state"
 run_bk "$BKBIN" "2\n${BK_SRC_HTTPS}\n0\n" update
-check "update (identical script, unknown commit): nothing is replaced" contains "$OUT" "there is nothing to replace."
-check "update (identical script, unknown commit): the commit is recorded and verified" contains "$OUT" "Recorded version 0.0.2-new and commit ${BK_NEW_COMMIT:0:12} in ${D}/state/install.state (verified)."
+check "update (identical script, unknown commit): nothing is replaced" contains "$OUT" "Already the latest script; nothing to replace."
+check "update (identical script, unknown commit): the commit is recorded and verified" contains "$OUT" "Recorded 0.0.2-new (${BK_NEW_COMMIT:0:12})."
 check "update (identical script, unknown commit): the record has commit and source" bash -c '[[ "$1" == "$2" && "$3" == "$4" ]]' _ "$(bk_state_get commit)" "$BK_NEW_COMMIT" "$(bk_state_get source)" "$BK_SRC_HTTPS"
-check "update (identical script, unknown commit): no backup, no question" bash -c '[[ "$1" == 0 && "$2" != *"ezvps will replace"* ]]' _ "$(bk_n)" "$OUT"
+check "update (identical script, unknown commit): no backup, no question" bash -c '[[ "$1" == 0 && "$2" != *"Update available"* ]]' _ "$(bk_n)" "$OUT"
 run_bk "$BKBIN" "1\n0\n" update
-check "update (identical script): the next check says up to date" contains "$OUT" "Up to date: the installed commit is the latest main."
+check "update (identical script): the next check says up to date" contains "$OUT" "Up to date"
 bk_new
 BK_EXTRA=(EZVPS_BACKUP_DIR="$D/afile/sub")
 printf 'x\n' >"$D/afile"
@@ -7112,7 +7120,7 @@ bk_new
 before="$(bk_snap_all)"
 BK_EXTRA=(FAKE_CP_PATTERN='*/backups/*/bin/ezvps')
 run_bk "$BKBIN_CPFAULT" "2\ny\n0\n" update
-check "update: a backup that does not verify stops the update before anything is replaced" contains "$OUT" "Update cancelled: the current ezvps could not be backed up. Nothing was changed."
+check "update: a backup that does not verify stops the update before anything is replaced" contains "$OUT" "Update cancelled: could not back up the current ezvps. Nothing was changed."
 check "update: nothing changed after the bad backup (script, state, no backup left)" equals "$(bk_snap_all)" "$before"
 bk_new
 before="$(bk_snap_all)"
@@ -7125,7 +7133,7 @@ cp -a "$D/bin/ezvps" "$BKW/V-old-ezvps"
 cp -a "$D/state/install.state" "$BKW/V-old-install.state"
 BK_EXTRA=(FAKE_CP_PATTERN='*/.ezvps.*' FAKE_CP_ONCE=1 FAKE_CP_MARK="$D/cp.mark")
 run_bk "$BKBIN_CPFAULT" "2\ny\n0\n" update
-check "update: an installed file that is not the fetched one is detected" contains "$OUT" "The new script did not verify after it was installed"
+check "update: an installed file that is not the fetched one is detected" contains "$OUT" "New script did not verify after install"
 check "update: ... and rolled back, byte for byte" cmp -s "$BKW/V-old-ezvps" "$D/bin/ezvps"
 check "update: ... the install record is untouched and no update is reported" bash -c 'cmp -s "$1" "$2" && [[ "$3" != *"Updated "* ]]' _ "$BKW/V-old-install.state" "$D/state/install.state" "$OUT"
 bk_restore_setup
@@ -7195,7 +7203,7 @@ if command -v git >/dev/null 2>&1; then
     cp -a "$IRW/c1b/state" "$D/state"
     BK_EXTRA=(FAKE_MAIN_COMMIT="$HEAD_COMMIT")
     run_bk "$BKBIN" "1\n0\n" update
-    check "install record, end to end: Check For Updates reads it (installed commit = checkout commit => up to date)" contains "$OUT" "Up to date: the installed commit is the latest main."
+    check "install record, end to end: Check For Updates reads it (installed commit = checkout commit => up to date)" contains "$OUT" "Up to date"
     check "install record, end to end: it fetched from the recorded origin without asking" bk_log_has "-- https://example.com/owner/ezvps.git "
     check "install record, end to end: it did not ask for an address" not_contains "$OUT" "Repository (empty to cancel)"
     # uncommitted change => the commit is unknown
@@ -7240,7 +7248,7 @@ check "install record: a state directory that cannot be created only warns, the 
 bk_new
 rm -f "$D/state/install.state"
 run_bk "$BKBIN" "1\n${BK_SRC_HTTPS}\n0\n" update
-check "an old install (no record) is unknown, not up to date" bash -c '[[ "$1" == *"commit unknown"* && "$1" != *"Up to date"* ]]' _ "$OUT"
+check "an old install (no record) is unknown, not up to date" bash -c '[[ "$1" == *"Commit unknown"* && "$1" != *"Up to date"* ]]' _ "$OUT"
 
 # --- every item runs through the CLI too -------------------------------------------------------------
 echo "-- CLI"
@@ -7347,7 +7355,7 @@ check "no code prints or reads a private key (privkey.pem is only chmod'ed, stat
 check "the YES confirmations read the answer exactly (IFS= read), so ' YES' and 'YES ' do not confirm" equals "$(ezb_code | grep -c 'IFS= read -r -p "Type YES')" 2
 check "restore and uninstall both ask for the exact word YES" bash -c '[[ "$1" == *"Type YES to restore this backup"* && "$2" == *"Type YES to uninstall ezvps"* ]]' _ "$(ezb_fn ezb_restore_cmd)" "$(ezb_fn module_uninstall)"
 check "restore backs up the current state before it writes anything" bash -c 'a="$(grep -n "ezb_create pre-restore full" <<<"$1" | head -1 | cut -d: -f1)"; b="$(grep -n "ezb_apply_certs \"\$sel\"" <<<"$1" | head -1 | cut -d: -f1)"; [[ -n "$a" && -n "$b" ]] && ((a < b))' _ "$(ezb_fn ezb_restore_cmd)"
-check "update and uninstall back up before they replace or remove" bash -c 'u="$1"; n="$2"; ((  $(grep -n "ezb_create pre-update core" <<<"$u" | head -1 | cut -d: -f1) < $(grep -n "ezb_install_script \"\$cand\"" <<<"$u" | head -1 | cut -d: -f1) )) && ((  $(grep -n "ezb_create pre-uninstall core" <<<"$n" | head -1 | cut -d: -f1) < $(grep -n "rm -f" <<<"$n" | head -1 | cut -d: -f1) ))' _ "$(ezb_fn upd_update_cmd)" "$(ezb_fn module_uninstall)"
+check "update and uninstall back up before they replace or remove" bash -c 'u="$1"; n="$2"; ((  $(grep -n "ezb_create pre-update core" <<<"$u" | head -1 | cut -d: -f1) < $(grep -n "ezb_install_script \"\$cand\"" <<<"$u" | head -1 | cut -d: -f1) )) && ((  $(grep -n "ezb_create pre-uninstall core" <<<"$n" | head -1 | cut -d: -f1) < $(grep -n "rm -f" <<<"$n" | head -1 | cut -d: -f1) ))' _ "$(ezb_fn upd_apply_latest)" "$(ezb_fn module_uninstall)"
 check "every item starts with ezb_preflight (root, supported system, and a writable backup directory where it writes)" bash -c 'for f in ezb_create_cmd ezb_list_cmd ezb_restore_cmd upd_check_cmd upd_update_cmd module_uninstall; do grep -q "ezb_preflight" <<<"$(sed -n "/^${f}() {/,/^}/p" "$2")" || exit 1; done' _ "$(ezb_code)" "$EZVPS"
 check "ezb_preflight requires root and a supported system" bash -c '[[ "$1" == *"require_root"* && "$1" == *"require_supported_os"* ]]' _ "$(ezb_fn ezb_preflight)"
 check "the update source is never hardcoded (no github.com address of a private repo in the update code)" bash -c '! grep -qE "https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|git@github\.com:[A-Za-z0-9_.-]+/" <<<"$1"' _ "$(ezb_code | grep -vE 'info |warn |err ')"
