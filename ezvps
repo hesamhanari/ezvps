@@ -7673,6 +7673,13 @@ upd_valid_source() {
 
 upd_resolve_source() {
     local u
+    # Curl-mode installs made before the source fix recorded the raw file
+    # URL, which git cannot clone. Rewrite it to the repository's git
+    # address (the same derivation install.sh now records); a successful
+    # update then records the rewritten address.
+    if [[ "$UPD_SOURCE" =~ ^https://raw\.githubusercontent\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/ ]]; then
+        UPD_SOURCE="https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}.git"
+    fi
     if upd_valid_source "$UPD_SOURCE"; then
         return 0
     fi

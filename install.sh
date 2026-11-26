@@ -21,7 +21,9 @@
 #   /var/lib/ezvps/install.state so Check For Updates can compare it with the
 #   latest main. In checkout mode, commit is recorded only from a clean git
 #   checkout and source is the checkout's `origin` (credentials stripped). In
-#   curl mode, source is the raw download URL and commit is omitted (unknown).
+#   curl mode, source is the git address derived from the raw download URL
+#   (Check For Updates clones it with git, which cannot clone a raw file
+#   URL) and commit is omitted (unknown).
 #
 # Overrides (mainly for tests):
 #   EZVPS_BIN_DIR       install directory      (default /usr/local/bin)
@@ -264,12 +266,28 @@ clean_source() { # clean_source <url>
     return 0
 }
 
+# The git remote for a raw.githubusercontent.com download URL
+# (https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<file> ->
+# https://github.com/<owner>/<repo>.git), or empty when the URL is not of
+# that shape. Check For Updates clones the recorded source with git, and
+# git cannot clone a raw file URL, so curl mode records this instead.
+raw_url_git_remote() { # raw_url_git_remote <raw-url>
+    local rest owner repo
+    rest="${1#https://raw.githubusercontent.com/}"
+    [[ "$rest" != "$1" && "$rest" == */*/*/* ]] || return 0
+    owner="${rest%%/*}"
+    repo="${rest#*/}"
+    repo="${repo%%/*}"
+    [[ -n "$owner" && -n "$repo" ]] || return 0
+    clean_source "https://github.com/${owner}/${repo}.git"
+}
+
 # Records what is installed. Never fatal: without a record, Check For Updates simply
 # reports the installed commit as unknown.
 record_install() {
     local commit="" source="" sha="" tmp
     if ((CURL_MODE)); then
-        source="$EZVPS_RAW_URL"
+        source="$(raw_url_git_remote "$EZVPS_RAW_URL")"
     else
         if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]] &&
             git -C "$SCRIPT_DIR" ls-files --error-unmatch -- ezvps >/dev/null 2>&1 &&
