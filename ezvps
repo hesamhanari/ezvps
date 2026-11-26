@@ -39,6 +39,9 @@ if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_BLUE=$'\033[38;5;39m'
     C_PURPLE=$'\033[38;5;141m'
     C_PINK=$'\033[38;5;177m'
+    C_DOT_ON=$'\033[38;5;82m'
+    C_DOT_IDLE=$'\033[38;5;220m'
+    C_DOT_OFF=$'\033[38;5;203m'
     C_MUTED=$'\033[38;5;245m'
     C_LINE=$'\033[38;5;238m'
     C_PILL=$'\033[48;5;45;38;5;16;1m'
@@ -50,6 +53,7 @@ if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RESET=$'\033[0m'
 else
     C_BOLD="" C_CYAN="" C_BLUE="" C_PURPLE="" C_PINK=""
+    C_DOT_ON="" C_DOT_IDLE="" C_DOT_OFF=""
     C_MUTED="" C_LINE="" C_PILL="" C_SEL_BG="" C_SEL_FG="" C_SEL_TXT=""
     C_YELLOW="" C_RED="" C_RESET=""
 fi
@@ -73,6 +77,7 @@ tui_interactive() {
 # rendered as question marks. Never paste a literal glyph into this file.
 TUI_G_RULE=$'\u2500'    # horizontal rule
 TUI_G_DOT=$'\u2022'     # bullet separator (banner meta line)
+TUI_G_STATUS=$'\u25cf'  # status dot (main menu)
 
 tui_cursor_show() {
     tui_interactive && printf '\033[?25h'
@@ -181,6 +186,79 @@ tui_sys_summary() {
     [[ -n "$OS_ID" ]] && printf ' %s %s %s' "$TUI_G_DOT" "${OS_ID^}" "$OS_VERSION"
 }
 
+# Main-menu status dots: one per service module, computed once per menu
+# display (main_menu fills TUI_DOTS, tui_select consumes it). Bash
+# builtins only: installed = the binary the module itself looks for,
+# running = a process with that comm in /proc (no systemctl call).
+# States: on (installed and running), idle (installed, not running),
+# off (not installed), empty (not a service: no dot).
+TUI_DOTS=()
+declare -A TUI_PROCS=()
+
+tui_scan_procs() {
+    TUI_PROCS=()
+    local d c
+    for d in /proc/[0-9]*; do
+        [[ -r "$d/comm" ]] || continue
+        read -r c < "$d/comm" 2>/dev/null || continue
+        [[ -n "$c" ]] && TUI_PROCS["$c"]=1
+    done
+}
+
+tui_proc_running() { # tui_proc_running <comm>
+    [[ -n "${TUI_PROCS[$1]:-}" ]]
+}
+
+# tui_module_state <key>: print on|idle|off, or nothing for non-services.
+tui_module_state() {
+    local f
+    case "$1" in
+        l2tp)
+            have_cmd ezl2tp || { printf 'off'; return; }
+            tui_proc_running xl2tpd && printf 'on' || printf 'idle'
+            ;;
+        3x-ui)
+            [[ -x "$XUI_BIN" ]] || have_cmd x-ui || { printf 'off'; return; }
+            tui_proc_running x-ui && printf 'on' || printf 'idle'
+            ;;
+        backpack)
+            [[ -x "${LC_PREFIX}/bin/backpack" ]] || have_cmd backpack || { printf 'off'; return; }
+            tui_proc_running backpack && printf 'on' || printf 'idle'
+            ;;
+        ctunnel)
+            [[ -x "${LC_PREFIX}/bin/ctunnel" ]] || have_cmd ctunnel || { printf 'off'; return; }
+            tui_proc_running ctunnel && printf 'on' || printf 'idle'
+            ;;
+        nginx)
+            have_cmd nginx || { printf 'off'; return; }
+            tui_proc_running nginx && printf 'on' || printf 'idle'
+            ;;
+        certs)
+            [[ -x "${ACME_HOME}/acme.sh" ]] || have_cmd acme.sh || { printf 'off'; return; }
+            for f in "${CERT_DIR}"/*/fullchain.pem; do
+                [[ -f "$f" ]] && { printf 'on'; return; }
+            done
+            printf 'idle'
+            ;;
+        lazyports)
+            [[ -x "${LC_PREFIX}/bin/lazyports" || -x "${HOME:-/root}/go/bin/lazyports" ]] || have_cmd lazyports || { printf 'off'; return; }
+            tui_proc_running lazyports && printf 'on' || printf 'idle'
+            ;;
+        ssh)
+            have_cmd sshd || { printf 'off'; return; }
+            tui_proc_running sshd && printf 'on' || printf 'idle'
+            ;;
+        firewall)
+            if have_cmd ufw || have_cmd firewall-cmd || have_cmd nft || have_cmd iptables; then
+                printf 'on'
+            else
+                printf 'off'
+            fi
+            ;;
+        *) ;;
+    esac
+}
+
 tui_print_banner() {
     local meta width=68 rule="" i rows cols budget anim=0 lead=$'\n' art=() line
     meta="$(tui_sys_summary)"
@@ -275,7 +353,14 @@ tui_select() {
     local prompt="$1" zero_label="$2"
     shift 2
     local items=("$@") n=${#@} total=$((${#@} + 1)) idx=0 i num label pad buf="" key rest
+    local dots=() dot dcol
     TUI_CHOICE=""
+    # Status dots (main menu only): the caller fills TUI_DOTS with one
+    # state per item; consume it here so submenus never inherit it.
+    if ((${#TUI_DOTS[@]} > 0)); then
+        dots=("${TUI_DOTS[@]}")
+        TUI_DOTS=()
+    fi
 
     if ! tui_interactive; then
         for i in "${!items[@]}"; do
@@ -304,6 +389,12 @@ tui_select() {
         ((lw > 54)) && lw=54
         ((lw < 12)) && lw=12
     fi
+    # Status dots take two columns after the label field (space + dot);
+    # shrink the field so rows still never wrap.
+    if ((${#dots[@]} > 0)); then
+        lw=$((lw - 2))
+        ((lw < 10)) && lw=10
+    fi
 
     printf '\033[?25l'
     while true; do
@@ -320,12 +411,25 @@ tui_select() {
                 label="$zero_label"
             fi
             printf -v pad '%2d) %-*s' "$num" "$lw" "${label:0:$lw}"
+            dot=""
+            if ((${#dots[@]} > 0)); then
+                dot="  "
+                if ((i < n && i < ${#dots[@]})); then
+                    dcol=""
+                    case "${dots[$i]}" in
+                        on)   dcol="$C_DOT_ON" ;;
+                        idle) dcol="$C_DOT_IDLE" ;;
+                        off)  dcol="$C_DOT_OFF" ;;
+                    esac
+                    [[ -n "$dcol" ]] && dot=" ${dcol}${TUI_G_STATUS}${C_RESET}"
+                fi
+            fi
             if ((i == idx)); then
-                printf $'  %s%s \u25b8 %s%s%s\033[K\n' "$C_SEL_BG" "$C_SEL_FG" "$C_SEL_TXT" "$pad" "$C_RESET"
+                printf $'  %s%s \u25b8 %s%s%s%s\033[K\n' "$C_SEL_BG" "$C_SEL_FG" "$C_SEL_TXT" "$pad" "$dot" "$C_RESET"
             elif ((num == 0)); then
-                printf '     %s%s%s\033[K\n' "$C_MUTED" "$pad" "$C_RESET"
+                printf '     %s%s%s%s\033[K\n' "$C_MUTED" "$pad" "$C_RESET" "$dot"
             else
-                printf '     %s%s%s\033[K\n' "$C_BOLD" "$pad" "$C_RESET"
+                printf '     %s%s%s%s\033[K\n' "$C_BOLD" "$pad" "$C_RESET" "$dot"
             fi
         done
         if ((cols > 0 && cols < 50)); then
@@ -8068,11 +8172,16 @@ print_menu() {
 }
 
 main_menu() {
-    local choice
+    local choice k
     while true; do
         clear_screen
         if tui_interactive; then
             tui_print_banner
+            tui_scan_procs
+            TUI_DOTS=()
+            for k in "${MODULE_KEYS[@]}"; do
+                TUI_DOTS+=("$(tui_module_state "$k")")
+            done
             tui_select "Main menu" "Exit" "${MODULE_LABELS[@]}"
             choice="$TUI_CHOICE"
         else

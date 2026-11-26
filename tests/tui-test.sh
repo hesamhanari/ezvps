@@ -194,7 +194,59 @@ txt = strip_ansi(out)
 check("EZVPS_NO_AUTORUN=1: install.sh does not start ezvps",
       "Done. Run: ezvps" in txt and "Main menu" not in txt)
 
-# 13. The ezvps file itself stays pure ASCII (glyphs are \\u escapes).
+# 13. Main-menu status dots: red = not installed, yellow = installed but
+# not running, green = installed and running. Detection is driven into
+# temp dirs via the documented EZVPS_* switches; PATH excludes sbin so
+# the Firewall backend check is deterministic too.
+import shutil, subprocess
+tmpd = tempfile.mkdtemp(prefix="ezvps-dots-")
+tools = os.path.join(tmpd, "tools")
+os.makedirs(os.path.join(tools, "bin"))
+os.makedirs(os.path.join(tmpd, "bin"))
+acme = os.path.join(tmpd, "acme"); os.makedirs(acme)
+certs = os.path.join(tmpd, "certs"); os.makedirs(certs)
+dot_env = {
+    "EZVPS_TOOL_PREFIX": tools,
+    "EZVPS_ACME_HOME": acme,
+    "EZVPS_CERT_DIR": certs,
+    "HOME": tmpd,
+    "PATH": os.path.join(tmpd, "bin") + ":/usr/bin:/bin",
+}
+out = run(40, [], env=dot_env)
+check("status dots: nothing installed -> red dots",
+      b"38;5;203" in out and "\u25cf".encode() in out)
+check("status dots: no green/yellow when nothing installed",
+      b"38;5;82" not in out and b"38;5;220" not in out)
+# Installed but not running: fake acme.sh (Certificates) and a fake
+# ctunnel binary -> yellow.
+open(os.path.join(acme, "acme.sh"), "w").write("#!/bin/sh\n")
+os.chmod(os.path.join(acme, "acme.sh"), 0o755)
+open(os.path.join(tools, "bin", "ctunnel"), "w").write("#!/bin/sh\n")
+os.chmod(os.path.join(tools, "bin", "ctunnel"), 0o755)
+out = run(40, [], env=dot_env)
+check("status dots: installed, not running -> yellow", b"38;5;220" in out)
+# Running: a cert exists (Certificates) and a renamed sleep runs as
+# ctunnel -> green.
+os.makedirs(os.path.join(certs, "example.com"))
+open(os.path.join(certs, "example.com", "fullchain.pem"), "w").write("x\n")
+shutil.copy(shutil.which("sleep"), os.path.join(tools, "bin", "ctunnel"))
+os.chmod(os.path.join(tools, "bin", "ctunnel"), 0o755)
+proc = subprocess.Popen([os.path.join(tools, "bin", "ctunnel"), "30"])
+try:
+    out = run(40, [], env=dot_env)
+finally:
+    proc.terminate()
+check("status dots: installed and running -> green", b"38;5;82" in out)
+txt = strip_ansi(out)
+check("status dots: dot sits on the module row",
+      any("Certificates" in l and "\u25cf" in l for l in txt.split("\n")))
+# Dots must not wrap a 44-col terminal either.
+out = run(40, [], cols=44, env=dot_env)
+txt = strip_ansi(out)
+wide = [l for l in re.split(r"[\r\n]", txt) if len(l) > 44]
+check("status dots: 44-col terminal, nothing wraps", not wide and "\u25cf" in txt)
+
+# 14. The ezvps file itself stays pure ASCII (glyphs are \\u escapes).
 raw = open(EZVPS, "rb").read()
 check("ezvps file is pure ASCII", all(b < 128 for b in raw))
 
