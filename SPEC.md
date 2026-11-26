@@ -1768,6 +1768,11 @@ nothing private is hardcoded and nothing is ever fetched from an anonymous or pu
   `user@host:path`. `http://`, `git://`, `file://`, local paths, options (a leading `-`) and anything with
   spaces or control characters are refused, and a refused address is **never echoed back** (it may contain a
   token).
+* In curl mode there is no checkout origin: `install.sh` derives the git address from the download URL
+  (`https://raw.githubusercontent.com/<owner>/<repo>/...` → `https://github.com/<owner>/<repo>.git`) and
+  records that. Installs made before this recorded the raw file URL itself, which git cannot clone;
+  `upd_resolve_source` rewrites such a recorded raw URL to the git address before validating it, and
+  the next successful update records the rewritten address.
 * If no valid source is recorded (an install made before this existed, or a copy that was not a git
   checkout), ezvps asks once for the repository address (placeholders `git@github.com:<owner>/ezvps.git`
   or `https://github.com/<owner>/ezvps.git`) and explains that git asks for credentials itself.
@@ -1892,7 +1897,8 @@ Menu item 12 (module key `uninstall`, `module_uninstall`). It has no submenu: it
   `commit` (only from a git checkout whose `ezvps` is tracked and identical to `HEAD`, else empty),
   `source` (in checkout mode, the checkout's `origin` with any user name or token removed from an
   `https://` address and only an `https://`, `ssh://` or `user@host:path` address; in curl mode,
-  the raw download URL `https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps`), `sha256`
+  the git address derived from the raw download URL, `https://github.com/hesamhanari/ezvps.git` —
+  git cannot clone a raw file URL), `sha256`
   of the installed script and the time. Written on every run, also when the script is already up to
   date. A failure only warns. Check For Updates (6.11) reads it; `git` is used here only to read
   the local checkout, nothing is downloaded.

@@ -6816,6 +6816,12 @@ bk_record "$BK_OLD_COMMIT" "$BK_SRC_SSH"
 run_bk "$BKBIN" "1\n0\n" update
 check "check: an ssh source (user@host:path) is used as recorded" bk_log_has "-- ${BK_SRC_SSH} "
 bk_new
+bk_record "$BK_OLD_COMMIT" "https://raw.githubusercontent.com/owner/ezvps/main/ezvps"
+run_bk "$BKBIN" "1\n0\n" update
+check "check: a raw file URL recorded by an older curl install is rewritten to the git address" bk_log_has "-- https://github.com/owner/ezvps.git "
+check "check: the raw file URL is never cloned" not_contains "$(<"$D/log")" "raw.githubusercontent.com"
+check "check: the rewritten source is the one shown" contains "$OUT" "(main of https://github.com/owner/ezvps.git)"
+bk_new
 bk_record "$BK_OLD_COMMIT" "http://example.com/owner/ezvps.git"
 run_bk "$BKBIN" "1\n\n0\n" update
 check "check: a recorded http:// source is ignored with a warning, never fetched" bash -c '[[ "$1" == *"not an accepted one; it is ignored."* && "$2" == 0 ]]' _ "$OUT" "$(grep -c '^git ' "$D/log")"
@@ -7284,6 +7290,8 @@ only_pinned_urls() {
             'https://*' | 'http://}' | 'http://${2};') ;;
             # Check For Updates: the address validation patterns and the help text for the address prompt (git does the fetching)
             'https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5}' | 'https://host/owner/repo,') ;;
+            # Check For Updates: rewriting a recorded raw file URL to the git address (the match pattern and the result; git does the fetching)
+            'https://raw\.githubusercontent\.com/([A-Za-z0-9._-]+' | 'https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}.git') ;;
             *) echo "unexpected URL: $u" >&2; bad=1 ;;
         esac
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
@@ -7449,7 +7457,7 @@ check "curl mode (good download): never executes the downloaded script to verify
 check "curl mode (good download): installs executable ezvps" test -x "$ICURL/good/bin/ezvps"
 check "curl mode (good download): installed script matches downloaded payload" cmp -s "$FAKE_CURL_PAYLOAD" "$ICURL/good/bin/ezvps"
 check "curl mode (good download): records the text-parsed version in install.state" equals "$(ir_state "$ICURL/good/state/install.state" version)" "0.0.1-curltest"
-check "curl mode (good download): records the raw URL as source" equals "$(ir_state "$ICURL/good/state/install.state" source)" "https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps"
+check "curl mode (good download): records the derived git address as source (git cannot clone a raw file URL)" equals "$(ir_state "$ICURL/good/state/install.state" source)" "https://github.com/hesamhanari/ezvps.git"
 check "curl mode (good download): leaves commit empty (unknown)" equals "$(ir_state "$ICURL/good/state/install.state" commit)" ""
 check "curl mode (good download): records sha256 of the fetched file" equals "$(ir_state "$ICURL/good/state/install.state" sha256)" "$(sha256sum "$FAKE_CURL_PAYLOAD" | cut -d' ' -f1)"
 
