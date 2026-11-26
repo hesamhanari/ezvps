@@ -1799,23 +1799,23 @@ to write the record only warns.
 It fetches `main` as above and prints:
 
 ```
-Installed: 0.0.1-old (aaaaaaaaaaaa)
-Latest:    0.0.2-new (bbbbbbbbbbbb)
+Update available
+Current: 0.0.1-old (aaaaaaaaaaaa)
+Latest:  0.0.2-new (bbbbbbbbbbbb)
 ```
 
 The installed **version** is read from the installed file (as text, never executed). The installed
 **commit** counts as known only when `install.state` has a valid 40-hex commit **and** the installed
 script still has the recorded `sha256`. Then:
 
-* same commit: `Up to date.`
-* different commit: `Update available.`
+* same commit: `Up to date`;
+* different commit: `Update available`;
 * **otherwise the commit is unknown, and ezvps says so and why** (no record, no commit in the record, the
-  installed script differs from the one the record describes, record unreadable) and prints `Installed
-  commit unknown; not reported as up to date.` An old install without a record is therefore never shown
-  as up to date.
+  installed script differs from the one the record describes, record unreadable) and prints `Commit
+  unknown (<why>)`. An old install without a record is therefore never shown as up to date.
 
 Unless it is up to date, Check then offers the already-fetched candidate right away (no second fetch):
-it runs the Update ezvps steps 3-9 below, including the yes/no question (default no, EOF is no).
+it runs the Update ezvps steps 3-9 below, including the `Update?` question (default no, EOF is no).
 Declining changes nothing.
 
 Refusals, all with nothing changed: not root / unsupported system, `git` missing (the message says why git
@@ -1831,7 +1831,7 @@ is required and to install it with apt; ezvps does not install it), an unaccepte
    and print `ezvps <version>`. Otherwise it is refused, nothing is changed and nothing is offered.
 4. If the installed script is already byte for byte the fetched one, nothing is replaced and nothing is
    asked; an unknown or stale install record is rewritten (and read back) so the next check is exact.
-5. The plan (`version old -> new`, commit) is shown and **a yes is required** (default no, EOF is no).
+5. **`Update?` requires a yes** (default no, EOF is no).
 6. **The current script and the ezvps state files are backed up first** (`core` backup, reason
    `pre-update`, under `/var/backups/ezvps`, path printed); if that fails nothing is changed.
 7. The script is replaced atomically (temp file next to it, mode 755, `mv`). Tool configs, nginx sites,

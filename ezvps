@@ -7832,7 +7832,6 @@ upd_get_latest() {
         return 1
     fi
     info "Fetching latest ${EZB_UPDATE_BRANCH} from ${UPD_SOURCE}..."
-    info "git may ask for your credentials."
     if ! upd_fetch_latest "${UPD_TMP}/src"; then
         err "Fetch failed from ${UPD_SOURCE}. Nothing was changed."
         upd_cleanup
@@ -7853,20 +7852,19 @@ upd_get_latest() {
 upd_compare() {
     local iv="${UPD_INST_VERSION:-unknown}" lv="${UPD_LATEST_VERSION:-unknown}"
     info ""
-    if [[ -n "$UPD_INST_COMMIT" ]]; then
-        info "Installed: ${iv} (${UPD_INST_COMMIT:0:12})"
-    else
-        info "Installed: ${iv} (commit unknown: ${UPD_INST_WHY})"
-    fi
-    info "Latest:    ${lv} (${UPD_LATEST_COMMIT:0:12})"
-    info ""
     if [[ -z "$UPD_INST_COMMIT" ]]; then
-        warn "Installed commit unknown; not reported as up to date."
+        warn "Commit unknown (${UPD_INST_WHY})"
     elif [[ "$UPD_INST_COMMIT" == "$UPD_LATEST_COMMIT" ]]; then
-        info "Up to date."
+        info "Up to date"
     else
-        info "Update available."
+        info "Update available"
     fi
+    if [[ -n "$UPD_INST_COMMIT" ]]; then
+        info "Current: ${iv} (${UPD_INST_COMMIT:0:12})"
+    else
+        info "Current: ${iv}"
+    fi
+    info "Latest:  ${lv} (${UPD_LATEST_COMMIT:0:12})"
     return 0
 }
 
@@ -7983,9 +7981,7 @@ upd_apply_latest() {
         return 0
     fi
     info ""
-    info "Replace ${EZB_BIN}: ${old_v} -> ${new_v} (${UPD_LATEST_COMMIT:0:12})."
-    info "Current script is backed up first; nothing else is touched."
-    if ! ask_yes_no "Update now?"; then
+    if ! ask_yes_no "Update?"; then
         info "Nothing was changed."
         return 0
     fi
