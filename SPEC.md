@@ -171,8 +171,8 @@ redraws. EOF on stdin exits 0.
 
 Interactive TUI (TTY only; non-TTY input uses the numbered list above
 with a `Select:` prompt): `Up`/`Down` or `j`/`k` move, `Enter` selects,
-digits jump (a digit that would go out of range is ignored; `0` then a
-digit is a fresh choice, never `01`), `q`/`Esc` go back, `Ctrl-C`
+digits jump (a digit that would go out of range is ignored; `0` is a
+complete choice and selects Back/Exit at once), `q`/`Esc` go back, `Ctrl-C`
 restores the cursor. Main-menu rows for the service modules (all but
 Backup, Check For Updates, Uninstall) end with a status dot: green =
 installed and running, yellow = installed but not running, red = not

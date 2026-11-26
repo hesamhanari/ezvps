@@ -96,17 +96,17 @@ clean = strip_ansi(out)
 check("'13' never submits as invalid", "Invalid choice: 13" not in clean)
 check("'13' selects item 1 instead", "L2TP" in clean)
 
-# 5. '01' in a submenu selects choice 1, never 'Invalid choice: 01'.
-out = run(40, [b"2", b"0", b"1"])
+# 5. '0' in a submenu backs out at once, no Enter needed.
+out = run(40, [b"2", b"0"])
 clean = strip_ansi(out)
-check("'01' never submits as invalid", "Invalid choice: 01" not in clean)
-check("'01' selects submenu item 1", "Download and run the installer now?" in clean)
+check("'0' in a submenu: no invalid choice", "Invalid choice" not in clean)
+check("'0' in a submenu: module returns at once (pause reached, no Enter sent)",
+      "Press Enter to return to the menu" in clean)
 
-# 6. '0' then an out-of-range digit stays on Back; Enter backs out.
-out = run(40, [b"2", b"0", b"9", b"\r"])
-clean = strip_ansi(out)
-check("'0' then '9' stays on Back", "Invalid choice" not in clean
-      and "Press Enter to return to the menu" in clean)
+# 6. '0' at the main menu exits at once, no Enter needed.
+out = run(40, [b"0"], first_wait=3.0)
+check("'0' at the main menu exits at once",
+      b"\x1b[?25h" in out and "ezvps closed" in strip_ansi(out))
 
 # 7. Up wraps to Exit; Enter exits cleanly.
 out = run(40, [b"\x1b[A", b"\r"])

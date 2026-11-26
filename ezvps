@@ -484,17 +484,7 @@ tui_select() {
             TUI_CHOICE="0"
             return 0
         elif [[ "$key" =~ ^[0-9]$ ]]; then
-            if [[ "$buf" == "0" ]]; then
-                # '0' then a digit is a fresh choice, never '01'/'02' ...
-                if [[ "$key" == "0" ]]; then
-                    : # stay on the zero item
-                elif ((10#$key > n)); then
-                    : # fresh digit is out of range: stay on the zero item
-                else
-                    buf="$key"
-                    idx=$((10#$key - 1))
-                fi
-            elif ((10#${buf}${key} > n)); then
+            if ((10#${buf}${key} > n)); then
                 : # digit would go out of range (e.g. '3' after '1' when n=12): ignore it
             else
                 buf+="$key"
@@ -504,7 +494,9 @@ tui_select() {
                     idx=$((10#$buf - 1))
                 fi
             fi
-            if ((${#buf} >= 2 || (10#$buf * 10 > n && 10#$buf > 0))); then
+            # '0' is always a complete choice (Back/Exit) and submits at
+            # once, like any other unambiguous digit.
+            if [[ "$buf" == "0" ]] || ((${#buf} >= 2 || (10#$buf * 10 > n && 10#$buf > 0))); then
                 printf '\033[?25h\n'
                 TUI_CHOICE="$buf"
                 return 0
