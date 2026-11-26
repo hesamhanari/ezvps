@@ -1796,23 +1796,27 @@ to write the record only warns.
 
 #### 1) Check for updates
 
-Read-only (nothing is written; no backup directory is created). It fetches `main` as above and prints:
+It fetches `main` as above and prints:
 
 ```
-Installed:  version 0.0.1-old, commit aaaaaaaaaaaa
-Latest:     version 0.0.2-new, commit bbbbbbbbbbbb (main of <source>)
+Installed: 0.0.1-old (aaaaaaaaaaaa)
+Latest:    0.0.2-new (bbbbbbbbbbbb)
 ```
 
 The installed **version** is read from the installed file (as text, never executed). The installed
 **commit** counts as known only when `install.state` has a valid 40-hex commit **and** the installed
 script still has the recorded `sha256`. Then:
 
-* same commit: `Up to date: the installed commit is the latest main.`
-* different commit: `Update available` (pointing to Update ezvps);
+* same commit: `Up to date.`
+* different commit: `Update available.`
 * **otherwise the commit is unknown, and ezvps says so and why** (no record, no commit in the record, the
-  installed script differs from the one the record describes, record unreadable) and prints `Unknown:
-  ezvps cannot tell whether this install is up to date, so it is NOT reported as current.` An old install
-  without a record is therefore never shown as up to date; differing versions are noted.
+  installed script differs from the one the record describes, record unreadable) and prints `Installed
+  commit unknown; not reported as up to date.` An old install without a record is therefore never shown
+  as up to date.
+
+Unless it is up to date, Check then offers the already-fetched candidate right away (no second fetch):
+it runs the Update ezvps steps 3-9 below, including the yes/no question (default no, EOF is no).
+Declining changes nothing.
 
 Refusals, all with nothing changed: not root / unsupported system, `git` missing (the message says why git
 is required and to install it with apt; ezvps does not install it), an unaccepted address, a failed fetch
@@ -1838,7 +1842,7 @@ is required and to install it with apt; ezvps does not install it), an unaccepte
    the backup, checked byte for byte, and the install record is left as it was;** the update is never
    reported as done.
 9. The install record is rewritten (and read back), the other state files are compared with the backup, and
-   the report says `Updated <path>: version old -> new, commit ...` plus what was verified. The running
+   the report says `Updated: old -> new (commit). Verified.` plus the backup path. The running
    session keeps the old code; restart ezvps to use the new one.
 
 ### 6.12 Uninstall (PR 12, done)
