@@ -81,7 +81,10 @@ On an interactive terminal the menus are arrow-key driven: `Up`/`Down`
 `q` or `Esc` goes back. A digit that would go out of range is ignored.
 On a non-TTY (piped input, scripts) the same menus fall back to the
 numbered list with a `Select:` prompt. Short terminals (under 30 rows)
-get a one-line banner instead of the art banner.
+get a one-line banner instead of the art banner. Narrow terminals
+(under 72 columns, e.g. a phone SSH client in portrait) get the
+one-line banner too, and menu rows are sized to the terminal width so
+nothing wraps.
 
 Menu:
 
