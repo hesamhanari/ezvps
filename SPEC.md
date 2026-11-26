@@ -175,7 +175,13 @@ digits jump (a digit that would go out of range is ignored; `0` then a
 digit is a fresh choice, never `01`), `q`/`Esc` go back, `Ctrl-C`
 restores the cursor. The banner shows host, public IP (private,
 CGNAT and benchmarking addresses are skipped) and OS; terminals under
-30 rows get a one-line banner instead of the art. All TUI glyphs are
+30 rows get a one-line banner instead of the art. The TUI is
+width-aware (`tui_term_size` via `stty size`, falling back to
+`LINES`/`COLUMNS`): terminals under 72 columns also get the one-line
+banner (without the tagline), menu label fields shrink from 54 to fit
+the width (labels truncated, never wrapped — wrapping breaks the
+fixed-line redraw), rule lines shrink, and under 50 columns the hint
+line shortens. Unknown width keeps the original 54-column layout. All TUI glyphs are
 written as `\u` escapes so `ezvps` stays pure ASCII — never paste a
 literal glyph into the file. PTY tests: `bash tests/tui-test.sh`
 (needs python3; skips without it).

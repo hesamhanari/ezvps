@@ -79,6 +79,29 @@ tui_cursor_show() {
     return 0
 }
 
+# Terminal size for the TUI: sets TUI_ROWS/TUI_COLS, 0 when unknown (non-TTY).
+# Phone SSH clients are narrow (40-50 cols): fixed-width rows wrap there, and
+# wrapping breaks the menu redraw, which moves the cursor up a fixed number
+# of lines. Everything the TUI prints must fit TUI_COLS when it is known.
+TUI_ROWS=0 TUI_COLS=0
+tui_term_size() {
+    local r="" c=""
+    TUI_ROWS="${LINES:-0}" TUI_COLS="${COLUMNS:-0}"
+    read -r r c < <(stty size </dev/tty 2>/dev/null) || true
+    [[ "$r" =~ ^[0-9]+$ ]] && TUI_ROWS="$r"
+    [[ "$c" =~ ^[0-9]+$ ]] && TUI_COLS="$c"
+    return 0
+}
+
+# tui_trunc <text> <max>: text truncated to <max> characters (empty if max < 1).
+tui_trunc() {
+    if (($2 < 1)); then
+        printf ''
+    else
+        printf '%s' "${1:0:$2}"
+    fi
+}
+
 tui_is_private_ip() { # tui_is_private_ip <ipv4>: RFC1918, loopback, link-local, CGNAT, benchmarking
     [[ "$1" =~ ^10\.|^127\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^192\.168\.|^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|^169\.254\.|^198\.1[89]\. ]]
 }
@@ -109,16 +132,36 @@ tui_sys_summary() {
 }
 
 tui_print_banner() {
-    local meta width=68 rule="" i rows="${LINES:-0}"
+    local meta width=68 rule="" i rows cols budget
     meta="$(tui_sys_summary)"
+    tui_term_size
+    rows="$TUI_ROWS" cols="$TUI_COLS"
+    if ((cols > 0 && cols - 2 < width)); then
+        width=$((cols - 2))
+        ((width < 10)) && width=10
+    fi
     # Short terminals (<30 rows): the 6-line art banner + 13-line main menu
     # is 26 lines and scrolls the art off a 24-row screen. Print one line.
-    if ((rows == 0)); then
-        read -r rows _ < <(stty size </dev/tty 2>/dev/null) || rows=0
-    fi
-    if ((rows > 0 && rows < 30)); then
-        printf '\n  %s v%s %s  %sVPS management, made simple%s   %s%s%s\n\n' "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+    # Narrow terminals (<72 cols, e.g. a phone in portrait): the art is 66
+    # columns wide and wraps, so they get the one line too, without the
+    # tagline, and the meta text is truncated to fit.
+    if ((rows > 0 && rows < 30)) || ((cols > 0 && cols < 72)); then
+        if ((cols > 0 && cols < 72)); then
+            budget=$((cols - ${#EZVPS_VERSION} - 8))
+            meta="$(tui_trunc "$meta" "$budget")"
+            printf '\n  %s v%s %s  %s%s%s\n\n' "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+        else
+            if ((cols > 0)); then
+                budget=$((cols - ${#EZVPS_VERSION} - 37))
+                meta="$(tui_trunc "$meta" "$budget")"
+            fi
+            printf '\n  %s v%s %s  %sVPS management, made simple%s   %s%s%s\n\n' "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+        fi
         return 0
+    fi
+    if ((cols > 0)); then
+        budget=$((cols - ${#EZVPS_VERSION} - 37))
+        meta="$(tui_trunc "$meta" "$budget")"
     fi
     for ((i = 0; i < width; i++)); do rule+="$TUI_G_RULE"; done
     printf '\n'
@@ -134,7 +177,17 @@ tui_print_banner() {
 }
 
 tui_sub_header() {
-    local title="$1" sub="${2:-}" width=68 rule="" i
+    local title="$1" sub="${2:-}" width=68 rule="" i cols avail
+    tui_term_size
+    cols="$TUI_COLS"
+    if ((cols > 0 && cols - 2 < width)); then
+        width=$((cols - 2))
+        ((width < 10)) && width=10
+    fi
+    if ((cols > 0 && ${#title} + ${#sub} + 5 > cols)); then
+        avail=$((cols - ${#title} - 5))
+        sub="$(tui_trunc "$sub" "$avail")"
+    fi
     for ((i = 0; i < width; i++)); do rule+="$TUI_G_RULE"; done
     printf '\n'
     printf '  %s%s%s%s' "$C_BOLD" "$C_CYAN" "$title" "$C_RESET"
@@ -166,6 +219,20 @@ tui_select() {
         return 0
     fi
 
+    # Label field width: 54 on a normal terminal, less on a narrow one
+    # (a phone in portrait is 40-50 cols). Rows must never wrap: the redraw
+    # below moves the cursor up a fixed number of lines, and a wrapped row
+    # takes two physical lines and garbles the menu. Row overhead is 9
+    # columns (indent/marker + "NN) "), plus one spare column.
+    local lw=54 cols
+    tui_term_size
+    cols="$TUI_COLS"
+    if ((cols > 0)); then
+        lw=$((cols - 10))
+        ((lw > 54)) && lw=54
+        ((lw < 12)) && lw=12
+    fi
+
     printf '\033[?25l'
     while true; do
         printf $'  %s\u203a%s %s%s%s' "$C_CYAN" "$C_RESET" "$C_BOLD" "$prompt" "$C_RESET"
@@ -180,7 +247,7 @@ tui_select() {
                 num=0
                 label="$zero_label"
             fi
-            printf -v pad '%2d) %-54s' "$num" "$label"
+            printf -v pad '%2d) %-*s' "$num" "$lw" "${label:0:$lw}"
             if ((i == idx)); then
                 printf $'  %s%s \u25b8 %s%s%s\033[K\n' "$C_SEL_BG" "$C_SEL_FG" "$C_SEL_TXT" "$pad" "$C_RESET"
             elif ((num == 0)); then
@@ -189,7 +256,11 @@ tui_select() {
                 printf '     %s%s%s\033[K\n' "$C_BOLD" "$pad" "$C_RESET"
             fi
         done
-        printf $'  %s\u2191/\u2193 move \u23ce Enter select \u00b7 0-%d jump \u00b7 q back%s\033[K' "$C_MUTED" "$n" "$C_RESET"
+        if ((cols > 0 && cols < 50)); then
+            printf $'  %s\u2191/\u2193 \u00b7 Enter \u00b7 0-%d \u00b7 q%s\033[K' "$C_MUTED" "$n" "$C_RESET"
+        else
+            printf $'  %s\u2191/\u2193 move \u23ce Enter select \u00b7 0-%d jump \u00b7 q back%s\033[K' "$C_MUTED" "$n" "$C_RESET"
+        fi
 
         IFS= read -rsn1 key || {
             printf '\033[?25h\n'

@@ -31,10 +31,10 @@ def check(name, cond):
 def strip_ansi(b):
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", b.decode("utf-8", "replace"))
 
-def run(rows, keys, wait=0.45):
-    """Run ezvps in a PTY of `rows` rows, send `keys` (bytes), return all output."""
+def run(rows, keys, wait=0.45, cols=80):
+    """Run ezvps in a PTY of `rows`x`cols`, send `keys` (bytes), return all output."""
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, 80, 0, 0))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     pid = os.fork()
     if pid == 0:
         os.setsid()
@@ -120,7 +120,24 @@ txt = strip_ansi(out)
 check("24-row terminal gets the compact banner", "\u2588" not in txt
       and "VPS management, made simple" in txt and "Main menu" in txt)
 
-# 10. The ezvps file itself stays pure ASCII (glyphs are \\u escapes).
+# 10. Narrow terminal (44 cols, like a phone in portrait): no line may be
+# wider than the terminal (wrapped rows garble the fixed-line redraw), the
+# banner is the compact one-liner, and navigation still works.
+out = run(24, [], cols=44)
+txt = strip_ansi(out)
+wide = [l for l in txt.split("\n") if len(l) > 44]
+check("44-col terminal: no line wider than the terminal", not wide)
+check("44-col terminal: compact banner, menu present", "\u2588" not in txt
+      and "Main menu" in txt and "Check For Updates" in txt)
+out = run(40, [], cols=44)
+txt = strip_ansi(out)
+check("44-col tall terminal: compact banner by width, not rows",
+      "\u2588" not in txt and "Main menu" in txt)
+out = run(24, [b"\x1b[B", b"\r"], cols=44)
+check("44-col terminal: Down+Enter still opens 3x-ui submenu",
+      "Xray proxy panel" in strip_ansi(out))
+
+# 11. The ezvps file itself stays pure ASCII (glyphs are \\u escapes).
 raw = open(EZVPS, "rb").read()
 check("ezvps file is pure ASCII", all(b < 128 for b in raw))
 
