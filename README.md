@@ -79,6 +79,12 @@ ezvps --help
 On an interactive terminal the menus are arrow-key driven: `Up`/`Down`
 (or `j`/`k`) move, `Enter` selects, digits jump straight to an item,
 `q` or `Esc` goes back. A digit that would go out of range is ignored.
+In the main menu each service module carries a status dot: green when
+installed and running, yellow when installed but not running, red when
+not installed (Backup, Check For Updates and Uninstall have no dot).
+The check is builtin-only (the binary the module itself looks for, plus
+a `/proc` scan for the running process) and refreshes every time the
+main menu is shown.
 On a non-TTY (piped input, scripts) the same menus fall back to the
 numbered list with a `Select:` prompt. Short terminals (under 30 rows)
 get a one-line banner instead of the art banner. Menu rows are sized

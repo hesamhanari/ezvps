@@ -173,7 +173,17 @@ Interactive TUI (TTY only; non-TTY input uses the numbered list above
 with a `Select:` prompt): `Up`/`Down` or `j`/`k` move, `Enter` selects,
 digits jump (a digit that would go out of range is ignored; `0` then a
 digit is a fresh choice, never `01`), `q`/`Esc` go back, `Ctrl-C`
-restores the cursor. The banner shows host, public IP (private,
+restores the cursor. Main-menu rows for the service modules (all but
+Backup, Check For Updates, Uninstall) end with a status dot: green =
+installed and running, yellow = installed but not running, red = not
+installed. `tui_module_state` decides with bash builtins only: the
+binary the module itself detects (e.g. `$XUI_BIN`, `$LC_PREFIX/bin/...`,
+`command -v`), plus a `/proc/*/comm` scan (`tui_scan_procs`, once per
+menu display) for the running process; Certificates is "running" when
+at least one `$CERT_DIR/*/fullchain.pem` exists, Firewall when a
+backend command exists. `main_menu` fills `TUI_DOTS`; `tui_select`
+consumes and clears it, so submenus and the non-TTY list never show
+dots. The banner shows host, public IP (private,
 CGNAT and benchmarking addresses are skipped) and OS; terminals under
 30 rows get a one-line banner instead of the art. The TUI is
 width-aware (`tui_term_size` via `stty size`, falling back to
