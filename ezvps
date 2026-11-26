@@ -194,12 +194,12 @@ tui_print_banner() {
         width=$((cols - 2))
         ((width < 10)) && width=10
     fi
-    # Short terminals (<30 rows): the art banner + 13-line main menu is 24
+    # Short terminals (<30 rows): the art banner + 13-line main menu is 25
     # lines and scrolls the art off a 24-row screen. Print one line.
-    # Very narrow terminals (<36 cols): the art is 31 columns wide and
-    # would wrap, so they get the one line too, without the tagline, and
-    # the meta text is truncated to fit.
-    if ((rows > 0 && rows < 30)) || ((cols > 0 && cols < 36)); then
+    # Very narrow terminals (<44 cols): the art is 41 columns wide (43 with
+    # the indent) and would wrap, so they get the one line too, without the
+    # tagline, and the meta text is truncated to fit.
+    if ((rows > 0 && rows < 30)) || ((cols > 0 && cols < 44)); then
         TUI_BANNER_LINES=3
         if ((anim)); then
             tui_anim_spinner
@@ -223,11 +223,12 @@ tui_print_banner() {
         meta="$(tui_trunc "$meta" "$budget")"
     fi
     for ((i = 0; i < width; i++)); do rule+="$TUI_G_RULE"; done
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588%s \u2588\u2588\u2588\u2588\u2588%s \u2588   \u2588%s \u2588\u2588\u2588\u2588\u2588%s  \u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588    %s    \u2588 %s \u2588   \u2588%s \u2588   \u2588%s \u2588    %s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588 %s   \u2588  %s \u2588   \u2588%s \u2588\u2588\u2588\u2588\u2588%s  \u2588\u2588\u2588 %s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588    %s  \u2588   %s  \u2588 \u2588 %s \u2588    %s     \u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588%s \u2588\u2588\u2588\u2588\u2588%s   \u2588  %s \u2588    %s \u2588\u2588\u2588\u2588 %s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557%s\u2588\u2588\u2557   \u2588\u2588\u2557%s\u2588\u2588\u2588\u2588\u2588\u2588\u2557 %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2554\u2550\u2550\u2550\u2550\u255d%s\u255a\u2550\u2550\u2588\u2588\u2588\u2554\u255d%s\u2588\u2588\u2551   \u2588\u2588\u2551%s\u2588\u2588\u2554\u2550\u2550\u2588\u2588\u2557%s\u2588\u2588\u2554\u2550\u2550\u2550\u2550\u255d%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2557  %s  \u2588\u2588\u2588\u2554\u255d %s\u2588\u2588\u2551   \u2588\u2588\u2551%s\u2588\u2588\u2588\u2588\u2588\u2588\u2554\u255d%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2554\u2550\u2550\u255d  %s \u2588\u2588\u2588\u2554\u255d  %s\u255a\u2588\u2588\u2557 \u2588\u2588\u2554\u255d%s\u2588\u2588\u2554\u2550\u2550\u2550\u255d %s\u255a\u2550\u2550\u2550\u2550\u2588\u2588\u2551%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557%s \u255a\u2588\u2588\u2588\u2588\u2554\u255d %s\u2588\u2588\u2551     %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2551%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u255d%s\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u255d%s  \u255a\u2550\u2550\u2550\u255d  %s\u255a\u2550\u255d     %s\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u255d%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
     printf '\n'
     for line in "${art[@]}"; do
         printf '%s' "$line"
@@ -244,7 +245,7 @@ tui_print_banner() {
         printf '  %s v%s %s  %sVPS management, made simple%s   %s%s%s\n'         "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
     fi
     printf '  %s%s%s\n\n' "$C_LINE" "$rule" "$C_RESET"
-    TUI_BANNER_LINES=10
+    TUI_BANNER_LINES=11
 }
 
 tui_sub_header() {

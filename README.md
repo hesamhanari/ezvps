@@ -83,7 +83,7 @@ On a non-TTY (piped input, scripts) the same menus fall back to the
 numbered list with a `Select:` prompt. Short terminals (under 30 rows)
 get a one-line banner instead of the art banner. Menu rows are sized
 to the terminal width so nothing wraps on narrow terminals (e.g. a
-phone SSH client in portrait); under 36 columns the banner is the
+phone SSH client in portrait); under 44 columns the banner is the
 one-liner too. At startup the banner animates in and on exit it wipes
 away (about a second each; any key skips, `EZVPS_NO_ANIM=1` turns
 both off). `install.sh` starts

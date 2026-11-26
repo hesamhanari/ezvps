@@ -177,8 +177,8 @@ restores the cursor. The banner shows host, public IP (private,
 CGNAT and benchmarking addresses are skipped) and OS; terminals under
 30 rows get a one-line banner instead of the art. The TUI is
 width-aware (`tui_term_size` via `stty size`, falling back to
-`LINES`/`COLUMNS`): the art banner is a thin 5-row, 31-column
-single-stroke EZVPS; terminals under 36 columns get the one-line
+`LINES`/`COLUMNS`): the art banner is a 6-row, 41-column
+ANSI Shadow EZVPS; terminals under 44 columns get the one-line
 banner instead, menu label fields shrink from 54 to fit the width
 (labels truncated, never wrapped — wrapping breaks the fixed-line
 redraw), rule lines shrink, under 50 columns the tagline is dropped

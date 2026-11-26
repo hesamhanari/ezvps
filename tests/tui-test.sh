@@ -124,8 +124,8 @@ check("24-row terminal gets the compact banner", "\u2588" not in txt
 
 # 10. Narrow terminal (44 cols, like a phone in portrait): no line may be
 # wider than the terminal (wrapped rows garble the fixed-line redraw).
-# Short (24 rows) gets the compact banner; tall gets the thin art, which
-# fits 44 cols. Under 36 cols the art would wrap, so compact again.
+# Short (24 rows) gets the compact banner; tall gets the banner art, which
+# fits 44 cols. Under 44 cols the art would wrap, so compact again.
 # Navigation still works throughout.
 out = run(24, [], cols=44)
 txt = strip_ansi(out)
@@ -136,7 +136,7 @@ check("44-col short terminal: compact banner, menu present", "\u2588" not in txt
 out = run(40, [], cols=44)
 txt = strip_ansi(out)
 wide = [l for l in re.split(r"[\r\n]", txt) if len(l) > 44]
-check("44-col tall terminal: thin art fits, nothing wraps",
+check("44-col tall terminal: banner art fits, nothing wraps",
       "\u2588" in txt and "Main menu" in txt and not wide)
 out = run(40, [], cols=34)
 txt = strip_ansi(out)
