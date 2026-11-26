@@ -84,7 +84,10 @@ numbered list with a `Select:` prompt. Short terminals (under 30 rows)
 get a one-line banner instead of the art banner. Narrow terminals
 (under 72 columns, e.g. a phone SSH client in portrait) get the
 one-line banner too, and menu rows are sized to the terminal width so
-nothing wraps.
+nothing wraps. At startup the banner animates in (about a second; any
+key skips it, `EZVPS_NO_ANIM=1` turns it off). `install.sh` starts
+`ezvps` automatically when run on an interactive terminal
+(`EZVPS_NO_AUTORUN=1` opts out; piped runs never do).
 
 Menu:
 

@@ -31,8 +31,8 @@ def check(name, cond):
 def strip_ansi(b):
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", b.decode("utf-8", "replace"))
 
-def run(rows, keys, wait=0.45, cols=80):
-    """Run ezvps in a PTY of `rows`x`cols`, send `keys` (bytes), return all output."""
+def run(rows, keys, wait=0.45, cols=80, first_wait=1.5, env=None, script=None):
+    """Run ezvps (or `script`) in a PTY of `rows`x`cols`, send `keys`, return output."""
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     pid = os.fork()
@@ -42,7 +42,9 @@ def run(rows, keys, wait=0.45, cols=80):
         os.close(master); os.close(slave)
         os.environ["TERM"] = "xterm-256color"
         os.environ["LANG"] = "C.UTF-8"
-        os.execv("/bin/bash", ["bash", EZVPS])
+        if env:
+            os.environ.update(env)
+        os.execv("/bin/bash", ["bash", script or EZVPS])
     os.close(slave)
     def read_all(timeout):
         out = b""
@@ -58,7 +60,7 @@ def run(rows, keys, wait=0.45, cols=80):
                     break
                 out += data
         return out
-    out = read_all(1.5)
+    out = read_all(first_wait)
     for k in keys:
         os.write(master, k)
         time.sleep(wait)
@@ -125,7 +127,7 @@ check("24-row terminal gets the compact banner", "\u2588" not in txt
 # banner is the compact one-liner, and navigation still works.
 out = run(24, [], cols=44)
 txt = strip_ansi(out)
-wide = [l for l in txt.split("\n") if len(l) > 44]
+wide = [l for l in re.split(r"[\r\n]", txt) if len(l) > 44]
 check("44-col terminal: no line wider than the terminal", not wide)
 check("44-col terminal: compact banner, menu present", "\u2588" not in txt
       and "Main menu" in txt and "Check For Updates" in txt)
@@ -137,7 +139,46 @@ out = run(24, [b"\x1b[B", b"\r"], cols=44)
 check("44-col terminal: Down+Enter still opens 3x-ui submenu",
       "Xray proxy panel" in strip_ansi(out))
 
-# 11. The ezvps file itself stays pure ASCII (glyphs are \\u escapes).
+# 11. Startup animation: completes on its own (art + menu appear), a key
+# during it skips to the full banner, EZVPS_NO_ANIM=1 disables it, and the
+# narrow-terminal compact banner shows the spinner.
+out = run(40, [], first_wait=3.0)
+txt = strip_ansi(out)
+check("animation completes: art and menu appear", "\u2588" in txt and "Main menu" in txt)
+out = run(40, [b"x"], first_wait=0.3)
+txt = strip_ansi(out)
+check("keypress during animation skips to full banner", "\u2588" in txt and "Main menu" in txt)
+out = run(40, [], env={"EZVPS_NO_ANIM": "1"})
+txt = strip_ansi(out)
+check("EZVPS_NO_ANIM=1: banner and menu still render", "\u2588" in txt and "Main menu" in txt)
+out = run(24, [], cols=44, first_wait=3.0)
+txt = strip_ansi(out)
+check("narrow terminal: spinner frames shown, then menu",
+      any(f in txt for f in "\u280b\u2819\u2839\u2838\u283c") and "Main menu" in txt)
+
+# 12. install.sh on a TTY starts ezvps automatically after installing.
+import tempfile
+tmpd = tempfile.mkdtemp(prefix="ezvps-tui-test-")
+inst_env = {
+    "EZVPS_ALLOW_NONROOT": "1",
+    "EZVPS_SKIP_OS_CHECK": "1",
+    "EZVPS_BIN_DIR": tmpd + "/bin",
+    "EZVPS_STATE_DIR": tmpd + "/state",
+    "EZVPS_BACKUP_DIR": tmpd + "/backups",
+}
+out = run(40, [b"q"], first_wait=4.0, env=inst_env,
+          script=os.path.abspath("install.sh"))
+txt = strip_ansi(out)
+check("install.sh auto-runs ezvps on a TTY",
+      "Starting ezvps" in txt and "Main menu" in txt)
+out = run(40, [], first_wait=3.0,
+          env=dict(inst_env, EZVPS_NO_AUTORUN="1"),
+          script=os.path.abspath("install.sh"))
+txt = strip_ansi(out)
+check("EZVPS_NO_AUTORUN=1: install.sh does not start ezvps",
+      "Done. Run: ezvps" in txt and "Main menu" not in txt)
+
+# 13. The ezvps file itself stays pure ASCII (glyphs are \\u escapes).
 raw = open(EZVPS, "rb").read()
 check("ezvps file is pure ASCII", all(b < 128 for b in raw))
 

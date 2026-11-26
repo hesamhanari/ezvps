@@ -31,6 +31,8 @@
 #   EZVPS_ALLOW_NONROOT=1  skip the root check
 #   EZVPS_SKIP_OS_CHECK=1  skip the OS check (tests only)
 #   EZVPS_OS_RELEASE    os-release file to read (default /etc/os-release)
+#   EZVPS_NO_AUTORUN=1  do not start ezvps after installing (TTY runs start
+#                       it automatically; piped runs never do)
 
 set -uo pipefail
 
@@ -327,7 +329,15 @@ main() {
     install_script
     record_install
     report_ezl2tp
-    info "Done. Run: ezvps"
+    # On an interactive terminal, start ezvps right away (as a child, so the
+    # curl-mode temp cleanup trap still runs when it exits). Piped or
+    # scripted runs keep the plain message. EZVPS_NO_AUTORUN=1 opts out.
+    if [[ -t 0 && -t 1 && -z "${EZVPS_NO_AUTORUN:-}" ]]; then
+        info "Done. Starting ezvps..."
+        "${TARGET}"
+    else
+        info "Done. Run: ezvps"
+    fi
 }
 
 main "$@"

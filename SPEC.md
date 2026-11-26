@@ -181,7 +181,14 @@ width-aware (`tui_term_size` via `stty size`, falling back to
 banner (without the tagline), menu label fields shrink from 54 to fit
 the width (labels truncated, never wrapped — wrapping breaks the
 fixed-line redraw), rule lines shrink, and under 50 columns the hint
-line shortens. Unknown width keeps the original 54-column layout. All TUI glyphs are
+line shortens. Unknown width keeps the original 54-column layout.
+Startup animation (once per run, interactive TTY only, ~1s, any
+keypress skips the rest, `EZVPS_NO_ANIM=1` disables): the art banner
+reveals line by line; the compact banner is preceded by a braille
+spinner. Delays are `read -t` on `/dev/tty` (no external commands).
+`install.sh` starts the installed `ezvps` at the end when stdin and
+stdout are TTYs (`EZVPS_NO_AUTORUN=1` opts out; piped runs print
+`Done. Run: ezvps` as before). All TUI glyphs are
 written as `\u` escapes so `ezvps` stays pure ASCII — never paste a
 literal glyph into the file. PTY tests: `bash tests/tui-test.sh`
 (needs python3; skips without it).
