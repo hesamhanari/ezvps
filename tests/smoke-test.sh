@@ -7289,11 +7289,27 @@ only_pinned_urls() {
     done < <(grep -vE '^[[:space:]]*#' "$1" | grep -oE "https?://[^\"' )]+")
     ((bad == 0))
 }
+install_curl_bad() {
+    awk '
+        /^[A-Za-z_0-9]+\(\)[[:space:]]*\{/ { fn=$1; sub(/\(.*/, "()", fn); depth=0 }
+        {
+            line=$0; sub(/(^|[[:space:]])#.*/, "", line)
+            if (line ~ /(^|[[:space:]($`";|&])(curl|wget)([[:space:];|&)]|$)/) {
+                if (fn != "fetch_ezvps()") print NR": "$0
+            }
+            if (fn != "") {
+                o=gsub(/\{/, "&", line); c=gsub(/\}/, "&", line)
+                depth += o - c
+                if (depth <= 0) { fn=""; depth=0 }
+            }
+        }' "$1"
+}
 check "curl is invoked only by the 3x-ui download/probe functions, the nginx.org key download, the pinned acme.sh download and the pinned Backpack installer / Lazyports release download" equals "$(curl_functions "$EZVPS")" "acme_fetch_script() lc_fetch_installer() ngx_fetch_key() xui_fetch_installer() xui_probe() "
 check "ezvps never pipes a download into a shell" no_pipe_to_shell "$EZVPS"
 check "ezvps only knows the pinned upstream URL" only_pinned_urls "$EZVPS"
 check "ezvps has no URL for the private easyl2tp repo" not_contains "$(<"$EZVPS")" "raw.githubusercontent.com/<owner>"
-check "install.sh has no curl/wget" no_downloads "$INSTALL"
+check "install.sh invokes curl/wget only inside fetch_ezvps" equals "$(install_curl_bad "$INSTALL")" ""
+check "install.sh never pipes a download into a shell" no_pipe_to_shell "$INSTALL"
 check "install.sh never writes to an ezl2tp path" no_ezl2tp_writes "$INSTALL"
 check "ezvps never writes to an ezl2tp path" no_ezl2tp_writes "$EZVPS"
 lc_body() { awk '/^(lc_[a-z_]+|module_(backpack|ctunnel|lazyports))\(\)/ {on=1} on {print} /^}/ {on=0}' "$EZVPS"; }
@@ -7389,6 +7405,84 @@ OUT="$(EZVPS_SOURCE="$BROKEN" EZVPS_BIN_DIR="$IBIN" EZVPS_BACKUP_DIR="$IBAK" EZV
 RC=$?
 check "syntax-broken source is refused" test "$RC" -ne 0
 check "installed file untouched after refused install" equals "$(file_sum "$IBIN/ezvps")" "$BEFORE"
+
+echo "-- install.sh: curl mode (fake curl stub, no local ezvps)"
+ICURL="$WORK/inst-curl"
+ICURL_SRC="$ICURL/src"
+ICURL_BOX="$ICURL/box"
+ICURL_NOBOX="$ICURL/nobox"
+mkdir -p "$ICURL_SRC" "$ICURL_BOX" "$ICURL_NOBOX"
+cp "$INSTALL" "$ICURL_SRC/install.sh"
+for c in bash cp mkdir mv rm mktemp date chmod cmp sha256sum dirname cat; do
+    ln -s "$(command -v "$c")" "$ICURL_BOX/$c"
+    ln -s "$(command -v "$c")" "$ICURL_NOBOX/$c"
+done
+FAKE_CURL_PAYLOAD="$ICURL/payload-good"
+cat >"$FAKE_CURL_PAYLOAD" <<'EOF'
+#!/usr/bin/env bash
+EZVPS_VERSION="0.0.1-curltest"
+echo "CURL-DOWNLOADED-SCRIPT-EXECUTED" >&2
+exit 99
+EOF
+FAKE_CURL_BROKEN="$ICURL/payload-broken"
+printf 'if then\n' >"$FAKE_CURL_BROKEN"
+FAKE_CURL_LOG="$ICURL/curl.log"
+mkstub "$ICURL_BOX/curl" <<'EOF'
+echo "curl $*" >>"$FAKE_CURL_LOG"
+out="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "-o" ]] && out="$a"
+    prev="$a"
+done
+[[ "${FAKE_CURL_FAIL:-0}" == "1" ]] && exit 22
+cp "$FAKE_CURL_FILE" "$out"
+exit 0
+EOF
+
+: >"$FAKE_CURL_LOG"
+OUT="$(PATH="$ICURL_BOX" FAKE_CURL_LOG="$FAKE_CURL_LOG" FAKE_CURL_FILE="$FAKE_CURL_PAYLOAD" EZVPS_BIN_DIR="$ICURL/good/bin" EZVPS_BACKUP_DIR="$ICURL/good/backup" EZVPS_STATE_DIR="$ICURL/good/state" "$BASH_BIN" "$ICURL_SRC/install.sh" 2>&1)"
+RC=$?
+check "curl mode (good download): exits 0" equals "$RC" 0
+check "curl mode (good download): prints the URL before downloading" contains "$OUT" "https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps"
+check "curl mode (good download): invokes curl -fsSL" contains "$(<"$FAKE_CURL_LOG")" "-fsSL"
+check "curl mode (good download): never executes the downloaded script to verify it" not_contains "$OUT" "CURL-DOWNLOADED-SCRIPT-EXECUTED"
+check "curl mode (good download): installs executable ezvps" test -x "$ICURL/good/bin/ezvps"
+check "curl mode (good download): installed script matches downloaded payload" cmp -s "$FAKE_CURL_PAYLOAD" "$ICURL/good/bin/ezvps"
+check "curl mode (good download): records the text-parsed version in install.state" equals "$(ir_state "$ICURL/good/state/install.state" version)" "0.0.1-curltest"
+check "curl mode (good download): records the raw URL as source" equals "$(ir_state "$ICURL/good/state/install.state" source)" "https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps"
+check "curl mode (good download): leaves commit empty (unknown)" equals "$(ir_state "$ICURL/good/state/install.state" commit)" ""
+check "curl mode (good download): records sha256 of the fetched file" equals "$(ir_state "$ICURL/good/state/install.state" sha256)" "$(sha256sum "$FAKE_CURL_PAYLOAD" | cut -d' ' -f1)"
+
+OUT="$(PATH="$ICURL_BOX" FAKE_CURL_LOG="$FAKE_CURL_LOG" FAKE_CURL_FAIL=1 EZVPS_BIN_DIR="$ICURL/fail/bin" EZVPS_BACKUP_DIR="$ICURL/fail/backup" EZVPS_STATE_DIR="$ICURL/fail/state" "$BASH_BIN" "$ICURL_SRC/install.sh" 2>&1)"
+RC=$?
+check "curl mode (curl failure): exits non-zero" test "$RC" -ne 0
+check "curl mode (curl failure): reports error and Nothing was changed" bash -c '[[ "$1" == *"failed to download"* && "$1" == *"Nothing was changed."* ]]' _ "$OUT"
+check "curl mode (curl failure): installs nothing" test ! -e "$ICURL/fail/bin/ezvps"
+check "curl mode (curl failure): writes no install.state" test ! -e "$ICURL/fail/state/install.state"
+
+OUT="$(PATH="$ICURL_NOBOX" EZVPS_BIN_DIR="$ICURL/nocurl/bin" EZVPS_BACKUP_DIR="$ICURL/nocurl/backup" EZVPS_STATE_DIR="$ICURL/nocurl/state" "$BASH_BIN" "$ICURL_SRC/install.sh" 2>&1)"
+RC=$?
+check "curl mode (missing curl): exits non-zero" test "$RC" -ne 0
+check "curl mode (missing curl): reports curl is not installed and Nothing was changed" bash -c '[[ "$1" == *"curl is not installed"* && "$1" == *"Nothing was changed."* ]]' _ "$OUT"
+check "curl mode (missing curl): installs nothing" test ! -e "$ICURL/nocurl/bin/ezvps"
+
+OUT="$(PATH="$ICURL_BOX" FAKE_CURL_LOG="$FAKE_CURL_LOG" FAKE_CURL_FILE="$FAKE_CURL_BROKEN" EZVPS_BIN_DIR="$ICURL/broken/bin" EZVPS_BACKUP_DIR="$ICURL/broken/backup" EZVPS_STATE_DIR="$ICURL/broken/state" "$BASH_BIN" "$ICURL_SRC/install.sh" 2>&1)"
+RC=$?
+check "curl mode (syntax-broken download): exits non-zero" test "$RC" -ne 0
+check "curl mode (syntax-broken download): reports syntax error and Nothing was changed" bash -c '[[ "$1" == *"syntax error"* && "$1" == *"Nothing was changed."* ]]' _ "$OUT"
+check "curl mode (syntax-broken download): installs nothing" test ! -e "$ICURL/broken/bin/ezvps"
+check "curl mode (syntax-broken download): writes no install.state" test ! -e "$ICURL/broken/state/install.state"
+
+FAKE_CURL_NOVERSION="$ICURL/payload-noversion"
+printf '#!/usr/bin/env bash\necho ok\n' >"$FAKE_CURL_NOVERSION"
+ICURL_TMP="$ICURL/tmpdir"
+mkdir -p "$ICURL_TMP"
+OUT="$(TMPDIR="$ICURL_TMP" PATH="$ICURL_BOX" FAKE_CURL_LOG="$FAKE_CURL_LOG" FAKE_CURL_FILE="$FAKE_CURL_NOVERSION" EZVPS_BIN_DIR="$ICURL/nover/bin" EZVPS_BACKUP_DIR="$ICURL/nover/backup" EZVPS_STATE_DIR="$ICURL/nover/state" "$BASH_BIN" "$ICURL_SRC/install.sh" 2>&1)"
+RC=$?
+check "curl mode (missing EZVPS_VERSION): exits non-zero" test "$RC" -ne 0
+check "curl mode (missing EZVPS_VERSION): reports missing version and Nothing was changed" bash -c '[[ "$1" == *"EZVPS_VERSION"* && "$1" == *"Nothing was changed."* ]]' _ "$OUT"
+check "curl mode (missing EZVPS_VERSION): installs nothing" test ! -e "$ICURL/nover/bin/ezvps"
+check "curl mode (missing EZVPS_VERSION): cleans up temp dir" dir_empty_or_missing "$ICURL_TMP"
 
 # The installer applies the same rule as ezvps: the five supported systems, nothing else.
 echo "-- install.sh: operating systems (fake os-release, check on)"

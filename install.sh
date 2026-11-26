@@ -1,35 +1,56 @@
 #!/usr/bin/env bash
-# ezvps installer for Debian 12/13 and Ubuntu 22.04/24.04/26.04 LTS (run as root
-# from a checkout of this repo). Any other system is refused.
+# ezvps installer for Debian 12/13 and Ubuntu 22.04/24.04/26.04 LTS (run as root).
+# Any other system is refused.
 #
-#   git clone <repo-url> && cd ezvps && bash install.sh
+#   Checkout mode:
+#     git clone <repo-url> && cd ezvps && sudo bash install.sh
+#   One-line curl mode:
+#     bash <(curl -fsSL https://raw.githubusercontent.com/hesamhanari/ezvps/main/install.sh)
 #
+# - In checkout mode (when ezvps sits next to install.sh, or EZVPS_SOURCE is set),
+#   installs from that local file and downloads nothing.
+# - In curl mode (no local ezvps next to install.sh), downloads ezvps into a
+#   temporary directory via fetch_ezvps, verifies syntax (bash -n) and reads
+#   EZVPS_VERSION as text (never executes the download), then installs.
 # - Installs the `ezvps` script to /usr/local/bin/ezvps.
 # - Safe to re-run: identical file => no-op; changed file => the existing
 #   one is backed up first, then replaced atomically.
 # - Never touches ezl2tp (command, config or state). It only reports whether
 #   ezl2tp is present.
-# - Records what it installed (version, commit, source repository, sha256) in
+# - Records what it installed (version, commit, source, sha256) in
 #   /var/lib/ezvps/install.state so Check For Updates can compare it with the
-#   latest main. The commit is recorded only when this is a clean git checkout
-#   whose ezvps is the committed one; otherwise it is left out (unknown). The
-#   source address is the checkout's own `origin`, with any credentials removed.
-# - Needs no extra packages and downloads nothing (git is only read locally).
+#   latest main. In checkout mode, commit is recorded only from a clean git
+#   checkout and source is the checkout's `origin` (credentials stripped). In
+#   curl mode, source is the raw download URL and commit is omitted (unknown).
 #
 # Overrides (mainly for tests):
 #   EZVPS_BIN_DIR       install directory      (default /usr/local/bin)
 #   EZVPS_BACKUP_DIR    backup directory       (default /var/backups/ezvps)
 #   EZVPS_STATE_DIR     state directory        (default /var/lib/ezvps)
+#   EZVPS_SOURCE        local ezvps script path (overrides checkout/curl detection)
 #   EZVPS_ALLOW_NONROOT=1  skip the root check
 #   EZVPS_SKIP_OS_CHECK=1  skip the OS check (tests only)
 #   EZVPS_OS_RELEASE    os-release file to read (default /etc/os-release)
 
 set -uo pipefail
 
+EZVPS_RAW_URL="https://raw.githubusercontent.com/hesamhanari/ezvps/main/ezvps"
 BIN_DIR="${EZVPS_BIN_DIR:-/usr/local/bin}"
 BACKUP_DIR="${EZVPS_BACKUP_DIR:-/var/backups/ezvps}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE="${EZVPS_SOURCE:-${SCRIPT_DIR}/ezvps}"
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+fi
+SOURCE=""
+CURL_MODE=0
+TMP_DIR=""
+if [[ -n "${EZVPS_SOURCE:-}" ]]; then
+    SOURCE="$EZVPS_SOURCE"
+elif [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/ezvps" ]]; then
+    SOURCE="${SCRIPT_DIR}/ezvps"
+else
+    CURL_MODE=1
+fi
 TARGET="${BIN_DIR}/ezvps"
 STATE_DIR="${EZVPS_STATE_DIR:-/var/lib/ezvps}"
 STATE_FILE="${STATE_DIR}/install.state"
@@ -37,9 +58,15 @@ SOURCE_VERSION=""
 
 info() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
+err() { printf 'ERROR: %s\n' "$*" >&2; }
 die() {
-    printf 'ERROR: %s\n' "$*" >&2
+    err "$*"
     exit 1
+}
+
+cleanup() {
+    [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]] && rm -rf -- "$TMP_DIR"
+    return 0
 }
 
 check_root() {
@@ -145,7 +172,35 @@ check_os() {
         die "$(os_unsupported_message "ezvps install")"
 }
 
+fetch_ezvps() { # fetch_ezvps <dest-file>
+    local dest="$1"
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is not installed; install curl and try again. Nothing was changed."
+        return 1
+    fi
+    info "Downloading ${EZVPS_RAW_URL}..."
+    if ! curl -fsSL -o "$dest" "$EZVPS_RAW_URL"; then
+        err "failed to download ${EZVPS_RAW_URL}. Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
 check_source() {
+    if ((CURL_MODE)); then
+        [[ -s "$SOURCE" ]] || die "downloaded ezvps script is empty; refusing to install it. Nothing was changed."
+        bash -n "$SOURCE" || die "downloaded ezvps script has a syntax error; refusing to install it. Nothing was changed."
+        local line ver_re='^EZVPS_VERSION=["'\'']([A-Za-z0-9._+-]+)["'\'']$' LC_ALL=C
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ $ver_re ]]; then
+                SOURCE_VERSION="${BASH_REMATCH[1]}"
+                break
+            fi
+        done <"$SOURCE"
+        [[ -n "$SOURCE_VERSION" ]] ||
+            die "downloaded ezvps script is missing a valid EZVPS_VERSION; refusing to install it. Nothing was changed."
+        return 0
+    fi
     [[ -f "$SOURCE" ]] || die "ezvps script not found at ${SOURCE} (run install.sh from a repo checkout)"
     bash -n "$SOURCE" || die "${SOURCE} has a syntax error; refusing to install it"
     local out
@@ -211,14 +266,18 @@ clean_source() { # clean_source <url>
 # reports the installed commit as unknown.
 record_install() {
     local commit="" source="" sha="" tmp
-    if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]] &&
-        git -C "$SCRIPT_DIR" ls-files --error-unmatch -- ezvps >/dev/null 2>&1 &&
-        git -C "$SCRIPT_DIR" diff --quiet HEAD -- ezvps >/dev/null 2>&1; then
-        commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)"
-        [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || commit=""
-    fi
-    if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]]; then
-        source="$(clean_source "$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null)")"
+    if ((CURL_MODE)); then
+        source="$EZVPS_RAW_URL"
+    else
+        if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]] &&
+            git -C "$SCRIPT_DIR" ls-files --error-unmatch -- ezvps >/dev/null 2>&1 &&
+            git -C "$SCRIPT_DIR" diff --quiet HEAD -- ezvps >/dev/null 2>&1; then
+            commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)"
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || commit=""
+        fi
+        if command -v git >/dev/null 2>&1 && [[ "$SOURCE" == "${SCRIPT_DIR}/ezvps" ]]; then
+            source="$(clean_source "$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null)")"
+        fi
     fi
     sha="$(sha256sum "$TARGET" 2>/dev/null)" || sha=""
     sha="${sha%% *}"
@@ -258,6 +317,12 @@ report_ezl2tp() {
 main() {
     check_root
     check_os
+    if ((CURL_MODE)); then
+        TMP_DIR="$(mktemp -d)" || die "cannot create temporary directory. Nothing was changed."
+        trap cleanup EXIT
+        SOURCE="${TMP_DIR}/ezvps"
+        fetch_ezvps "$SOURCE" || exit 1
+    fi
     check_source
     install_script
     record_install

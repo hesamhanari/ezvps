@@ -64,6 +64,12 @@ so Check For Updates can tell whether you are current.
 ## Use
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hesamhanari/ezvps/main/install.sh)
+```
+
+The installer downloads the `ezvps` script from this repo, verifies it, and installs it; or clone the repo and run `install.sh` locally.
+
+```bash
 sudo ezvps            # interactive menu
 sudo ezvps l2tp       # jump straight to a module
 ezvps --version
