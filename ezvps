@@ -106,14 +106,37 @@ tui_trunc() {
 # second long, and any keypress skips the rest. EZVPS_NO_ANIM=1 turns it off.
 # Non-TTY output is never animated, so scripts and tests see no change.
 TUI_ANIM_DONE=0
+tui_anim_enabled() {
+    tui_interactive && [[ -z "${EZVPS_NO_ANIM:-}" ]]
+}
 tui_anim_on() {
-    tui_interactive && [[ -z "${EZVPS_NO_ANIM:-}" ]] && ((TUI_ANIM_DONE == 0))
+    tui_anim_enabled && ((TUI_ANIM_DONE == 0))
 }
 
-# tui_anim_pause: wait ~80ms; return 0 if a key was pressed (skip the rest).
+# tui_anim_pause [seconds]: wait (default 80ms); return 0 if a key was
+# pressed (skip the rest of the animation).
 tui_anim_pause() {
     local _k
-    IFS= read -rsn1 -t 0.08 _k </dev/tty 2>/dev/null
+    IFS= read -rsn1 -t "${1:-0.08}" _k </dev/tty 2>/dev/null
+}
+
+# Exit animation: redraw the banner, then wipe it line by line bottom-up.
+# Any key skips to a clean screen. Interactive TTY only, like the startup.
+TUI_BANNER_LINES=0
+tui_exit_animation() {
+    tui_anim_enabled || return 0
+    local i skipped=0
+    clear_screen
+    tui_print_banner
+    for ((i = 0; i < TUI_BANNER_LINES; i++)); do
+        printf '\033[1A\r\033[2K'
+        if tui_anim_pause 0.04; then
+            skipped=1
+            break
+        fi
+    done
+    ((skipped)) && clear_screen
+    printf '  %sezvps closed%s\n' "$C_MUTED" "$C_RESET"
 }
 
 # tui_anim_spinner: braille spinner on its own line, then clears the line.
@@ -171,17 +194,18 @@ tui_print_banner() {
         width=$((cols - 2))
         ((width < 10)) && width=10
     fi
-    # Short terminals (<30 rows): the 6-line art banner + 13-line main menu
-    # is 26 lines and scrolls the art off a 24-row screen. Print one line.
-    # Narrow terminals (<72 cols, e.g. a phone in portrait): the art is 66
-    # columns wide and wraps, so they get the one line too, without the
-    # tagline, and the meta text is truncated to fit.
-    if ((rows > 0 && rows < 30)) || ((cols > 0 && cols < 72)); then
+    # Short terminals (<30 rows): the art banner + 13-line main menu is 24
+    # lines and scrolls the art off a 24-row screen. Print one line.
+    # Very narrow terminals (<36 cols): the art is 31 columns wide and
+    # would wrap, so they get the one line too, without the tagline, and
+    # the meta text is truncated to fit.
+    if ((rows > 0 && rows < 30)) || ((cols > 0 && cols < 36)); then
+        TUI_BANNER_LINES=3
         if ((anim)); then
             tui_anim_spinner
             lead=""
         fi
-        if ((cols > 0 && cols < 72)); then
+        if ((cols > 0 && cols < 50)); then
             budget=$((cols - ${#EZVPS_VERSION} - 8))
             meta="$(tui_trunc "$meta" "$budget")"
             printf '%s  %s v%s %s  %s%s%s\n\n' "$lead" "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
@@ -194,17 +218,16 @@ tui_print_banner() {
         fi
         return 0
     fi
-    if ((cols > 0)); then
+    if ((cols >= 50)); then
         budget=$((cols - ${#EZVPS_VERSION} - 37))
         meta="$(tui_trunc "$meta" "$budget")"
     fi
     for ((i = 0; i < width; i++)); do rule+="$TUI_G_RULE"; done
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588   \u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588 %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588   \u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588  %s  \u2588\u2588\u2588\u2588\u2588 %s\u2588\u2588\u2588   \u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588  %s \u2588\u2588\u2588\u2588\u2588  %s\u2588\u2588\u2588\u2588 \u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588 %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s \u2588\u2588\u2588\u2588\u2588\u2588\u2588 %s\u2588\u2588\u2588     %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
-    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s  \u2588\u2588\u2588\u2588\u2588  %s\u2588\u2588\u2588     %s\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588%s \u2588\u2588\u2588\u2588\u2588%s \u2588   \u2588%s \u2588\u2588\u2588\u2588\u2588%s  \u2588\u2588\u2588\u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588    %s    \u2588 %s \u2588   \u2588%s \u2588   \u2588%s \u2588    %s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2588\u2588 %s   \u2588  %s \u2588   \u2588%s \u2588\u2588\u2588\u2588\u2588%s  \u2588\u2588\u2588 %s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588    %s  \u2588   %s  \u2588 \u2588 %s \u2588    %s     \u2588%s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
+    printf -v line $'  %s\u2588\u2588\u2588\u2588\u2588%s \u2588\u2588\u2588\u2588\u2588%s   \u2588  %s \u2588    %s \u2588\u2588\u2588\u2588 %s\n' "$C_CYAN" "$C_BLUE" "$C_PURPLE" "$C_PINK" "$C_PINK" "$C_RESET"; art+=("$line")
     printf '\n'
     for line in "${art[@]}"; do
         printf '%s' "$line"
@@ -213,8 +236,15 @@ tui_print_banner() {
         fi
     done
     printf '\n'
-    printf '  %s v%s %s  %sVPS management, made simple%s   %s%s%s\n'         "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+    if ((cols > 0 && cols < 50)); then
+        budget=$((cols - ${#EZVPS_VERSION} - 8))
+        meta="$(tui_trunc "$meta" "$budget")"
+        printf '  %s v%s %s  %s%s%s\n' "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+    else
+        printf '  %s v%s %s  %sVPS management, made simple%s   %s%s%s\n'         "$C_PILL" "$EZVPS_VERSION" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_MUTED" "$meta" "$C_RESET"
+    fi
     printf '  %s%s%s\n\n' "$C_LINE" "$rule" "$C_RESET"
+    TUI_BANNER_LINES=10
 }
 
 tui_sub_header() {
@@ -8053,6 +8083,7 @@ main_menu() {
             choice="${choice//[[:space:]]/}"
         fi
         if [[ "$choice" == "0" ]]; then
+            tui_exit_animation
             return 0
         elif [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#MODULE_KEYS[@]})); then
             run_module "${MODULE_KEYS[$((10#$choice - 1))]}"

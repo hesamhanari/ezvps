@@ -123,17 +123,24 @@ check("24-row terminal gets the compact banner", "\u2588" not in txt
       and "VPS management, made simple" in txt and "Main menu" in txt)
 
 # 10. Narrow terminal (44 cols, like a phone in portrait): no line may be
-# wider than the terminal (wrapped rows garble the fixed-line redraw), the
-# banner is the compact one-liner, and navigation still works.
+# wider than the terminal (wrapped rows garble the fixed-line redraw).
+# Short (24 rows) gets the compact banner; tall gets the thin art, which
+# fits 44 cols. Under 36 cols the art would wrap, so compact again.
+# Navigation still works throughout.
 out = run(24, [], cols=44)
 txt = strip_ansi(out)
 wide = [l for l in re.split(r"[\r\n]", txt) if len(l) > 44]
 check("44-col terminal: no line wider than the terminal", not wide)
-check("44-col terminal: compact banner, menu present", "\u2588" not in txt
+check("44-col short terminal: compact banner, menu present", "\u2588" not in txt
       and "Main menu" in txt and "Check For Updates" in txt)
 out = run(40, [], cols=44)
 txt = strip_ansi(out)
-check("44-col tall terminal: compact banner by width, not rows",
+wide = [l for l in re.split(r"[\r\n]", txt) if len(l) > 44]
+check("44-col tall terminal: thin art fits, nothing wraps",
+      "\u2588" in txt and "Main menu" in txt and not wide)
+out = run(40, [], cols=34)
+txt = strip_ansi(out)
+check("34-col terminal: compact banner (art would wrap)",
       "\u2588" not in txt and "Main menu" in txt)
 out = run(24, [b"\x1b[B", b"\r"], cols=44)
 check("44-col terminal: Down+Enter still opens 3x-ui submenu",
@@ -151,10 +158,19 @@ check("keypress during animation skips to full banner", "\u2588" in txt and "Mai
 out = run(40, [], env={"EZVPS_NO_ANIM": "1"})
 txt = strip_ansi(out)
 check("EZVPS_NO_ANIM=1: banner and menu still render", "\u2588" in txt and "Main menu" in txt)
-out = run(24, [], cols=44, first_wait=3.0)
+out = run(40, [], cols=34, first_wait=3.0)
 txt = strip_ansi(out)
 check("narrow terminal: spinner frames shown, then menu",
       any(f in txt for f in "\u280b\u2819\u2839\u2838\u283c") and "Main menu" in txt)
+
+# Exit animation: q at the main menu wipes the banner and prints the
+# closing line; EZVPS_NO_ANIM=1 exits plainly.
+out = run(40, [b"q"], first_wait=3.0)
+txt = strip_ansi(out)
+check("exit animation wipes and closes", b"\x1b[2K" in out and "ezvps closed" in txt)
+out = run(40, [b"q"], env={"EZVPS_NO_ANIM": "1"})
+txt = strip_ansi(out)
+check("EZVPS_NO_ANIM=1: plain exit, no wipe", b"\x1b[2K" not in out and "ezvps closed" not in txt)
 
 # 12. install.sh on a TTY starts ezvps automatically after installing.
 import tempfile
